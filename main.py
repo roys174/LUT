@@ -71,13 +71,14 @@ def Up(x):
 # ---------------------------------------------------------------------------
 
 class LUT:
-    __slots__ = ['y_dim', 'S', 'a_arr', 'b_arr', 'bitmasks']
+    __slots__ = ['y_dim', 'S', 'a_arr', 'b_arr', 'bitmasks', 'trees']
     def __init__(self, n_t):
         self.y_dim = 0
         self.S = None
         self.a_arr = None
         self.b_arr = None
         self.bitmasks = None
+        self.trees = np.arange(n_t, dtype=np.int32)
 
 
 class LUTcache:
@@ -92,23 +93,23 @@ class AttentionHead:
     __slots__ = ['V', 'V_cache', 'Positional_encoding', 'PE_cache']
     def __init__(self, args):
         N_T = args.n_t
-        CONTEXT_SIZE = args.context_size
+        
         POSITIONAL_DIM = args.positional_dim
         self.V = LUT(N_T)
-        self.V_cache = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
-        self.Positional_encoding = np.zeros((CONTEXT_SIZE, N_T, POSITIONAL_DIM), dtype=np.float32)
-        self.PE_cache = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
+        self.V_cache = [LUTcache(N_T) for _ in range(args.context_size)]
+        self.Positional_encoding = np.zeros((args.context_size, N_T, POSITIONAL_DIM), dtype=np.float32)
+        self.PE_cache = [LUTcache(N_T) for _ in range(args.context_size)]
 
 
 class StandardOutputHead:
     __slots__ = ['unembedder', 'unembedder_vars', 'output', 'tokens']
     def __init__(self, args):
         N_T = args.n_t
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_SIZE = args.vocab_size
         self.unembedder = LUT(N_T)
-        self.unembedder_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
-        self.output = np.zeros((CONTEXT_SIZE, VOCAB_SIZE), dtype=np.float32)
+        self.unembedder_vars = [LUTcache(N_T) for _ in range(args.context_size)]
+        self.output = np.zeros((args.context_size, VOCAB_SIZE), dtype=np.float32)
         self.tokens = None  # set by load_targets
 
     def build(self, n_c, args):
@@ -118,29 +119,29 @@ class StandardOutputHead:
         self.tokens = tokens
 
     def forward(self, z, args):
-        CONTEXT_SIZE = args.context_size
+        
         self.output[:] = 0.0
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             cache_index(self.unembedder, self.unembedder_vars[pos], z[pos], args)
             LUT_forward(self.unembedder, self.unembedder_vars[pos], self.output[pos], args)
 
     def backward(self, x_grad, args):
-        CONTEXT_SIZE = args.context_size
-        for pos in range(CONTEXT_SIZE):
+        
+        for pos in range(args.context_size):
             LUT_backward(self.unembedder, self.unembedder_vars[pos], x_grad[pos], self.output[pos], args)
 
     def compute_gradients(self, args):
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_SIZE = args.vocab_size
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             softmax(self.output[pos], VOCAB_SIZE, 1.0)
             self.output[pos][self.tokens[pos + 1]] -= 1.0
 
     def sample_token(self, args):
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_SIZE = args.vocab_size
-        softmax(self.output[CONTEXT_SIZE - 1], VOCAB_SIZE, args.temperature)
-        return sample(self.output[CONTEXT_SIZE - 1], VOCAB_SIZE)
+        softmax(self.output[args.context_size - 1], VOCAB_SIZE, args.temperature)
+        return sample(self.output[args.context_size - 1], VOCAB_SIZE)
 
     def validation_loss(self, args):
         last = args.context_size - 1
@@ -156,16 +157,16 @@ class FactoredOutputHead:
                  'tokens_hi', 'tokens_lo']
     def __init__(self, args):
         N_T = args.n_t
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_HI = args.vocab_hi
         self.unembedder_hi = LUT(N_T)
-        self.unembedder_hi_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
-        self.output_hi = np.zeros((CONTEXT_SIZE, VOCAB_HI), dtype=np.float32)
+        self.unembedder_hi_vars = [LUTcache(N_T) for _ in range(args.context_size)]
+        self.output_hi = np.zeros((args.context_size, VOCAB_HI), dtype=np.float32)
         self.unembedder_lo = LUT(N_T)
-        self.unembedder_lo_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
-        self.output_lo = np.zeros((CONTEXT_SIZE, 256), dtype=np.float32)
-        self.tokens_hi = np.zeros(CONTEXT_SIZE + 1, dtype=np.int32)
-        self.tokens_lo = np.zeros(CONTEXT_SIZE + 1, dtype=np.int32)
+        self.unembedder_lo_vars = [LUTcache(N_T) for _ in range(args.context_size)]
+        self.output_lo = np.zeros((args.context_size, 256), dtype=np.float32)
+        self.tokens_hi = np.zeros(args.context_size + 1, dtype=np.int32)
+        self.tokens_lo = np.zeros(args.context_size + 1, dtype=np.int32)
 
     def build(self, n_c, args):
         build_LUT(self.unembedder_hi, n_c, args.vocab_hi, args)
@@ -177,38 +178,38 @@ class FactoredOutputHead:
             self.tokens_lo[pos] = tokens[pos] % 256
 
     def forward(self, z, args):
-        CONTEXT_SIZE = args.context_size
+        
         self.output_hi[:] = 0.0
         self.output_lo[:] = 0.0
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             cache_index(self.unembedder_hi, self.unembedder_hi_vars[pos], z[pos], args)
             LUT_forward(self.unembedder_hi, self.unembedder_hi_vars[pos], self.output_hi[pos], args)
             cache_index(self.unembedder_lo, self.unembedder_lo_vars[pos], z[pos], args)
             LUT_forward(self.unembedder_lo, self.unembedder_lo_vars[pos], self.output_lo[pos], args)
 
     def backward(self, x_grad, args):
-        CONTEXT_SIZE = args.context_size
-        for pos in range(CONTEXT_SIZE):
+        
+        for pos in range(args.context_size):
             LUT_backward(self.unembedder_hi, self.unembedder_hi_vars[pos], x_grad[pos], self.output_hi[pos], args)
             LUT_backward(self.unembedder_lo, self.unembedder_lo_vars[pos], x_grad[pos], self.output_lo[pos], args)
 
     def compute_gradients(self, args):
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_HI = args.vocab_hi
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             softmax(self.output_hi[pos], VOCAB_HI, 1.0)
             self.output_hi[pos][self.tokens_hi[pos + 1]] -= 1.0
             softmax(self.output_lo[pos], 256, 1.0)
             self.output_lo[pos][self.tokens_lo[pos + 1]] -= 1.0
 
     def sample_token(self, args):
-        CONTEXT_SIZE = args.context_size
+        
         VOCAB_SIZE = args.vocab_size
         VOCAB_HI = args.vocab_hi
-        softmax(self.output_hi[CONTEXT_SIZE - 1], VOCAB_HI, args.temperature)
-        hi = sample(self.output_hi[CONTEXT_SIZE - 1], VOCAB_HI)
-        softmax(self.output_lo[CONTEXT_SIZE - 1], 256, args.temperature)
-        lo = sample(self.output_lo[CONTEXT_SIZE - 1], 256)
+        softmax(self.output_hi[args.context_size - 1], VOCAB_HI, args.temperature)
+        hi = sample(self.output_hi[args.context_size - 1], VOCAB_HI)
+        softmax(self.output_lo[args.context_size - 1], 256, args.temperature)
+        lo = sample(self.output_lo[args.context_size - 1], 256)
         token_id = hi * 256 + lo
         if token_id >= VOCAB_SIZE:
             token_id = hi * 256
@@ -230,17 +231,17 @@ class Model:
     def __init__(self, args):
         VOCAB_SIZE = args.vocab_size
         EMBEDDING_DIM = args.embedding_dim
-        CONTEXT_SIZE = args.context_size
+        
         NUM_LAYERS = args.num_layers
         NUM_HEADS = args.num_heads
         N_T = args.n_t
 
         self.Token_embedder = np.zeros((VOCAB_SIZE, EMBEDDING_DIM), dtype=np.float32)
-        self.tokens = np.zeros(CONTEXT_SIZE + 1, dtype=np.int32)
-        self.z = np.zeros((CONTEXT_SIZE, EMBEDDING_DIM), dtype=np.float32)
+        self.tokens = np.zeros(args.context_size + 1, dtype=np.int32)
+        self.z = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
 
         self.FFN = [LUT(N_T) for _ in range(NUM_LAYERS)]
-        self.FFN_cache = [[LUTcache(N_T) for _ in range(CONTEXT_SIZE)] for _ in range(NUM_LAYERS)]
+        self.FFN_cache = [[LUTcache(N_T) for _ in range(args.context_size)] for _ in range(NUM_LAYERS)]
 
         self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
 
@@ -268,10 +269,11 @@ def build_LUT(lut, total_n_c, y_dim, args):
     N_T = args.n_t
     N_C = args.n_c
     EMBEDDING_DIM = args.embedding_dim
+    s_dtype = np.float16 if getattr(args, 'fp16', False) else np.float32
 
     lut.y_dim = y_dim
     num_bins = 1 << total_n_c
-    lut.S = np.zeros((N_T, num_bins, y_dim), dtype=np.float32)
+    lut.S = np.zeros((N_T, num_bins, y_dim), dtype=s_dtype)
     lut.a_arr = np.zeros((N_T, N_C), dtype=np.int32)
     lut.b_arr = np.zeros((N_T, N_C), dtype=np.int32)
     lut.bitmasks = (1 << np.arange(N_C)).astype(np.int32)
@@ -287,14 +289,12 @@ def cache_index(lut, cache, x, args):
     cache.j[:N_T] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=1)
     abs_u = np.abs(u)
     cache.r_min[:N_T] = abs_u.argmin(axis=1)
-    cache.u_min[:N_T] = u[np.arange(N_T), cache.r_min[:N_T]]
+    cache.u_min[:N_T] = u[lut.trees, cache.r_min[:N_T]]
 
 
 def cache_PE_index(cache, u, args):
     N_T = args.n_t
-    POSITIONAL_DIM = args.positional_dim
-    bitmasks = (1 << np.arange(POSITIONAL_DIM)).astype(np.int32)
-    cache.j[:N_T] = ((u[:N_T] > 0).astype(np.int32) * bitmasks).sum(axis=1)
+    cache.j[:N_T] = ((u[:N_T] > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=1)
     abs_u = np.abs(u[:N_T])
     cache.r_min[:N_T] = abs_u.argmin(axis=1)
     cache.u_min[:N_T] = u[np.arange(N_T), cache.r_min[:N_T]]
@@ -302,7 +302,7 @@ def cache_PE_index(cache, u, args):
 
 def LUT_forward(lut, cache, y, args):
     N_T = args.n_t
-    y[:lut.y_dim] += lut.S[np.arange(N_T), cache.j[:N_T].astype(int)].sum(axis=0)
+    y[:lut.y_dim] += lut.S[lut.trees, cache.j[:N_T]].sum(axis=0)
 
 
 def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
@@ -316,9 +316,9 @@ def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
 def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     global learning_rate
     N_T = args.n_t
-    trees = np.arange(N_T)
-    j_bins = cache.j[:N_T].astype(int)
-    jbar_bins = (cache.j[:N_T] ^ (1 << cache.r_min[:N_T])).astype(int)
+    trees = lut.trees
+    j_bins = cache.j[:N_T]
+    jbar_bins = j_bins ^ (1 << cache.r_min[:N_T])
 
     S_j = lut.S[trees, j_bins]            # (N_T, y_dim)
     S_jbar = lut.S[trees, jbar_bins]      # (N_T, y_dim)
@@ -328,8 +328,9 @@ def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     sign_u = np.where(u_min > 0, 1.0, -1.0)
     v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
 
-    np.add.at(x_gradient, lut.a_arr[trees, cache.r_min[:N_T]], v)
-    np.add.at(x_gradient, lut.b_arr[trees, cache.r_min[:N_T]], -v)
+    r_min = cache.r_min[:N_T]
+    np.add.at(x_gradient, lut.a_arr[trees, r_min], v)
+    np.add.at(x_gradient, lut.b_arr[trees, r_min], -v)
 
     lut.S[trees, j_bins] -= learning_rate * y_gradient[:lut.y_dim]
 
@@ -340,49 +341,84 @@ def CONCATENATE(Q, P, PE, args):
     return int((Q << (N_C + POSITIONAL_DIM)) | (P << POSITIONAL_DIM) | PE)
 
 
+def CONCATENATE_vec(Q, P, PE, args):
+    """Vectorized CONCATENATE for arrays of indices."""
+    return (Q << (args.n_c + args.positional_dim)) | (P << args.positional_dim) | PE
+
+
 def concatenated_LUT_forward(lut, cacheQ, cacheK, cachePE, y, args):
     N_T = args.n_t
-
-    for i in range(N_T):
-        j_bin = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), args)
-        y[:lut.y_dim] += lut.S[i, j_bin]
+    j_bins = CONCATENATE_vec(cacheQ.j[:N_T], cacheK.j[:N_T], cachePE.j[:N_T], args)
+    y[:lut.y_dim] += lut.S[lut.trees, j_bins].sum(axis=0)
 
 
 def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
                                 x_gradientQ, x_gradientK, PE_grad, y_gradient, args):
     global learning_rate
     N_T = args.n_t
+    trees = lut.trees
+    y_g = y_gradient[:lut.y_dim]
 
-    for i in range(N_T):
-        j_bin = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), args)
+    jQ = cacheQ.j[:N_T]
+    jK = cacheK.j[:N_T]
+    jPE = cachePE.j[:N_T]
+    j_bins = CONCATENATE_vec(jQ, jK, jPE, args)
 
-        if abs(cacheQ.u_min[i]) < abs(cacheK.u_min[i]):
-            jbar_bin = CONCATENATE(
-                int(cacheQ.j[i] ^ (1 << cacheQ.r_min[i])),
-                int(cacheK.j[i]),
-                int(cachePE.j[i]),
-                args)
-            backward_update(lut, cacheQ, i, j_bin, jbar_bin, y_gradient, x_gradientQ)
-        else:
-            jbar_bin = CONCATENATE(
-                int(cacheQ.j[i]),
-                int(cacheK.j[i] ^ (1 << cacheK.r_min[i])),
-                int(cachePE.j[i]),
-                args)
-            backward_update(lut, cacheK, i, j_bin, jbar_bin, y_gradient, x_gradientK)
+    S_j = lut.S[trees, j_bins]  # (N_T, y_dim)
 
-        if (abs(cachePE.u_min[i]) < abs(cacheQ.u_min[i]) and
-                abs(cachePE.u_min[i]) < abs(cacheK.u_min[i])):
-            jbarPE_bin = CONCATENATE(
-                int(cacheQ.j[i]),
-                int(cacheK.j[i]),
-                int(cachePE.j[i] ^ (1 << cachePE.r_min[i])),
-                args)
-            giPE = np.dot(y_gradient[:lut.y_dim], lut.S[i][jbarPE_bin] - lut.S[i][j_bin])
-            deltaPE = giPE * Up(cachePE.u_min[i])
-            PE_grad[i][cachePE.r_min[i]] += deltaPE
+    # --- Q/K branch: which trees have |u_Q| < |u_K|? ---
+    abs_uQ = np.abs(cacheQ.u_min[:N_T])
+    abs_uK = np.abs(cacheK.u_min[:N_T])
+    q_mask = abs_uQ < abs_uK  # True = Q closer
 
-        lut.S[i, j_bin] -= learning_rate * y_gradient[:lut.y_dim]
+    # Compute jbar for BOTH branches (cheap), then select
+    jbar_Q = CONCATENATE_vec(jQ ^ (1 << cacheQ.r_min[:N_T]), jK, jPE, args)
+    jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << cacheK.r_min[:N_T]), jPE, args)
+
+    jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
+    S_jbar = lut.S[trees, jbar_bins]  # (N_T, y_dim)
+
+    gi = ((S_jbar - S_j) * y_g).sum(axis=1)
+    u_min_qk = np.where(q_mask, cacheQ.u_min[:N_T], cacheK.u_min[:N_T])
+    sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min_qk))**2)
+
+    r_min_qk = np.where(q_mask, cacheQ.r_min[:N_T], cacheK.r_min[:N_T])
+
+    # Scatter Q gradients (only where q_mask is True)
+    q_trees = trees[q_mask]
+    if len(q_trees) > 0:
+        q_r = r_min_qk[q_mask]
+        q_v = v[q_mask]
+        np.add.at(x_gradientQ, lut.a_arr[q_trees, q_r], q_v)
+        np.add.at(x_gradientQ, lut.b_arr[q_trees, q_r], -q_v)
+
+    # Scatter K gradients (only where q_mask is False)
+    k_trees = trees[~q_mask]
+    if len(k_trees) > 0:
+        k_r = r_min_qk[~q_mask]
+        k_v = v[~q_mask]
+        np.add.at(x_gradientK, lut.a_arr[k_trees, k_r], k_v)
+        np.add.at(x_gradientK, lut.b_arr[k_trees, k_r], -k_v)
+
+    # --- PE branch ---
+    abs_uPE = np.abs(cachePE.u_min[:N_T])
+    pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
+    pe_trees = trees[pe_mask]
+    if len(pe_trees) > 0:
+        jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << cachePE.r_min[:N_T]), args)
+        S_jbarPE = lut.S[pe_trees, jbarPE_bins[pe_mask]]
+        giPE = ((S_jbarPE - S_j[pe_mask]) * y_g).sum(axis=1)
+        u_pe = cachePE.u_min[:N_T][pe_mask]
+        sign_pe = np.where(u_pe > 0, 1.0, -1.0)
+        deltaPE = giPE * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
+        pe_r = cachePE.r_min[:N_T][pe_mask]
+        # Scatter PE gradients
+        for idx, t in enumerate(pe_trees):
+            PE_grad[t, pe_r[idx]] += deltaPE[idx]
+
+    # SGD update
+    lut.S[trees, j_bins] -= learning_rate * y_g
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +432,7 @@ def build_Model(m, args):
     NUM_HEADS = args.num_heads
     N_C = args.n_c
     POSITIONAL_DIM = args.positional_dim
-    CONTEXT_SIZE = args.context_size
+    
     N_T = args.n_t
 
     m.Token_embedder[:] = random_vector(VOCAB_SIZE * EMBEDDING_DIM, 1.0).reshape(VOCAB_SIZE, EMBEDDING_DIM)
@@ -405,21 +441,21 @@ def build_Model(m, args):
         build_LUT(m.FFN[l], N_C, EMBEDDING_DIM, args)
         for h in range(NUM_HEADS):
             m.head[l][h].Positional_encoding[:] = random_vector(
-                CONTEXT_SIZE * N_T * POSITIONAL_DIM, 1.0
-            ).reshape(CONTEXT_SIZE, N_T, POSITIONAL_DIM)
+                args.context_size * N_T * POSITIONAL_DIM, 1.0
+            ).reshape(args.context_size, N_T, POSITIONAL_DIM)
             build_LUT(m.head[l][h].V, N_C + N_C + POSITIONAL_DIM, EMBEDDING_DIM, args)
 
     m.output_head.build(N_C, args)
 
 
 def attention_forward(head, x, y, args):
-    CONTEXT_SIZE = args.context_size
+    
 
-    for pos in range(CONTEXT_SIZE):
+    for pos in range(args.context_size):
         cache_index(head.V, head.V_cache[pos], x[pos], args)
         cache_PE_index(head.PE_cache[pos], head.Positional_encoding[pos], args)
 
-    for pos in range(1, CONTEXT_SIZE):
+    for pos in range(1, args.context_size):
         for pos1 in range(pos):
             concatenated_LUT_forward(
                 head.V, head.V_cache[pos], head.V_cache[pos1],
@@ -428,13 +464,13 @@ def attention_forward(head, x, y, args):
 
 def attention_backward(head, x_grad, y_grad, args):
     global learning_rate
-    CONTEXT_SIZE = args.context_size
+    
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
 
-    pos_grad = np.zeros((CONTEXT_SIZE, N_T, POSITIONAL_DIM), dtype=np.float32)
+    pos_grad = np.zeros((args.context_size, N_T, POSITIONAL_DIM), dtype=np.float32)
 
-    for pos in range(1, CONTEXT_SIZE):
+    for pos in range(1, args.context_size):
         for pos1 in range(pos):
             concatenated_LUT_backward(
                 head.V, head.V_cache[pos], head.V_cache[pos1],
@@ -446,7 +482,7 @@ def attention_backward(head, x_grad, y_grad, args):
 
 
 def model_forward(m, args):
-    CONTEXT_SIZE = args.context_size
+    
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
@@ -456,7 +492,7 @@ def model_forward(m, args):
         for h in range(NUM_HEADS):
             attention_forward(m.head[l][h], x, m.z, args)
 
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             cache_index(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
             LUT_forward(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
 
@@ -464,18 +500,18 @@ def model_forward(m, args):
 
 
 def model_backward(m, args):
-    CONTEXT_SIZE = args.context_size
+    
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
 
-    x_grad = np.zeros((CONTEXT_SIZE, EMBEDDING_DIM), dtype=np.float32)
+    x_grad = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
 
     m.output_head.backward(x_grad, args)
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             LUT_backward(m.FFN[l], m.FFN_cache[l][pos], x_grad[pos], y_grad[pos], args)
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
@@ -484,7 +520,7 @@ def model_backward(m, args):
 
     # no need to compute gradients for the embedder; just update the synaptic values
     # (disabled in the C version too)
-    # for pos in range(CONTEXT_SIZE):
+    # for pos in range(args.context_size):
     #     for k in range(EMBEDDING_DIM):
     #         m.Token_embedder[m.tokens[pos]][k] -= learning_rate * x_grad[pos][k]
 
@@ -500,7 +536,7 @@ def model_training_step(m, args):
 # ---------------------------------------------------------------------------
 
 def load_training_data(training, args):
-    CONTEXT_SIZE = args.context_size
+    
     TESTING_LENGTH = args.testing_length
     enc = args.enc
 
@@ -514,7 +550,7 @@ def load_training_data(training, args):
 
     tokens = enc.encode(text)
     training.data = np.array(tokens, dtype=np.int32)
-    training.length = len(training.data) - CONTEXT_SIZE - 1
+    training.length = len(training.data) - args.context_size - 1
     print(f"Training data: {len(training.data)} tokens from {args.training_data}")
 
     # Load or split validation data
@@ -527,7 +563,7 @@ def load_training_data(training, args):
             sys.exit(1)
         val_tokens = enc.encode(val_text)
         training.val_data = np.array(val_tokens, dtype=np.int32)
-        training.val_length = len(training.val_data) - CONTEXT_SIZE - 1
+        training.val_length = len(training.val_data) - args.context_size - 1
         print(f"Validation data: {len(training.val_data)} tokens from {args.validation_data}")
     else:
         # No separate validation file: use random snippets from training data
@@ -553,14 +589,12 @@ def embed_token(m, data, pos, output):
 
 
 def load_snippet(m, data_array, char_start, args):
-    CONTEXT_SIZE = args.context_size
-
-    for pos in range(CONTEXT_SIZE):
+    for pos in range(args.context_size):
         embed_token(m, data_array, char_start + pos, m.z[pos])
         m.tokens[pos] = int(data_array[char_start + pos])
-    m.tokens[CONTEXT_SIZE] = int(data_array[char_start + CONTEXT_SIZE])
+    m.tokens[args.context_size] = int(data_array[char_start + args.context_size])
 
-    m.output_head.load_targets(m.tokens, CONTEXT_SIZE)
+    m.output_head.load_targets(m.tokens, args.context_size)
 
 
 def model_inference(m, args):
@@ -569,24 +603,23 @@ def model_inference(m, args):
 
 
 def model_prompt_response(m, prompt_text, response_length, args):
-    CONTEXT_SIZE = args.context_size
     EMBEDDING_DIM = args.embedding_dim
     enc = args.enc
 
     # Encode prompt to token IDs
     prompt_tokens = enc.encode(prompt_text)
-    # Truncate or pad to CONTEXT_SIZE
-    if len(prompt_tokens) > CONTEXT_SIZE:
-        prompt_tokens = prompt_tokens[:CONTEXT_SIZE]
+    # Truncate or pad to args.context_size
+    if len(prompt_tokens) > args.context_size:
+        prompt_tokens = prompt_tokens[:args.context_size]
     else:
-        prompt_tokens = [0] * (CONTEXT_SIZE - len(prompt_tokens)) + prompt_tokens
+        prompt_tokens = [0] * (args.context_size - len(prompt_tokens)) + prompt_tokens
     prompt_tokens = list(prompt_tokens)
 
     # Print the prompt
     sys.stdout.write(prompt_text[:80])
 
     for i in range(response_length):
-        for pos in range(CONTEXT_SIZE):
+        for pos in range(args.context_size):
             m.z[pos][:EMBEDDING_DIM] = m.Token_embedder[prompt_tokens[pos]]
         response = model_inference(m, args)
         sys.stdout.write(enc.decode([response]))
@@ -595,6 +628,52 @@ def model_prompt_response(m, prompt_text, response_length, args):
         prompt_tokens = prompt_tokens[1:] + [response]
 
     sys.stdout.flush()
+
+
+def print_model_stats(m, args):
+    """Print model parameter count and memory footprint."""
+    total_params = 0
+    total_bytes = 0
+
+    def count_array(arr):
+        nonlocal total_params, total_bytes
+        total_params += arr.size
+        total_bytes += arr.nbytes
+
+    # Token embedder
+    count_array(m.Token_embedder)
+
+    # Per-layer
+    for l in range(args.num_layers):
+        # FFN LUT
+        count_array(m.FFN[l].S)
+        # Attention heads
+        for h in range(args.num_heads):
+            head = m.head[l][h]
+            count_array(head.V.S)
+            count_array(head.Positional_encoding)
+
+    # Output head
+    if args.factored_output:
+        count_array(m.output_head.unembedder_hi.S)
+        count_array(m.output_head.unembedder_lo.S)
+    else:
+        count_array(m.output_head.unembedder.S)
+
+    if total_bytes < 1024**2:
+        mem_str = f"{total_bytes / 1024:.1f} KB"
+    elif total_bytes < 1024**3:
+        mem_str = f"{total_bytes / 1024**2:.1f} MB"
+    else:
+        mem_str = f"{total_bytes / 1024**3:.2f} GB"
+
+    if total_params < 1_000_000:
+        param_str = f"{total_params:,}"
+    else:
+        param_str = f"{total_params / 1_000_000:.1f}M"
+
+    dtype_str = "fp16" if getattr(args, 'fp16', False) else "fp32"
+    print(f"Model: {param_str} parameters, {mem_str} memory ({dtype_str})")
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +705,8 @@ def main():
     parser.add_argument('--loss-file', type=str, default='loss.csv')
     parser.add_argument('--factored-output', action='store_true',
                         help='Use factored base-256 decomposition for unembedder (faster for large vocabs)')
+    parser.add_argument('--fp16', action='store_true',
+                        help='Use float16 for LUT S tables (halves memory, may reduce precision)')
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
@@ -637,6 +718,9 @@ def main():
     args.vocab_hi = (args.vocab_size + 255) // 256
     args.vocab_lo = 256
 
+    # Pre-compute positional encoding bitmasks
+    args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
         f.write("step, loss, perplexity\n")
@@ -646,6 +730,7 @@ def main():
 
     m = Model(args)
     build_Model(m, args)
+    print_model_stats(m, args)
 
     pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
     last_ppl = None
