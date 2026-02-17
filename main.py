@@ -10,6 +10,7 @@ import random
 import sys
 import numpy as np
 import tiktoken
+from tqdm import tqdm
 
 
 # Global learning rate (updated each step)
@@ -549,7 +550,11 @@ def main():
     m = Model(args)
     build_Model(m, args)
 
-    for t in range(args.max_steps):
+    pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
+    last_ppl = None
+    last_loss = None
+
+    for t in pbar:
         load_snippet(m, training.data, get_random_training_index(training), args)
 
         # Adam learning rate scheduler
@@ -558,11 +563,10 @@ def main():
         model_training_step(m, args)
 
         if t % args.validation_interval == 0:
-            sys.stdout.write("...validating... ")
-            sys.stdout.flush()
+            pbar.set_description("Validating")
 
             validation_loss = 0.0
-            for i in range(args.testing_length):
+            for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args)
                 model_forward(m, args)
                 softmax(m.output[args.context_size - 1], args.vocab_size, 1.0)
@@ -572,24 +576,30 @@ def main():
             validation_loss /= args.testing_length
 
             perplexity = math.exp(validation_loss)
+            last_ppl = perplexity
+            last_loss = validation_loss
 
             with open(args.loss_file, 'a') as f:
                 f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}\n")
 
-            sys.stdout.write(f"\rt={t // 1000},000, ppl={perplexity:.2f}, loss={validation_loss:5.3f}: ")
-
-            # Use a snippet from validation data as the prompt
+            # Print validation result and sample generation
+            tqdm.write(f"\n--- step {t:,} | ppl={perplexity:.2f} | loss={validation_loss:.3f} ---")
             val_idx = random.randint(0, training.val_length - 1)
             prompt_tokens = training.val_data[val_idx:val_idx + args.context_size].tolist()
             prompt_text = enc.decode(prompt_tokens)
-            model_prompt_response(
-                m,
-                prompt_text,
-                80, args)
-            print()
+            # Capture generation output
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = buf = io.StringIO()
+            model_prompt_response(m, prompt_text, 80, args)
+            sys.stdout = old_stdout
+            tqdm.write(buf.getvalue())
+            tqdm.write("")
 
-        sys.stdout.write(f"\rt={t}")
-        sys.stdout.flush()
+            pbar.set_description("Training")
+
+        if last_ppl is not None:
+            pbar.set_postfix(ppl=f"{last_ppl:.2f}", loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
 
 
 if __name__ == '__main__':
