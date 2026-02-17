@@ -5,6 +5,7 @@
 """Python port by Claude, February 2026"""
 
 import argparse
+import io
 import math
 import random
 import sys
@@ -28,22 +29,13 @@ def softmax(x, size, temperature):
     x[:size] /= s
 
 
-def vector_multiply(vector1, vector2, size):
-    return np.dot(vector1[:size], vector2[:size])
-
-
 def random_vector(size, scale):
     return scale * 2.0 * (np.random.rand(size).astype(np.float32) - 0.5)
 
 
 def sample(probabilities, n):
-    coin = random.random()
-    cdf = 0.0
-    for i in range(n):
-        cdf += probabilities[i]
-        if coin < cdf:
-            return i
-    return n - 1
+    cumsum = np.cumsum(probabilities[:n])
+    return int(np.searchsorted(cumsum, random.random()))
 
 
 def fill_vector_with_random_integers(N, max_value):
@@ -93,7 +85,6 @@ class AttentionHead:
     __slots__ = ['V', 'V_cache', 'Positional_encoding', 'PE_cache']
     def __init__(self, args):
         N_T = args.n_t
-        
         POSITIONAL_DIM = args.positional_dim
         self.V = LUT(N_T)
         self.V_cache = [LUTcache(N_T) for _ in range(args.context_size)]
@@ -105,7 +96,6 @@ class StandardOutputHead:
     __slots__ = ['unembedder', 'unembedder_vars', 'output', 'tokens']
     def __init__(self, args):
         N_T = args.n_t
-        
         VOCAB_SIZE = args.vocab_size
         self.unembedder = LUT(N_T)
         self.unembedder_vars = [LUTcache(N_T) for _ in range(args.context_size)]
@@ -119,26 +109,22 @@ class StandardOutputHead:
         self.tokens = tokens
 
     def forward(self, z, args):
-        
         self.output[:] = 0.0
         for pos in range(args.context_size):
             cache_index(self.unembedder, self.unembedder_vars[pos], z[pos], args)
             LUT_forward(self.unembedder, self.unembedder_vars[pos], self.output[pos], args)
 
     def backward(self, x_grad, args):
-        
         for pos in range(args.context_size):
             LUT_backward(self.unembedder, self.unembedder_vars[pos], x_grad[pos], self.output[pos], args)
 
     def compute_gradients(self, args):
-        
         VOCAB_SIZE = args.vocab_size
         for pos in range(args.context_size):
             softmax(self.output[pos], VOCAB_SIZE, 1.0)
             self.output[pos][self.tokens[pos + 1]] -= 1.0
 
     def sample_token(self, args):
-        
         VOCAB_SIZE = args.vocab_size
         softmax(self.output[args.context_size - 1], VOCAB_SIZE, args.temperature)
         return sample(self.output[args.context_size - 1], VOCAB_SIZE)
@@ -157,7 +143,6 @@ class FactoredOutputHead:
                  'tokens_hi', 'tokens_lo']
     def __init__(self, args):
         N_T = args.n_t
-        
         VOCAB_HI = args.vocab_hi
         self.unembedder_hi = LUT(N_T)
         self.unembedder_hi_vars = [LUTcache(N_T) for _ in range(args.context_size)]
@@ -173,12 +158,11 @@ class FactoredOutputHead:
         build_LUT(self.unembedder_lo, n_c, 256, args)
 
     def load_targets(self, tokens, context_size):
-        for pos in range(context_size + 1):
-            self.tokens_hi[pos] = tokens[pos] // 256
-            self.tokens_lo[pos] = tokens[pos] % 256
+        t = tokens[:context_size + 1]
+        self.tokens_hi[:context_size + 1] = t // 256
+        self.tokens_lo[:context_size + 1] = t % 256
 
     def forward(self, z, args):
-        
         self.output_hi[:] = 0.0
         self.output_lo[:] = 0.0
         for pos in range(args.context_size):
@@ -188,13 +172,11 @@ class FactoredOutputHead:
             LUT_forward(self.unembedder_lo, self.unembedder_lo_vars[pos], self.output_lo[pos], args)
 
     def backward(self, x_grad, args):
-        
         for pos in range(args.context_size):
             LUT_backward(self.unembedder_hi, self.unembedder_hi_vars[pos], x_grad[pos], self.output_hi[pos], args)
             LUT_backward(self.unembedder_lo, self.unembedder_lo_vars[pos], x_grad[pos], self.output_lo[pos], args)
 
     def compute_gradients(self, args):
-        
         VOCAB_HI = args.vocab_hi
         for pos in range(args.context_size):
             softmax(self.output_hi[pos], VOCAB_HI, 1.0)
@@ -203,7 +185,6 @@ class FactoredOutputHead:
             self.output_lo[pos][self.tokens_lo[pos + 1]] -= 1.0
 
     def sample_token(self, args):
-        
         VOCAB_SIZE = args.vocab_size
         VOCAB_HI = args.vocab_hi
         softmax(self.output_hi[args.context_size - 1], VOCAB_HI, args.temperature)
@@ -227,11 +208,10 @@ class FactoredOutputHead:
 
 
 class Model:
-    __slots__ = ['Token_embedder', 'tokens', 'z', 'FFN', 'FFN_cache', 'head', 'output_head']
+    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN', 'FFN_cache', 'head', 'output_head']
     def __init__(self, args):
         VOCAB_SIZE = args.vocab_size
         EMBEDDING_DIM = args.embedding_dim
-        
         NUM_LAYERS = args.num_layers
         NUM_HEADS = args.num_heads
         N_T = args.n_t
@@ -239,6 +219,7 @@ class Model:
         self.Token_embedder = np.zeros((VOCAB_SIZE, EMBEDDING_DIM), dtype=np.float32)
         self.tokens = np.zeros(args.context_size + 1, dtype=np.int32)
         self.z = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
+        self._x_buf = np.zeros_like(self.z)
 
         self.FFN = [LUT(N_T) for _ in range(NUM_LAYERS)]
         self.FFN_cache = [[LUTcache(N_T) for _ in range(args.context_size)] for _ in range(NUM_LAYERS)]
@@ -284,30 +265,32 @@ def build_LUT(lut, total_n_c, y_dim, args):
 
 
 def cache_index(lut, cache, x, args):
-    N_T = args.n_t
     u = x[lut.a_arr] - x[lut.b_arr]                        # (N_T, N_C)
-    cache.j[:N_T] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=1)
+    cache.j[:] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=1)
     abs_u = np.abs(u)
-    cache.r_min[:N_T] = abs_u.argmin(axis=1)
-    cache.u_min[:N_T] = u[lut.trees, cache.r_min[:N_T]]
+    cache.r_min[:] = abs_u.argmin(axis=1)
+    cache.u_min[:] = u[lut.trees, cache.r_min]
 
 
 def cache_PE_index(cache, u, args):
-    N_T = args.n_t
-    cache.j[:N_T] = ((u[:N_T] > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=1)
-    abs_u = np.abs(u[:N_T])
-    cache.r_min[:N_T] = abs_u.argmin(axis=1)
-    cache.u_min[:N_T] = u[np.arange(N_T), cache.r_min[:N_T]]
+    cache.j[:] = ((u > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=1)
+    abs_u = np.abs(u)
+    cache.r_min[:] = abs_u.argmin(axis=1)
+    cache.u_min[:] = u[np.arange(u.shape[0]), cache.r_min]
+
+
+def _f32(arr):
+    """Cast to float32 if needed (no-op if already float32)."""
+    return arr if arr.dtype == np.float32 else arr.astype(np.float32)
 
 
 def LUT_forward(lut, cache, y, args):
-    N_T = args.n_t
-    y[:lut.y_dim] += lut.S[lut.trees, cache.j[:N_T]].sum(axis=0)
+    y[:lut.y_dim] += _f32(lut.S[lut.trees, cache.j]).sum(axis=0)
 
 
 def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
     """Equivalent of BACKWARD_UPDATE macro. Uses bin indices (not flat offsets)."""
-    gi = np.dot(y_gradient[:lut.y_dim], lut.S[i][jbar_bin] - lut.S[i][j_bin])
+    gi = np.dot(y_gradient[:lut.y_dim], _f32(lut.S[i][jbar_bin]) - _f32(lut.S[i][j_bin]))
     v = gi * Up(cache.u_min[i])
     gradient[lut.a_arr[i, cache.r_min[i]]] += v
     gradient[lut.b_arr[i, cache.r_min[i]]] -= v
@@ -315,22 +298,19 @@ def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
 
 def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     global learning_rate
-    N_T = args.n_t
     trees = lut.trees
-    j_bins = cache.j[:N_T]
-    jbar_bins = j_bins ^ (1 << cache.r_min[:N_T])
+    j_bins = cache.j
+    jbar_bins = j_bins ^ (1 << cache.r_min)
 
-    S_j = lut.S[trees, j_bins]            # (N_T, y_dim)
-    S_jbar = lut.S[trees, jbar_bins]      # (N_T, y_dim)
+    S_j = _f32(lut.S[trees, j_bins])
+    S_jbar = _f32(lut.S[trees, jbar_bins])
 
     gi = ((S_jbar - S_j) * y_gradient[:lut.y_dim]).sum(axis=1)
-    u_min = cache.u_min[:N_T]
-    sign_u = np.where(u_min > 0, 1.0, -1.0)
-    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
+    sign_u = np.where(cache.u_min > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(cache.u_min))**2)
 
-    r_min = cache.r_min[:N_T]
-    np.add.at(x_gradient, lut.a_arr[trees, r_min], v)
-    np.add.at(x_gradient, lut.b_arr[trees, r_min], -v)
+    np.add.at(x_gradient, lut.a_arr[trees, cache.r_min], v)
+    np.add.at(x_gradient, lut.b_arr[trees, cache.r_min], -v)
 
     lut.S[trees, j_bins] -= learning_rate * y_gradient[:lut.y_dim]
 
@@ -347,45 +327,41 @@ def CONCATENATE_vec(Q, P, PE, args):
 
 
 def concatenated_LUT_forward(lut, cacheQ, cacheK, cachePE, y, args):
-    N_T = args.n_t
-    j_bins = CONCATENATE_vec(cacheQ.j[:N_T], cacheK.j[:N_T], cachePE.j[:N_T], args)
-    y[:lut.y_dim] += lut.S[lut.trees, j_bins].sum(axis=0)
+    j_bins = CONCATENATE_vec(cacheQ.j, cacheK.j, cachePE.j, args)
+    y[:lut.y_dim] += _f32(lut.S[lut.trees, j_bins]).sum(axis=0)
 
 
 def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
                                 x_gradientQ, x_gradientK, PE_grad, y_gradient, args):
     global learning_rate
-    N_T = args.n_t
     trees = lut.trees
     y_g = y_gradient[:lut.y_dim]
 
-    jQ = cacheQ.j[:N_T]
-    jK = cacheK.j[:N_T]
-    jPE = cachePE.j[:N_T]
+    jQ = cacheQ.j
+    jK = cacheK.j
+    jPE = cachePE.j
     j_bins = CONCATENATE_vec(jQ, jK, jPE, args)
 
-    S_j = lut.S[trees, j_bins]  # (N_T, y_dim)
+    S_j = _f32(lut.S[trees, j_bins])
 
     # --- Q/K branch: which trees have |u_Q| < |u_K|? ---
-    abs_uQ = np.abs(cacheQ.u_min[:N_T])
-    abs_uK = np.abs(cacheK.u_min[:N_T])
-    q_mask = abs_uQ < abs_uK  # True = Q closer
+    abs_uQ = np.abs(cacheQ.u_min)
+    abs_uK = np.abs(cacheK.u_min)
+    q_mask = abs_uQ < abs_uK
 
-    # Compute jbar for BOTH branches (cheap), then select
-    jbar_Q = CONCATENATE_vec(jQ ^ (1 << cacheQ.r_min[:N_T]), jK, jPE, args)
-    jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << cacheK.r_min[:N_T]), jPE, args)
+    jbar_Q = CONCATENATE_vec(jQ ^ (1 << cacheQ.r_min), jK, jPE, args)
+    jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << cacheK.r_min), jPE, args)
 
     jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
-    S_jbar = lut.S[trees, jbar_bins]  # (N_T, y_dim)
+    S_jbar = _f32(lut.S[trees, jbar_bins])
 
     gi = ((S_jbar - S_j) * y_g).sum(axis=1)
-    u_min_qk = np.where(q_mask, cacheQ.u_min[:N_T], cacheK.u_min[:N_T])
+    u_min_qk = np.where(q_mask, cacheQ.u_min, cacheK.u_min)
     sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
     v = gi * (-0.5 * sign_u / (1 + np.abs(u_min_qk))**2)
 
-    r_min_qk = np.where(q_mask, cacheQ.r_min[:N_T], cacheK.r_min[:N_T])
+    r_min_qk = np.where(q_mask, cacheQ.r_min, cacheK.r_min)
 
-    # Scatter Q gradients (only where q_mask is True)
     q_trees = trees[q_mask]
     if len(q_trees) > 0:
         q_r = r_min_qk[q_mask]
@@ -393,7 +369,6 @@ def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
         np.add.at(x_gradientQ, lut.a_arr[q_trees, q_r], q_v)
         np.add.at(x_gradientQ, lut.b_arr[q_trees, q_r], -q_v)
 
-    # Scatter K gradients (only where q_mask is False)
     k_trees = trees[~q_mask]
     if len(k_trees) > 0:
         k_r = r_min_qk[~q_mask]
@@ -402,17 +377,17 @@ def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
         np.add.at(x_gradientK, lut.b_arr[k_trees, k_r], -k_v)
 
     # --- PE branch ---
-    abs_uPE = np.abs(cachePE.u_min[:N_T])
+    abs_uPE = np.abs(cachePE.u_min)
     pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
     pe_trees = trees[pe_mask]
     if len(pe_trees) > 0:
-        jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << cachePE.r_min[:N_T]), args)
-        S_jbarPE = lut.S[pe_trees, jbarPE_bins[pe_mask]]
+        jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << cachePE.r_min), args)
+        S_jbarPE = _f32(lut.S[pe_trees, jbarPE_bins[pe_mask]])
         giPE = ((S_jbarPE - S_j[pe_mask]) * y_g).sum(axis=1)
-        u_pe = cachePE.u_min[:N_T][pe_mask]
+        u_pe = cachePE.u_min[pe_mask]
         sign_pe = np.where(u_pe > 0, 1.0, -1.0)
         deltaPE = giPE * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
-        pe_r = cachePE.r_min[:N_T][pe_mask]
+        pe_r = cachePE.r_min[pe_mask]
         np.add.at(PE_grad, (pe_trees, pe_r), deltaPE)
 
     # SGD update
@@ -467,7 +442,7 @@ def attention_forward(head, x, y, args):
     jPE = all_jPE[all_pos - all_pos1]             # (num_pairs, N_T)
 
     j_bins = CONCATENATE_vec(jQ, jK, jPE, args)   # (num_pairs, N_T)
-    S_sums = lut.S[trees, j_bins].sum(axis=1)     # (num_pairs, y_dim)
+    S_sums = _f32(lut.S[trees, j_bins]).sum(axis=1)  # (num_pairs, y_dim)
 
     # Scatter-add to y by target position
     np.add.at(y[:, :y_dim], all_pos, S_sums)
@@ -514,7 +489,7 @@ def attention_backward(head, x_grad, y_grad, args):
 
         # Compute concatenated bin indices
         j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
-        S_j = lut.S[trees, j_bins]                    # (P, N_T, y_dim)
+        S_j = _f32(lut.S[trees, j_bins])  # (P, N_T, y_dim)
 
         # Q/K branch: which (pair, tree) elements have |u_Q| < |u_K|?
         abs_uQ = np.abs(uQ)   # (N_T,) broadcasts to (P, N_T)
@@ -525,7 +500,7 @@ def attention_backward(head, x_grad, y_grad, args):
         jbar_Q = CONCATENATE_vec(jQ ^ (1 << rQ), jK, jPE, args)
         jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << rK), jPE, args)
         jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
-        S_jbar = lut.S[trees, jbar_bins]  # (P, N_T, y_dim)
+        S_jbar = _f32(lut.S[trees, jbar_bins])  # (P, N_T, y_dim)
 
         # Gradient computation
         gi = ((S_jbar - S_j) * y_g).sum(axis=2)        # (P, N_T)
@@ -559,7 +534,7 @@ def attention_backward(head, x_grad, y_grad, args):
         pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
         if pe_mask.any():
             jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << rPE), args)
-            S_jbarPE = lut.S[trees, jbarPE_bins]       # (P, N_T, y_dim)
+            S_jbarPE = _f32(lut.S[trees, jbarPE_bins])  # (P, N_T, y_dim)
             giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)  # (P, N_T)
             u_pe = uPE[pe_mask]
             sign_pe = np.where(u_pe > 0, 1.0, -1.0)
@@ -580,15 +555,13 @@ def attention_backward(head, x_grad, y_grad, args):
 
 
 def model_forward(m, args):
-    
-    EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
 
     for l in range(NUM_LAYERS):
-        x = m.z.copy()
+        np.copyto(m._x_buf, m.z)
         for h in range(NUM_HEADS):
-            attention_forward(m.head[l][h], x, m.z, args)
+            attention_forward(m.head[l][h], m._x_buf, m.z, args)
 
         for pos in range(args.context_size):
             cache_index(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
@@ -598,7 +571,6 @@ def model_forward(m, args):
 
 
 def model_backward(m, args):
-    
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
@@ -681,18 +653,11 @@ def get_random_training_index(training):
     return random.randint(0, training.length - 1)
 
 
-def embed_token(m, data, pos, output):
-    EMBEDDING_DIM = output.shape[0] if hasattr(output, 'shape') else len(output)
-    output[:EMBEDDING_DIM] = m.Token_embedder[data[pos]]
-
-
 def load_snippet(m, data_array, char_start, args):
-    for pos in range(args.context_size):
-        embed_token(m, data_array, char_start + pos, m.z[pos])
-        m.tokens[pos] = int(data_array[char_start + pos])
-    m.tokens[args.context_size] = int(data_array[char_start + args.context_size])
-
-    m.output_head.load_targets(m.tokens, args.context_size)
+    CS = args.context_size
+    m.tokens[:CS + 1] = data_array[char_start:char_start + CS + 1]
+    m.z[:] = m.Token_embedder[m.tokens[:CS]]
+    m.output_head.load_targets(m.tokens, CS)
 
 
 def model_inference(m, args):
@@ -701,7 +666,6 @@ def model_inference(m, args):
 
 
 def model_prompt_response(m, prompt_text, response_length, args):
-    EMBEDDING_DIM = args.embedding_dim
     enc = args.enc
 
     # Encode prompt to token IDs
@@ -710,15 +674,13 @@ def model_prompt_response(m, prompt_text, response_length, args):
     if len(prompt_tokens) > args.context_size:
         prompt_tokens = prompt_tokens[:args.context_size]
     else:
-        prompt_tokens = [0] * (args.context_size - len(prompt_tokens)) + prompt_tokens
-    prompt_tokens = list(prompt_tokens)
+        prompt_tokens = [0] * (args.context_size - len(prompt_tokens)) + list(prompt_tokens)
 
     # Print the prompt
     sys.stdout.write(prompt_text[:80])
 
     for i in range(response_length):
-        for pos in range(args.context_size):
-            m.z[pos][:EMBEDDING_DIM] = m.Token_embedder[prompt_tokens[pos]]
+        m.z[:] = m.Token_embedder[prompt_tokens]
         response = model_inference(m, args)
         sys.stdout.write(enc.decode([response]))
 
@@ -866,7 +828,6 @@ def main():
             prompt_tokens = training.val_data[val_idx:val_idx + args.context_size].tolist()
             prompt_text = enc.decode(prompt_tokens)
             # Capture generation output
-            import io
             old_stdout = sys.stdout
             sys.stdout = buf = io.StringIO()
             model_prompt_response(m, prompt_text, 80, args)
