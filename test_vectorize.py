@@ -142,7 +142,8 @@ def orig_concatenated_LUT_backward(S_list, y_dim, anchors_list, cacheQ, cacheK, 
 def make_args(n_t=8, n_c=4, embedding_dim=16, positional_dim=4):
     return SimpleNamespace(n_t=n_t, n_c=n_c, embedding_dim=embedding_dim,
                            positional_dim=positional_dim,
-                           pe_bitmasks=(1 << np.arange(positional_dim)).astype(np.int32))
+                           pe_bitmasks=(1 << np.arange(positional_dim)).astype(np.int32),
+                           shift_qk=n_c + positional_dim)
 
 
 def make_matched_lut_and_old_data(args, total_n_c=None, y_dim=8, seed=42):

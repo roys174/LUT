@@ -343,7 +343,7 @@ def CONCATENATE(Q, P, PE, args):
 
 def CONCATENATE_vec(Q, P, PE, args):
     """Vectorized CONCATENATE for arrays of indices."""
-    return (Q << (args.n_c + args.positional_dim)) | (P << args.positional_dim) | PE
+    return (Q << args.shift_qk) | (P << args.positional_dim) | PE
 
 
 def concatenated_LUT_forward(lut, cacheQ, cacheK, cachePE, y, args):
@@ -413,9 +413,7 @@ def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
         sign_pe = np.where(u_pe > 0, 1.0, -1.0)
         deltaPE = giPE * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
         pe_r = cachePE.r_min[:N_T][pe_mask]
-        # Scatter PE gradients
-        for idx, t in enumerate(pe_trees):
-            PE_grad[t, pe_r[idx]] += deltaPE[idx]
+        np.add.at(PE_grad, (pe_trees, pe_r), deltaPE)
 
     # SGD update
     lut.S[trees, j_bins] -= learning_rate * y_g
@@ -449,34 +447,134 @@ def build_Model(m, args):
 
 
 def attention_forward(head, x, y, args):
-    
+    CS = args.context_size
+    lut = head.V
+    trees = lut.trees
+    y_dim = lut.y_dim
 
-    for pos in range(args.context_size):
-        cache_index(head.V, head.V_cache[pos], x[pos], args)
+    for pos in range(CS):
+        cache_index(lut, head.V_cache[pos], x[pos], args)
         cache_PE_index(head.PE_cache[pos], head.Positional_encoding[pos], args)
 
-    for pos in range(1, args.context_size):
-        for pos1 in range(pos):
-            concatenated_LUT_forward(
-                head.V, head.V_cache[pos], head.V_cache[pos1],
-                head.PE_cache[pos - pos1], y[pos], args)
+    # Pre-gather all cache j values
+    all_jV = np.array([head.V_cache[p].j for p in range(CS)])    # (CS, N_T)
+    all_jPE = np.array([head.PE_cache[p].j for p in range(CS)])  # (CS, N_T)
+
+    # All (pos1, pos) pairs where pos1 < pos
+    all_pos1, all_pos = np.triu_indices(CS, k=1)
+    jQ = all_jV[all_pos]                          # (num_pairs, N_T)
+    jK = all_jV[all_pos1]                         # (num_pairs, N_T)
+    jPE = all_jPE[all_pos - all_pos1]             # (num_pairs, N_T)
+
+    j_bins = CONCATENATE_vec(jQ, jK, jPE, args)   # (num_pairs, N_T)
+    S_sums = lut.S[trees, j_bins].sum(axis=1)     # (num_pairs, y_dim)
+
+    # Scatter-add to y by target position
+    np.add.at(y[:, :y_dim], all_pos, S_sums)
 
 
 def attention_backward(head, x_grad, y_grad, args):
     global learning_rate
-    
+    CS = args.context_size
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
+    lut = head.V
+    trees = lut.trees
+    y_dim = lut.y_dim
 
-    pos_grad = np.zeros((args.context_size, N_T, POSITIONAL_DIM), dtype=np.float32)
+    pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
 
-    for pos in range(1, args.context_size):
-        for pos1 in range(pos):
-            concatenated_LUT_backward(
-                head.V, head.V_cache[pos], head.V_cache[pos1],
-                head.PE_cache[pos - pos1],
-                x_grad[pos], x_grad[pos1], pos_grad[pos - pos1],
-                y_grad[pos], args)
+    # Pre-gather all cache values into contiguous arrays
+    all_jV = np.array([head.V_cache[p].j for p in range(CS)])        # (CS, N_T)
+    all_rV = np.array([head.V_cache[p].r_min for p in range(CS)])    # (CS, N_T)
+    all_uV = np.array([head.V_cache[p].u_min for p in range(CS)])    # (CS, N_T)
+    all_jPE = np.array([head.PE_cache[p].j for p in range(CS)])      # (CS, N_T)
+    all_rPE = np.array([head.PE_cache[p].r_min for p in range(CS)])  # (CS, N_T)
+    all_uPE = np.array([head.PE_cache[p].u_min for p in range(CS)])  # (CS, N_T)
+
+    for pos in range(1, CS):
+        P = pos  # number of pos1 values to batch
+        y_g = y_grad[pos, :y_dim]  # (y_dim,)
+
+        # Q cache (same for all pos1, broadcasts to (P, N_T))
+        jQ = all_jV[pos]     # (N_T,)
+        rQ = all_rV[pos]     # (N_T,)
+        uQ = all_uV[pos]     # (N_T,)
+
+        # K caches (vary by pos1)
+        jK = all_jV[:P]      # (P, N_T)
+        rK = all_rV[:P]      # (P, N_T)
+        uK = all_uV[:P]      # (P, N_T)
+
+        # PE caches (indexed by pos - pos1)
+        pe_idx = pos - np.arange(P)   # [pos, pos-1, ..., 1]
+        jPE = all_jPE[pe_idx]   # (P, N_T)
+        rPE = all_rPE[pe_idx]   # (P, N_T)
+        uPE = all_uPE[pe_idx]   # (P, N_T)
+
+        # Compute concatenated bin indices
+        j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
+        S_j = lut.S[trees, j_bins]                    # (P, N_T, y_dim)
+
+        # Q/K branch: which (pair, tree) elements have |u_Q| < |u_K|?
+        abs_uQ = np.abs(uQ)   # (N_T,) broadcasts to (P, N_T)
+        abs_uK = np.abs(uK)   # (P, N_T)
+        q_mask = abs_uQ < abs_uK  # (P, N_T)
+
+        # Compute jbar for both branches, then select
+        jbar_Q = CONCATENATE_vec(jQ ^ (1 << rQ), jK, jPE, args)
+        jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << rK), jPE, args)
+        jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
+        S_jbar = lut.S[trees, jbar_bins]  # (P, N_T, y_dim)
+
+        # Gradient computation
+        gi = ((S_jbar - S_j) * y_g).sum(axis=2)        # (P, N_T)
+        u_min_qk = np.where(q_mask, uQ, uK)            # (P, N_T)
+        sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
+        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min_qk))**2)
+        r_min_qk = np.where(q_mask, rQ, rK)            # (P, N_T)
+
+        trees_b = np.broadcast_to(trees, (P, N_T))
+
+        # Q gradient scatter -> all go to x_grad[pos]
+        if q_mask.any():
+            q_t = trees_b[q_mask]
+            q_r = r_min_qk[q_mask]
+            q_v = v[q_mask]
+            np.add.at(x_grad[pos], lut.a_arr[q_t, q_r], q_v)
+            np.add.at(x_grad[pos], lut.b_arr[q_t, q_r], -q_v)
+
+        # K gradient scatter -> x_grad[pos1] for each pair
+        k_mask = ~q_mask
+        if k_mask.any():
+            k_t = trees_b[k_mask]
+            k_r = r_min_qk[k_mask]
+            k_v = v[k_mask]
+            k_pos1 = np.broadcast_to(np.arange(P)[:, np.newaxis], (P, N_T))[k_mask]
+            np.add.at(x_grad, (k_pos1, lut.a_arr[k_t, k_r]), k_v)
+            np.add.at(x_grad, (k_pos1, lut.b_arr[k_t, k_r]), -k_v)
+
+        # PE gradient
+        abs_uPE = np.abs(uPE)
+        pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
+        if pe_mask.any():
+            jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << rPE), args)
+            S_jbarPE = lut.S[trees, jbarPE_bins]       # (P, N_T, y_dim)
+            giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)  # (P, N_T)
+            u_pe = uPE[pe_mask]
+            sign_pe = np.where(u_pe > 0, 1.0, -1.0)
+            deltaPE = giPE[pe_mask] * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
+            pe_t = trees_b[pe_mask]
+            pe_r = rPE[pe_mask]
+            pe_pair = np.broadcast_to(np.arange(P)[:, np.newaxis], (P, N_T))[pe_mask]
+            np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
+
+        # S update: accumulate for duplicate (tree, bin) across pos1 values
+        trees_flat = trees_b.ravel()
+        j_flat = j_bins.ravel()
+        neg_lr_y_g = np.empty((P * N_T, y_dim), dtype=lut.S.dtype)
+        neg_lr_y_g[:] = -(learning_rate * y_g)
+        np.add.at(lut.S, (trees_flat, j_flat), neg_lr_y_g)
 
     head.Positional_encoding -= learning_rate * pos_grad
 
@@ -718,8 +816,9 @@ def main():
     args.vocab_hi = (args.vocab_size + 255) // 256
     args.vocab_lo = 256
 
-    # Pre-compute positional encoding bitmasks
+    # Pre-compute positional encoding bitmasks and shift constants
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+    args.shift_qk = args.n_c + args.positional_dim
 
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
