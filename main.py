@@ -309,8 +309,11 @@ def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     sign_u = np.where(cache.u_min > 0, 1.0, -1.0)
     v = gi * (-0.5 * sign_u / (1 + np.abs(cache.u_min))**2)
 
-    np.add.at(x_gradient, lut.a_arr[trees, cache.r_min], v)
-    np.add.at(x_gradient, lut.b_arr[trees, cache.r_min], -v)
+    n = x_gradient.shape[0]
+    idx_a = lut.a_arr[trees, cache.r_min]
+    idx_b = lut.b_arr[trees, cache.r_min]
+    x_gradient += np.bincount(idx_a, weights=v, minlength=n)
+    x_gradient -= np.bincount(idx_b, weights=v, minlength=n)
 
     lut.S[trees, j_bins] -= learning_rate * y_gradient[:lut.y_dim]
 
@@ -362,19 +365,20 @@ def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
 
     r_min_qk = np.where(q_mask, cacheQ.r_min, cacheK.r_min)
 
+    nQ = x_gradientQ.shape[0]
     q_trees = trees[q_mask]
     if len(q_trees) > 0:
         q_r = r_min_qk[q_mask]
         q_v = v[q_mask]
-        np.add.at(x_gradientQ, lut.a_arr[q_trees, q_r], q_v)
-        np.add.at(x_gradientQ, lut.b_arr[q_trees, q_r], -q_v)
+        x_gradientQ += np.bincount(lut.a_arr[q_trees, q_r], weights=q_v, minlength=nQ)
+        x_gradientQ -= np.bincount(lut.b_arr[q_trees, q_r], weights=q_v, minlength=nQ)
 
     k_trees = trees[~q_mask]
     if len(k_trees) > 0:
         k_r = r_min_qk[~q_mask]
         k_v = v[~q_mask]
-        np.add.at(x_gradientK, lut.a_arr[k_trees, k_r], k_v)
-        np.add.at(x_gradientK, lut.b_arr[k_trees, k_r], -k_v)
+        x_gradientK += np.bincount(lut.a_arr[k_trees, k_r], weights=k_v, minlength=nQ)
+        x_gradientK -= np.bincount(lut.b_arr[k_trees, k_r], weights=k_v, minlength=nQ)
 
     # --- PE branch ---
     abs_uPE = np.abs(cachePE.u_min)
@@ -510,24 +514,28 @@ def attention_backward(head, x_grad, y_grad, args):
         r_min_qk = np.where(q_mask, rQ, rK)            # (P, N_T)
 
         trees_b = np.broadcast_to(trees, (P, N_T))
+        ED = x_grad.shape[1]
 
         # Q gradient scatter -> all go to x_grad[pos]
         if q_mask.any():
             q_t = trees_b[q_mask]
             q_r = r_min_qk[q_mask]
             q_v = v[q_mask]
-            np.add.at(x_grad[pos], lut.a_arr[q_t, q_r], q_v)
-            np.add.at(x_grad[pos], lut.b_arr[q_t, q_r], -q_v)
+            x_grad[pos] += np.bincount(lut.a_arr[q_t, q_r], weights=q_v, minlength=ED)
+            x_grad[pos] -= np.bincount(lut.b_arr[q_t, q_r], weights=q_v, minlength=ED)
 
-        # K gradient scatter -> x_grad[pos1] for each pair
+        # K gradient scatter -> x_grad[pos1] for each pair (flat bincount)
         k_mask = ~q_mask
         if k_mask.any():
             k_t = trees_b[k_mask]
             k_r = r_min_qk[k_mask]
             k_v = v[k_mask]
             k_pos1 = np.broadcast_to(np.arange(P)[:, np.newaxis], (P, N_T))[k_mask]
-            np.add.at(x_grad, (k_pos1, lut.a_arr[k_t, k_r]), k_v)
-            np.add.at(x_grad, (k_pos1, lut.b_arr[k_t, k_r]), -k_v)
+            flat_a = k_pos1 * ED + lut.a_arr[k_t, k_r]
+            flat_b = k_pos1 * ED + lut.b_arr[k_t, k_r]
+            flat_size = x_grad.size
+            x_grad.ravel()[:] += np.bincount(flat_a, weights=k_v, minlength=flat_size)
+            x_grad.ravel()[:] -= np.bincount(flat_b, weights=k_v, minlength=flat_size)
 
         # PE gradient
         abs_uPE = np.abs(uPE)
