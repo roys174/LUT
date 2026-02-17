@@ -9,6 +9,7 @@ import math
 import random
 import sys
 import numpy as np
+import tiktoken
 
 
 # Global learning rate (updated each step)
@@ -135,11 +136,12 @@ class Model:
 
 
 class TrainingData:
-    __slots__ = ['data', 'length', 'reserved_for_testing', 'testing_input_data']
+    __slots__ = ['data', 'length', 'val_data', 'val_length', 'testing_input_data']
     def __init__(self):
         self.data = None
         self.length = 0
-        self.reserved_for_testing = None
+        self.val_data = None
+        self.val_length = 0
         self.testing_input_data = None
 
 
@@ -402,40 +404,52 @@ def model_training_step(m, args):
 # Training data
 # ---------------------------------------------------------------------------
 
-def load_training_data(training, fname, args):
+def load_training_data(training, args):
     CONTEXT_SIZE = args.context_size
     TESTING_LENGTH = args.testing_length
+    enc = args.enc
 
+    # Load and tokenize training data
     try:
-        with open(fname, 'rb') as f:
-            data = f.read()
+        with open(args.training_data, 'r', encoding='utf-8') as f:
+            text = f.read()
     except IOError:
-        print(f"Error opening training datafile {fname}")
+        print(f"Error opening training datafile {args.training_data}")
         sys.exit(1)
 
-    print(f"Successfully opened training data file {fname}")
-
-    training.data = np.frombuffer(data, dtype=np.uint8).copy()
+    tokens = enc.encode(text)
+    training.data = np.array(tokens, dtype=np.int32)
     training.length = len(training.data) - CONTEXT_SIZE - 1
+    print(f"Training data: {len(training.data)} tokens from {args.training_data}")
 
-    training.reserved_for_testing = np.zeros(training.length, dtype=np.uint8)
+    # Load or split validation data
+    if args.validation_data:
+        try:
+            with open(args.validation_data, 'r', encoding='utf-8') as f:
+                val_text = f.read()
+        except IOError:
+            print(f"Error opening validation datafile {args.validation_data}")
+            sys.exit(1)
+        val_tokens = enc.encode(val_text)
+        training.val_data = np.array(val_tokens, dtype=np.int32)
+        training.val_length = len(training.val_data) - CONTEXT_SIZE - 1
+        print(f"Validation data: {len(training.val_data)} tokens from {args.validation_data}")
+    else:
+        # No separate validation file: use random snippets from training data
+        training.val_data = training.data
+        training.val_length = training.length
+        print("Validation data: sampled from training data")
 
+    # Sample validation snippet indices from val data
     training.testing_input_data = np.zeros(TESTING_LENGTH, dtype=np.int32)
     for i in range(TESTING_LENGTH):
-        training.testing_input_data[i] = random.randint(0, training.length - 1)
-        for j in range(-CONTEXT_SIZE, CONTEXT_SIZE + 1):
-            idx = max(0, training.testing_input_data[i] + j)
-            if idx < training.length:
-                training.reserved_for_testing[idx] = 1
+        training.testing_input_data[i] = random.randint(0, training.val_length - 1)
 
-    print("Successfully loaded training data")
+    print(f"Tokenizer: {args.tokenizer}, vocab_size: {args.vocab_size}")
 
 
 def get_random_training_index(training):
-    while True:
-        symbol_index = random.randint(0, training.length - 1)
-        if training.reserved_for_testing[symbol_index] != 1:
-            return symbol_index
+    return random.randint(0, training.length - 1)
 
 
 def embed_token(m, data, pos, output):
@@ -443,13 +457,13 @@ def embed_token(m, data, pos, output):
     output[:EMBEDDING_DIM] = m.Token_embedder[data[pos]]
 
 
-def load_snippet(m, training, char_start, args):
+def load_snippet(m, data_array, char_start, args):
     CONTEXT_SIZE = args.context_size
 
     for pos in range(CONTEXT_SIZE):
-        embed_token(m, training.data, char_start + pos, m.z[pos])
-        m.tokens[pos] = int(training.data[char_start + pos])
-    m.tokens[CONTEXT_SIZE] = int(training.data[char_start + CONTEXT_SIZE])
+        embed_token(m, data_array, char_start + pos, m.z[pos])
+        m.tokens[pos] = int(data_array[char_start + pos])
+    m.tokens[CONTEXT_SIZE] = int(data_array[char_start + CONTEXT_SIZE])
 
 
 def model_inference(m, args):
@@ -462,22 +476,31 @@ def model_inference(m, args):
     return sampled_index
 
 
-def model_prompt_response(m, prompt, response_length, args):
+def model_prompt_response(m, prompt_text, response_length, args):
     CONTEXT_SIZE = args.context_size
     EMBEDDING_DIM = args.embedding_dim
+    enc = args.enc
 
-    prompt_copy = bytearray(prompt[:CONTEXT_SIZE].ljust(CONTEXT_SIZE, b'\x00'))
-    sys.stdout.write(prompt_copy.decode('ascii', errors='replace'))
+    # Encode prompt to token IDs
+    prompt_tokens = enc.encode(prompt_text)
+    # Truncate or pad to CONTEXT_SIZE
+    if len(prompt_tokens) > CONTEXT_SIZE:
+        prompt_tokens = prompt_tokens[:CONTEXT_SIZE]
+    else:
+        prompt_tokens = [0] * (CONTEXT_SIZE - len(prompt_tokens)) + prompt_tokens
+    prompt_tokens = list(prompt_tokens)
+
+    # Print the prompt
+    sys.stdout.write(prompt_text[:80])
 
     for i in range(response_length):
         for pos in range(CONTEXT_SIZE):
-            m.z[pos][:EMBEDDING_DIM] = m.Token_embedder[prompt_copy[pos]]
+            m.z[pos][:EMBEDDING_DIM] = m.Token_embedder[prompt_tokens[pos]]
         response = model_inference(m, args)
-        sys.stdout.write(chr(response) if 32 <= response < 127 else '?')
+        sys.stdout.write(enc.decode([response]))
 
-        # shift the prompt by one character and insert response as the last character
-        prompt_copy[:-1] = prompt_copy[1:]
-        prompt_copy[CONTEXT_SIZE - 1] = response
+        # Shift context window and append new token
+        prompt_tokens = prompt_tokens[1:] + [response]
 
     sys.stdout.flush()
 
@@ -491,8 +514,13 @@ def main():
 
     parser = argparse.ArgumentParser(description="SNN Transformer (Python port)")
     parser.add_argument('training_data', type=str, help='Path to training data file')
+    parser.add_argument('--validation-data', type=str, default=None,
+                        help='Path to validation data file (if not provided, samples from training data)')
+    parser.add_argument('--tokenizer', type=str, default='gpt2',
+                        help='tiktoken encoding name (default: gpt2)')
     parser.add_argument('--context-size', type=int, default=32)
-    parser.add_argument('--vocab-size', type=int, default=256)
+    parser.add_argument('--vocab-size', type=int, default=256,
+                        help='(auto-detected from tokenizer, this default is overridden)')
     parser.add_argument('--embedding-dim', type=int, default=32)
     parser.add_argument('--positional-dim', type=int, default=4)
     parser.add_argument('--num-layers', type=int, default=6)
@@ -506,18 +534,23 @@ def main():
     parser.add_argument('--loss-file', type=str, default='loss.csv')
     args = parser.parse_args()
 
-    # Initialize loss file
+    # Initialize tokenizer and auto-set vocab size
+    enc = tiktoken.get_encoding(args.tokenizer)
+    args.vocab_size = enc.n_vocab
+    args.enc = enc
+
+    # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
-        pass
+        f.write("step, loss, perplexity\n")
 
     training = TrainingData()
-    load_training_data(training, args.training_data, args)
+    load_training_data(training, args)
 
     m = Model(args)
     build_Model(m, args)
 
     for t in range(args.max_steps):
-        load_snippet(m, training, get_random_training_index(training), args)
+        load_snippet(m, training.data, get_random_training_index(training), args)
 
         # Adam learning rate scheduler
         learning_rate = min(1.0 / math.sqrt(1 + t), t / 4000.0 / math.sqrt(4000))
@@ -530,7 +563,7 @@ def main():
 
             validation_loss = 0.0
             for i in range(args.testing_length):
-                load_snippet(m, training, int(training.testing_input_data[i]), args)
+                load_snippet(m, training.val_data, int(training.testing_input_data[i]), args)
                 model_forward(m, args)
                 softmax(m.output[args.context_size - 1], args.vocab_size, 1.0)
                 target = m.tokens[args.context_size]
@@ -538,13 +571,20 @@ def main():
                 validation_loss += -math.log(max(prob, 1e-30))
             validation_loss /= args.testing_length
 
-            with open(args.loss_file, 'a') as f:
-                f.write(f"{t}, {validation_loss:.6f}\n")
+            perplexity = math.exp(validation_loss)
 
-            sys.stdout.write(f"\rt={t // 1000},000, loss={validation_loss:5.3f}: ")
+            with open(args.loss_file, 'a') as f:
+                f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}\n")
+
+            sys.stdout.write(f"\rt={t // 1000},000, ppl={perplexity:.2f}, loss={validation_loss:5.3f}: ")
+
+            # Use a snippet from validation data as the prompt
+            val_idx = random.randint(0, training.val_length - 1)
+            prompt_tokens = training.val_data[val_idx:val_idx + args.context_size].tolist()
+            prompt_text = enc.decode(prompt_tokens)
             model_prompt_response(
                 m,
-                b"insert your validation prompt here ",
+                prompt_text,
                 80, args)
             print()
 
