@@ -70,19 +70,14 @@ def Up(x):
 # Data structures
 # ---------------------------------------------------------------------------
 
-class Anchors:
-    __slots__ = ['a', 'b']
-    def __init__(self, n_c):
-        self.a = np.zeros(n_c, dtype=np.int32)
-        self.b = np.zeros(n_c, dtype=np.int32)
-
-
 class LUT:
-    __slots__ = ['y_dim', 'S', 'anchors']
+    __slots__ = ['y_dim', 'S', 'a_arr', 'b_arr', 'bitmasks']
     def __init__(self, n_t):
         self.y_dim = 0
-        self.S = [None] * n_t
-        self.anchors = [None] * n_t
+        self.S = None
+        self.a_arr = None
+        self.b_arr = None
+        self.bitmasks = None
 
 
 class LUTcache:
@@ -105,14 +100,133 @@ class AttentionHead:
         self.PE_cache = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
 
 
+class StandardOutputHead:
+    __slots__ = ['unembedder', 'unembedder_vars', 'output', 'tokens']
+    def __init__(self, args):
+        N_T = args.n_t
+        CONTEXT_SIZE = args.context_size
+        VOCAB_SIZE = args.vocab_size
+        self.unembedder = LUT(N_T)
+        self.unembedder_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
+        self.output = np.zeros((CONTEXT_SIZE, VOCAB_SIZE), dtype=np.float32)
+        self.tokens = None  # set by load_targets
+
+    def build(self, n_c, args):
+        build_LUT(self.unembedder, n_c, args.vocab_size, args)
+
+    def load_targets(self, tokens, context_size):
+        self.tokens = tokens
+
+    def forward(self, z, args):
+        CONTEXT_SIZE = args.context_size
+        self.output[:] = 0.0
+        for pos in range(CONTEXT_SIZE):
+            cache_index(self.unembedder, self.unembedder_vars[pos], z[pos], args)
+            LUT_forward(self.unembedder, self.unembedder_vars[pos], self.output[pos], args)
+
+    def backward(self, x_grad, args):
+        CONTEXT_SIZE = args.context_size
+        for pos in range(CONTEXT_SIZE):
+            LUT_backward(self.unembedder, self.unembedder_vars[pos], x_grad[pos], self.output[pos], args)
+
+    def compute_gradients(self, args):
+        CONTEXT_SIZE = args.context_size
+        VOCAB_SIZE = args.vocab_size
+        for pos in range(CONTEXT_SIZE):
+            softmax(self.output[pos], VOCAB_SIZE, 1.0)
+            self.output[pos][self.tokens[pos + 1]] -= 1.0
+
+    def sample_token(self, args):
+        CONTEXT_SIZE = args.context_size
+        VOCAB_SIZE = args.vocab_size
+        softmax(self.output[CONTEXT_SIZE - 1], VOCAB_SIZE, args.temperature)
+        return sample(self.output[CONTEXT_SIZE - 1], VOCAB_SIZE)
+
+    def validation_loss(self, args):
+        last = args.context_size - 1
+        softmax(self.output[last], args.vocab_size, 1.0)
+        target = self.tokens[args.context_size]
+        prob = max(self.output[last][target], 1e-30)
+        return -math.log(prob)
+
+
+class FactoredOutputHead:
+    __slots__ = ['unembedder_hi', 'unembedder_hi_vars', 'output_hi',
+                 'unembedder_lo', 'unembedder_lo_vars', 'output_lo',
+                 'tokens_hi', 'tokens_lo']
+    def __init__(self, args):
+        N_T = args.n_t
+        CONTEXT_SIZE = args.context_size
+        VOCAB_HI = args.vocab_hi
+        self.unembedder_hi = LUT(N_T)
+        self.unembedder_hi_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
+        self.output_hi = np.zeros((CONTEXT_SIZE, VOCAB_HI), dtype=np.float32)
+        self.unembedder_lo = LUT(N_T)
+        self.unembedder_lo_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
+        self.output_lo = np.zeros((CONTEXT_SIZE, 256), dtype=np.float32)
+        self.tokens_hi = np.zeros(CONTEXT_SIZE + 1, dtype=np.int32)
+        self.tokens_lo = np.zeros(CONTEXT_SIZE + 1, dtype=np.int32)
+
+    def build(self, n_c, args):
+        build_LUT(self.unembedder_hi, n_c, args.vocab_hi, args)
+        build_LUT(self.unembedder_lo, n_c, 256, args)
+
+    def load_targets(self, tokens, context_size):
+        for pos in range(context_size + 1):
+            self.tokens_hi[pos] = tokens[pos] // 256
+            self.tokens_lo[pos] = tokens[pos] % 256
+
+    def forward(self, z, args):
+        CONTEXT_SIZE = args.context_size
+        self.output_hi[:] = 0.0
+        self.output_lo[:] = 0.0
+        for pos in range(CONTEXT_SIZE):
+            cache_index(self.unembedder_hi, self.unembedder_hi_vars[pos], z[pos], args)
+            LUT_forward(self.unembedder_hi, self.unembedder_hi_vars[pos], self.output_hi[pos], args)
+            cache_index(self.unembedder_lo, self.unembedder_lo_vars[pos], z[pos], args)
+            LUT_forward(self.unembedder_lo, self.unembedder_lo_vars[pos], self.output_lo[pos], args)
+
+    def backward(self, x_grad, args):
+        CONTEXT_SIZE = args.context_size
+        for pos in range(CONTEXT_SIZE):
+            LUT_backward(self.unembedder_hi, self.unembedder_hi_vars[pos], x_grad[pos], self.output_hi[pos], args)
+            LUT_backward(self.unembedder_lo, self.unembedder_lo_vars[pos], x_grad[pos], self.output_lo[pos], args)
+
+    def compute_gradients(self, args):
+        CONTEXT_SIZE = args.context_size
+        VOCAB_HI = args.vocab_hi
+        for pos in range(CONTEXT_SIZE):
+            softmax(self.output_hi[pos], VOCAB_HI, 1.0)
+            self.output_hi[pos][self.tokens_hi[pos + 1]] -= 1.0
+            softmax(self.output_lo[pos], 256, 1.0)
+            self.output_lo[pos][self.tokens_lo[pos + 1]] -= 1.0
+
+    def sample_token(self, args):
+        CONTEXT_SIZE = args.context_size
+        VOCAB_SIZE = args.vocab_size
+        VOCAB_HI = args.vocab_hi
+        softmax(self.output_hi[CONTEXT_SIZE - 1], VOCAB_HI, args.temperature)
+        hi = sample(self.output_hi[CONTEXT_SIZE - 1], VOCAB_HI)
+        softmax(self.output_lo[CONTEXT_SIZE - 1], 256, args.temperature)
+        lo = sample(self.output_lo[CONTEXT_SIZE - 1], 256)
+        token_id = hi * 256 + lo
+        if token_id >= VOCAB_SIZE:
+            token_id = hi * 256
+        return token_id
+
+    def validation_loss(self, args):
+        last = args.context_size - 1
+        softmax(self.output_hi[last], args.vocab_hi, 1.0)
+        softmax(self.output_lo[last], 256, 1.0)
+        target_hi = self.tokens_hi[args.context_size]
+        target_lo = self.tokens_lo[args.context_size]
+        prob_hi = max(self.output_hi[last][target_hi], 1e-30)
+        prob_lo = max(self.output_lo[last][target_lo], 1e-30)
+        return -math.log(prob_hi) + -math.log(prob_lo)
+
+
 class Model:
-    __slots__ = [
-        'Token_embedder', 'tokens', 'z',
-        'FFN', 'FFN_cache',
-        'head',
-        'unembedder', 'unembedder_vars',
-        'output',
-    ]
+    __slots__ = ['Token_embedder', 'tokens', 'z', 'FFN', 'FFN_cache', 'head', 'output_head']
     def __init__(self, args):
         VOCAB_SIZE = args.vocab_size
         EMBEDDING_DIM = args.embedding_dim
@@ -130,10 +244,10 @@ class Model:
 
         self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
 
-        self.unembedder = LUT(N_T)
-        self.unembedder_vars = [LUTcache(N_T) for _ in range(CONTEXT_SIZE)]
-
-        self.output = np.zeros((CONTEXT_SIZE, VOCAB_SIZE), dtype=np.float32)
+        if args.factored_output:
+            self.output_head = FactoredOutputHead(args)
+        else:
+            self.output_head = StandardOutputHead(args)
 
 
 class TrainingData:
@@ -156,90 +270,82 @@ def build_LUT(lut, total_n_c, y_dim, args):
     EMBEDDING_DIM = args.embedding_dim
 
     lut.y_dim = y_dim
+    num_bins = 1 << total_n_c
+    lut.S = np.zeros((N_T, num_bins, y_dim), dtype=np.float32)
+    lut.a_arr = np.zeros((N_T, N_C), dtype=np.int32)
+    lut.b_arr = np.zeros((N_T, N_C), dtype=np.int32)
+    lut.bitmasks = (1 << np.arange(N_C)).astype(np.int32)
     for i in range(N_T):
-        lut.anchors[i] = Anchors(N_C)
-        lut.anchors[i].a = fill_vector_with_random_integers(N_C, EMBEDDING_DIM)
-        lut.anchors[i].b = fill_vector_with_random_integers_different_from_vector2(
-            lut.anchors[i].a, N_C, EMBEDDING_DIM)
-        lut.S[i] = np.zeros((1 << total_n_c) * y_dim, dtype=np.float32)
+        lut.a_arr[i] = fill_vector_with_random_integers(N_C, EMBEDDING_DIM)
+        lut.b_arr[i] = fill_vector_with_random_integers_different_from_vector2(
+            lut.a_arr[i], N_C, EMBEDDING_DIM)
 
 
 def cache_index(lut, cache, x, args):
     N_T = args.n_t
-    N_C = args.n_c
-
-    for i in range(N_T):
-        cache.j[i] = 0
-        cache.u_min[i] = float('inf')
-
-        for r in range(N_C):
-            u = x[lut.anchors[i].a[r]] - x[lut.anchors[i].b[r]]
-            if u > 0:
-                cache.j[i] |= (1 << r)
-            if abs(u) < abs(cache.u_min[i]):
-                cache.r_min[i] = r
-                cache.u_min[i] = u
+    u = x[lut.a_arr] - x[lut.b_arr]                        # (N_T, N_C)
+    cache.j[:N_T] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=1)
+    abs_u = np.abs(u)
+    cache.r_min[:N_T] = abs_u.argmin(axis=1)
+    cache.u_min[:N_T] = u[np.arange(N_T), cache.r_min[:N_T]]
 
 
 def cache_PE_index(cache, u, args):
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
-
-    for i in range(N_T):
-        cache.j[i] = 0
-        cache.u_min[i] = float('inf')
-
-        for r in range(POSITIONAL_DIM):
-            if u[i][r] > 0:
-                cache.j[i] |= (1 << r)
-            if abs(u[i][r]) < abs(cache.u_min[i]):
-                cache.r_min[i] = r
-                cache.u_min[i] = u[i][r]
+    bitmasks = (1 << np.arange(POSITIONAL_DIM)).astype(np.int32)
+    cache.j[:N_T] = ((u[:N_T] > 0).astype(np.int32) * bitmasks).sum(axis=1)
+    abs_u = np.abs(u[:N_T])
+    cache.r_min[:N_T] = abs_u.argmin(axis=1)
+    cache.u_min[:N_T] = u[np.arange(N_T), cache.r_min[:N_T]]
 
 
 def LUT_forward(lut, cache, y, args):
     N_T = args.n_t
-
-    for i in range(N_T):
-        offset = int(cache.j[i]) * lut.y_dim
-        y[:lut.y_dim] += lut.S[i][offset:offset + lut.y_dim]
+    y[:lut.y_dim] += lut.S[np.arange(N_T), cache.j[:N_T].astype(int)].sum(axis=0)
 
 
-def backward_update(lut, cache, i, j, jbar, y_gradient, gradient):
-    """Equivalent of BACKWARD_UPDATE macro."""
-    gi = 0.0
-    for k in range(lut.y_dim):
-        gi += y_gradient[k] * (lut.S[i][jbar + k] - lut.S[i][j + k])
+def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
+    """Equivalent of BACKWARD_UPDATE macro. Uses bin indices (not flat offsets)."""
+    gi = np.dot(y_gradient[:lut.y_dim], lut.S[i][jbar_bin] - lut.S[i][j_bin])
     v = gi * Up(cache.u_min[i])
-    gradient[lut.anchors[i].a[cache.r_min[i]]] += v
-    gradient[lut.anchors[i].b[cache.r_min[i]]] -= v
+    gradient[lut.a_arr[i, cache.r_min[i]]] += v
+    gradient[lut.b_arr[i, cache.r_min[i]]] -= v
 
 
 def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     global learning_rate
     N_T = args.n_t
+    trees = np.arange(N_T)
+    j_bins = cache.j[:N_T].astype(int)
+    jbar_bins = (cache.j[:N_T] ^ (1 << cache.r_min[:N_T])).astype(int)
 
-    for i in range(N_T):
-        j = int(cache.j[i]) * lut.y_dim
-        jbar = int(cache.j[i] ^ (1 << cache.r_min[i])) * lut.y_dim
+    S_j = lut.S[trees, j_bins]            # (N_T, y_dim)
+    S_jbar = lut.S[trees, jbar_bins]      # (N_T, y_dim)
 
-        backward_update(lut, cache, i, j, jbar, y_gradient, x_gradient)
+    gi = ((S_jbar - S_j) * y_gradient[:lut.y_dim]).sum(axis=1)
+    u_min = cache.u_min[:N_T]
+    sign_u = np.where(u_min > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
 
-        lut.S[i][j:j + lut.y_dim] -= learning_rate * y_gradient[:lut.y_dim]
+    np.add.at(x_gradient, lut.a_arr[trees, cache.r_min[:N_T]], v)
+    np.add.at(x_gradient, lut.b_arr[trees, cache.r_min[:N_T]], -v)
+
+    lut.S[trees, j_bins] -= learning_rate * y_gradient[:lut.y_dim]
 
 
-def CONCATENATE(Q, P, PE, y_dim, args):
+def CONCATENATE(Q, P, PE, args):
     N_C = args.n_c
     POSITIONAL_DIM = args.positional_dim
-    return int(((Q << (N_C + POSITIONAL_DIM)) | (P << POSITIONAL_DIM) | PE) * y_dim)
+    return int((Q << (N_C + POSITIONAL_DIM)) | (P << POSITIONAL_DIM) | PE)
 
 
 def concatenated_LUT_forward(lut, cacheQ, cacheK, cachePE, y, args):
     N_T = args.n_t
 
     for i in range(N_T):
-        j = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), lut.y_dim, args)
-        y[:lut.y_dim] += lut.S[i][j:j + lut.y_dim]
+        j_bin = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), args)
+        y[:lut.y_dim] += lut.S[i, j_bin]
 
 
 def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
@@ -248,37 +354,35 @@ def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
     N_T = args.n_t
 
     for i in range(N_T):
-        j = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), lut.y_dim, args)
+        j_bin = CONCATENATE(int(cacheQ.j[i]), int(cacheK.j[i]), int(cachePE.j[i]), args)
 
         if abs(cacheQ.u_min[i]) < abs(cacheK.u_min[i]):
-            jbar = CONCATENATE(
+            jbar_bin = CONCATENATE(
                 int(cacheQ.j[i] ^ (1 << cacheQ.r_min[i])),
                 int(cacheK.j[i]),
                 int(cachePE.j[i]),
-                lut.y_dim, args)
-            backward_update(lut, cacheQ, i, j, jbar, y_gradient, x_gradientQ)
+                args)
+            backward_update(lut, cacheQ, i, j_bin, jbar_bin, y_gradient, x_gradientQ)
         else:
-            jbar = CONCATENATE(
+            jbar_bin = CONCATENATE(
                 int(cacheQ.j[i]),
                 int(cacheK.j[i] ^ (1 << cacheK.r_min[i])),
                 int(cachePE.j[i]),
-                lut.y_dim, args)
-            backward_update(lut, cacheK, i, j, jbar, y_gradient, x_gradientK)
+                args)
+            backward_update(lut, cacheK, i, j_bin, jbar_bin, y_gradient, x_gradientK)
 
         if (abs(cachePE.u_min[i]) < abs(cacheQ.u_min[i]) and
                 abs(cachePE.u_min[i]) < abs(cacheK.u_min[i])):
-            jbarPE = CONCATENATE(
+            jbarPE_bin = CONCATENATE(
                 int(cacheQ.j[i]),
                 int(cacheK.j[i]),
                 int(cachePE.j[i] ^ (1 << cachePE.r_min[i])),
-                lut.y_dim, args)
-            giPE = 0.0
-            for k in range(lut.y_dim):
-                giPE += y_gradient[k] * (lut.S[i][jbarPE + k] - lut.S[i][j + k])
+                args)
+            giPE = np.dot(y_gradient[:lut.y_dim], lut.S[i][jbarPE_bin] - lut.S[i][j_bin])
             deltaPE = giPE * Up(cachePE.u_min[i])
             PE_grad[i][cachePE.r_min[i]] += deltaPE
 
-        lut.S[i][j:j + lut.y_dim] -= learning_rate * y_gradient[:lut.y_dim]
+        lut.S[i, j_bin] -= learning_rate * y_gradient[:lut.y_dim]
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +409,7 @@ def build_Model(m, args):
             ).reshape(CONTEXT_SIZE, N_T, POSITIONAL_DIM)
             build_LUT(m.head[l][h].V, N_C + N_C + POSITIONAL_DIM, EMBEDDING_DIM, args)
 
-    build_LUT(m.unembedder, N_C, VOCAB_SIZE, args)
+    m.output_head.build(N_C, args)
 
 
 def attention_forward(head, x, y, args):
@@ -346,7 +450,6 @@ def model_forward(m, args):
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
-    VOCAB_SIZE = args.vocab_size
 
     for l in range(NUM_LAYERS):
         x = m.z.copy()
@@ -357,10 +460,7 @@ def model_forward(m, args):
             cache_index(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
             LUT_forward(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
 
-    m.output[:] = 0.0
-    for pos in range(CONTEXT_SIZE):
-        cache_index(m.unembedder, m.unembedder_vars[pos], m.z[pos], args)
-        LUT_forward(m.unembedder, m.unembedder_vars[pos], m.output[pos], args)
+    m.output_head.forward(m.z, args)
 
 
 def model_backward(m, args):
@@ -371,8 +471,7 @@ def model_backward(m, args):
 
     x_grad = np.zeros((CONTEXT_SIZE, EMBEDDING_DIM), dtype=np.float32)
 
-    for pos in range(CONTEXT_SIZE):
-        LUT_backward(m.unembedder, m.unembedder_vars[pos], x_grad[pos], m.output[pos], args)
+    m.output_head.backward(x_grad, args)
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
@@ -391,13 +490,8 @@ def model_backward(m, args):
 
 
 def model_training_step(m, args):
-    CONTEXT_SIZE = args.context_size
-    VOCAB_SIZE = args.vocab_size
-
     model_forward(m, args)
-    for pos in range(CONTEXT_SIZE):
-        softmax(m.output[pos], VOCAB_SIZE, 1.0)
-        m.output[pos][m.tokens[pos + 1]] -= 1.0  # output becomes a gradient
+    m.output_head.compute_gradients(args)
     model_backward(m, args)
 
 
@@ -466,15 +560,12 @@ def load_snippet(m, data_array, char_start, args):
         m.tokens[pos] = int(data_array[char_start + pos])
     m.tokens[CONTEXT_SIZE] = int(data_array[char_start + CONTEXT_SIZE])
 
+    m.output_head.load_targets(m.tokens, CONTEXT_SIZE)
+
 
 def model_inference(m, args):
-    CONTEXT_SIZE = args.context_size
-    VOCAB_SIZE = args.vocab_size
-
     model_forward(m, args)
-    softmax(m.output[CONTEXT_SIZE - 1], VOCAB_SIZE, args.temperature)
-    sampled_index = sample(m.output[CONTEXT_SIZE - 1], VOCAB_SIZE)
-    return sampled_index
+    return m.output_head.sample_token(args)
 
 
 def model_prompt_response(m, prompt_text, response_length, args):
@@ -533,12 +624,18 @@ def main():
     parser.add_argument('--validation-interval', type=int, default=10000)
     parser.add_argument('--temperature', type=float, default=0.4)
     parser.add_argument('--loss-file', type=str, default='loss.csv')
+    parser.add_argument('--factored-output', action='store_true',
+                        help='Use factored base-256 decomposition for unembedder (faster for large vocabs)')
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
     enc = tiktoken.get_encoding(args.tokenizer)
     args.vocab_size = enc.n_vocab
     args.enc = enc
+
+    # Factored output dimensions
+    args.vocab_hi = (args.vocab_size + 255) // 256
+    args.vocab_lo = 256
 
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
@@ -569,10 +666,7 @@ def main():
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args)
                 model_forward(m, args)
-                softmax(m.output[args.context_size - 1], args.vocab_size, 1.0)
-                target = m.tokens[args.context_size]
-                prob = m.output[args.context_size - 1][target]
-                validation_loss += -math.log(max(prob, 1e-30))
+                validation_loss += m.output_head.validation_loss(args)
             validation_loss /= args.testing_length
 
             perplexity = math.exp(validation_loss)
