@@ -699,20 +699,34 @@ def model_backward(m, args):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         lut = m.FFN[l]
         trees = lut.trees
-        for pos in range(args.context_size):
-            j_bins = m._ffn_j[l][pos]
-            jbar_bins = j_bins ^ (1 << m._ffn_r_min[l][pos])
-            S_j = _f32(lut.S[trees, j_bins])
-            S_jbar = _f32(lut.S[trees, jbar_bins])
-            gi = ((S_jbar - S_j) * y_grad[pos, :lut.y_dim]).sum(axis=1)
-            sign_u = np.where(m._ffn_u_min[l][pos] > 0, 1.0, -1.0)
-            v = gi * (-0.5 * sign_u / (1 + np.abs(m._ffn_u_min[l][pos]))**2)
-            n = x_grad.shape[1]
-            idx_a = lut.a_arr[trees, m._ffn_r_min[l][pos]]
-            idx_b = lut.b_arr[trees, m._ffn_r_min[l][pos]]
-            x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
-            x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
-            lut.S[trees, j_bins] -= learning_rate * y_grad[pos, :lut.y_dim]
+        CS = args.context_size
+        y_dim = lut.y_dim
+        j = m._ffn_j[l]          # (CS, N_T)
+        r_min = m._ffn_r_min[l]  # (CS, N_T)
+        u_min = m._ffn_u_min[l]  # (CS, N_T)
+
+        jbar = j ^ (1 << r_min)                              # (CS, N_T)
+        S_j = _f32(lut.S[trees, j])                          # (CS, N_T, y_dim)
+        S_jbar = _f32(lut.S[trees, jbar])                    # (CS, N_T, y_dim)
+        gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)  # (CS, N_T)
+        sign_u = np.where(u_min > 0, 1.0, -1.0)
+        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)   # (CS, N_T)
+
+        # Gradient scatter via flat bincount
+        ED = EMBEDDING_DIM
+        pos_idx = np.arange(CS)[:, np.newaxis]
+        idx_a = lut.a_arr[trees, r_min]                      # (CS, N_T)
+        idx_b = lut.b_arr[trees, r_min]                      # (CS, N_T)
+        flat_a = (pos_idx * ED + idx_a).ravel()
+        flat_b = (pos_idx * ED + idx_b).ravel()
+        v_flat = v.ravel()
+        flat_size = x_grad.size
+        x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
+        x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
+
+        # S update per position (no duplicates within a position)
+        for pos in range(CS):
+            lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         for h in range(NUM_HEADS):
