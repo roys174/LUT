@@ -35,7 +35,7 @@ def random_vector(size, scale):
 
 def sample(probabilities, n):
     cumsum = np.cumsum(probabilities[:n])
-    return int(np.searchsorted(cumsum, random.random()))
+    return min(int(np.searchsorted(cumsum, random.random())), n - 1)
 
 
 def fill_vector_with_random_integers(N, max_value):
