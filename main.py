@@ -372,8 +372,13 @@ def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_di
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                 y_grad, x_grad, pos_grad, a_arr, b_arr,
                                 shift_qk, pd, CS, N_T, y_dim, lr):
-    """Fused attention backward: S reads + dot + surrogate grad + scatter + PE + S update."""
+    """Fused attention backward: S reads + dot + surrogate grad + scatter + PE + S update.
+
+    Two-pass per pos: (1) read S & compute gradients for all pos1, (2) update S.
+    This matches the NumPy semantics where all pos1 read S before any updates.
+    """
     for pos in range(1, CS):
+        # Pass 1: gradient computation (reads S, does not modify it)
         for pos1 in range(pos):
             pe_pos = pos - pos1
             for t in range(N_T):
@@ -391,7 +396,6 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                     flip_bit = all_rV[pos1, t] + pd
                 jbar = j_bin ^ (1 << flip_bit)
 
-                # gi = dot(S[t,jbar,:] - S[t,j_bin,:], y_grad[pos,:y_dim])
                 gi = 0.0
                 for d in range(y_dim):
                     gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
@@ -429,7 +433,10 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                     deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
                     pos_grad[pe_pos, t, rPE] += deltaPE
 
-                # S update
+        # Pass 2: S update (after all pos1 have been read for this pos)
+        for pos1 in range(pos):
+            for t in range(N_T):
+                j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
                 for d in range(y_dim):
                     S[t, j_bin, d] -= lr * y_grad[pos, d]
 
@@ -653,41 +660,36 @@ def model_backward(m, args):
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         lut = m.FFN[l]
+        trees = lut.trees
         CS = args.context_size
+        y_dim = lut.y_dim
+        j = m._ffn_j[l]
+        r_min = m._ffn_r_min[l]
+        u_min = m._ffn_u_min[l]
 
-        if HAS_NUMBA and lut.S.dtype == np.float32:
-            _lut_backward_kernel(lut.S, lut.trees, m._ffn_j[l], m._ffn_r_min[l],
-                                  m._ffn_u_min[l], y_grad, x_grad,
-                                  lut.a_arr, lut.b_arr,
-                                  lut.y_dim, CS, args.n_t,
-                                  np.float32(learning_rate))
-        else:
-            trees = lut.trees
-            y_dim = lut.y_dim
-            j = m._ffn_j[l]
-            r_min = m._ffn_r_min[l]
-            u_min = m._ffn_u_min[l]
+        # FFN backward uses batch-read semantics: read S for ALL positions
+        # before any updates. This can't be fused into a per-position kernel
+        # because positions share bins (2^n_c is small).
+        jbar = j ^ (1 << r_min)
+        S_j = _f32(lut.S[trees, j])
+        S_jbar = _f32(lut.S[trees, jbar])
+        gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)
+        sign_u = np.where(u_min > 0, 1.0, -1.0)
+        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
 
-            jbar = j ^ (1 << r_min)
-            S_j = _f32(lut.S[trees, j])
-            S_jbar = _f32(lut.S[trees, jbar])
-            gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)
-            sign_u = np.where(u_min > 0, 1.0, -1.0)
-            v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
+        ED = EMBEDDING_DIM
+        pos_idx = np.arange(CS)[:, np.newaxis]
+        idx_a = lut.a_arr[trees, r_min]
+        idx_b = lut.b_arr[trees, r_min]
+        flat_a = (pos_idx * ED + idx_a).ravel()
+        flat_b = (pos_idx * ED + idx_b).ravel()
+        v_flat = v.ravel()
+        flat_size = x_grad.size
+        x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
+        x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
 
-            ED = EMBEDDING_DIM
-            pos_idx = np.arange(CS)[:, np.newaxis]
-            idx_a = lut.a_arr[trees, r_min]
-            idx_b = lut.b_arr[trees, r_min]
-            flat_a = (pos_idx * ED + idx_a).ravel()
-            flat_b = (pos_idx * ED + idx_b).ravel()
-            v_flat = v.ravel()
-            flat_size = x_grad.size
-            x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
-            x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
-
-            for pos in range(CS):
-                lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
+        for pos in range(CS):
+            lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         for h in range(NUM_HEADS):
