@@ -82,25 +82,35 @@ class LUTcache:
 
 
 class AttentionHead:
-    __slots__ = ['V', 'V_cache', 'Positional_encoding', 'PE_cache']
+    __slots__ = ['V', 'Positional_encoding',
+                 '_v_j', '_v_r_min', '_v_u_min',
+                 '_pe_j', '_pe_r_min', '_pe_u_min']
     def __init__(self, args):
         N_T = args.n_t
+        CS = args.context_size
         POSITIONAL_DIM = args.positional_dim
         self.V = LUT(N_T)
-        self.V_cache = [LUTcache(N_T) for _ in range(args.context_size)]
-        self.Positional_encoding = np.zeros((args.context_size, N_T, POSITIONAL_DIM), dtype=np.float32)
-        self.PE_cache = [LUTcache(N_T) for _ in range(args.context_size)]
+        self.Positional_encoding = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+        self._v_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._v_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._v_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        self._pe_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._pe_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._pe_u_min = np.zeros((CS, N_T), dtype=np.float32)
 
 
 class StandardOutputHead:
-    __slots__ = ['unembedder', 'unembedder_vars', 'output', 'tokens']
+    __slots__ = ['unembedder', 'output', 'tokens', '_j', '_r_min', '_u_min']
     def __init__(self, args):
         N_T = args.n_t
+        CS = args.context_size
         VOCAB_SIZE = args.vocab_size
         self.unembedder = LUT(N_T)
-        self.unembedder_vars = [LUTcache(N_T) for _ in range(args.context_size)]
-        self.output = np.zeros((args.context_size, VOCAB_SIZE), dtype=np.float32)
+        self.output = np.zeros((CS, VOCAB_SIZE), dtype=np.float32)
         self.tokens = None  # set by load_targets
+        self._j = np.zeros((CS, N_T), dtype=np.int32)
+        self._r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._u_min = np.zeros((CS, N_T), dtype=np.float32)
 
     def build(self, n_c, args):
         build_LUT(self.unembedder, n_c, args.vocab_size, args)
@@ -110,13 +120,29 @@ class StandardOutputHead:
 
     def forward(self, z, args):
         self.output[:] = 0.0
+        cache_index_batch(self.unembedder, z, self._j, self._r_min, self._u_min)
+        lut = self.unembedder
         for pos in range(args.context_size):
-            cache_index(self.unembedder, self.unembedder_vars[pos], z[pos], args)
-            LUT_forward(self.unembedder, self.unembedder_vars[pos], self.output[pos], args)
+            self.output[pos, :lut.y_dim] += _f32(lut.S[lut.trees, self._j[pos]]).sum(axis=0)
 
     def backward(self, x_grad, args):
+        global learning_rate
+        lut = self.unembedder
+        trees = lut.trees
         for pos in range(args.context_size):
-            LUT_backward(self.unembedder, self.unembedder_vars[pos], x_grad[pos], self.output[pos], args)
+            j_bins = self._j[pos]
+            jbar_bins = j_bins ^ (1 << self._r_min[pos])
+            S_j = _f32(lut.S[trees, j_bins])
+            S_jbar = _f32(lut.S[trees, jbar_bins])
+            gi = ((S_jbar - S_j) * self.output[pos, :lut.y_dim]).sum(axis=1)
+            sign_u = np.where(self._u_min[pos] > 0, 1.0, -1.0)
+            v = gi * (-0.5 * sign_u / (1 + np.abs(self._u_min[pos]))**2)
+            n = x_grad.shape[1]
+            idx_a = lut.a_arr[trees, self._r_min[pos]]
+            idx_b = lut.b_arr[trees, self._r_min[pos]]
+            x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
+            x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
+            lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
         VOCAB_SIZE = args.vocab_size
@@ -138,20 +164,27 @@ class StandardOutputHead:
 
 
 class FactoredOutputHead:
-    __slots__ = ['unembedder_hi', 'unembedder_hi_vars', 'output_hi',
-                 'unembedder_lo', 'unembedder_lo_vars', 'output_lo',
-                 'tokens_hi', 'tokens_lo']
+    __slots__ = ['unembedder_hi', 'output_hi',
+                 'unembedder_lo', 'output_lo',
+                 'tokens_hi', 'tokens_lo',
+                 '_hi_j', '_hi_r_min', '_hi_u_min',
+                 '_lo_j', '_lo_r_min', '_lo_u_min']
     def __init__(self, args):
         N_T = args.n_t
+        CS = args.context_size
         VOCAB_HI = args.vocab_hi
         self.unembedder_hi = LUT(N_T)
-        self.unembedder_hi_vars = [LUTcache(N_T) for _ in range(args.context_size)]
-        self.output_hi = np.zeros((args.context_size, VOCAB_HI), dtype=np.float32)
+        self.output_hi = np.zeros((CS, VOCAB_HI), dtype=np.float32)
         self.unembedder_lo = LUT(N_T)
-        self.unembedder_lo_vars = [LUTcache(N_T) for _ in range(args.context_size)]
-        self.output_lo = np.zeros((args.context_size, 256), dtype=np.float32)
-        self.tokens_hi = np.zeros(args.context_size + 1, dtype=np.int32)
-        self.tokens_lo = np.zeros(args.context_size + 1, dtype=np.int32)
+        self.output_lo = np.zeros((CS, 256), dtype=np.float32)
+        self.tokens_hi = np.zeros(CS + 1, dtype=np.int32)
+        self.tokens_lo = np.zeros(CS + 1, dtype=np.int32)
+        self._hi_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._hi_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._hi_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        self._lo_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._lo_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._lo_u_min = np.zeros((CS, N_T), dtype=np.float32)
 
     def build(self, n_c, args):
         build_LUT(self.unembedder_hi, n_c, args.vocab_hi, args)
@@ -165,16 +198,33 @@ class FactoredOutputHead:
     def forward(self, z, args):
         self.output_hi[:] = 0.0
         self.output_lo[:] = 0.0
+        cache_index_batch(self.unembedder_hi, z, self._hi_j, self._hi_r_min, self._hi_u_min)
+        cache_index_batch(self.unembedder_lo, z, self._lo_j, self._lo_r_min, self._lo_u_min)
         for pos in range(args.context_size):
-            cache_index(self.unembedder_hi, self.unembedder_hi_vars[pos], z[pos], args)
-            LUT_forward(self.unembedder_hi, self.unembedder_hi_vars[pos], self.output_hi[pos], args)
-            cache_index(self.unembedder_lo, self.unembedder_lo_vars[pos], z[pos], args)
-            LUT_forward(self.unembedder_lo, self.unembedder_lo_vars[pos], self.output_lo[pos], args)
+            self.output_hi[pos, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j[pos]]).sum(axis=0)
+            self.output_lo[pos, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j[pos]]).sum(axis=0)
 
     def backward(self, x_grad, args):
-        for pos in range(args.context_size):
-            LUT_backward(self.unembedder_hi, self.unembedder_hi_vars[pos], x_grad[pos], self.output_hi[pos], args)
-            LUT_backward(self.unembedder_lo, self.unembedder_lo_vars[pos], x_grad[pos], self.output_lo[pos], args)
+        global learning_rate
+        for lut, j, r_min, u_min, output in [
+            (self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
+            (self.unembedder_lo, self._lo_j, self._lo_r_min, self._lo_u_min, self.output_lo),
+        ]:
+            trees = lut.trees
+            for pos in range(args.context_size):
+                j_bins = j[pos]
+                jbar_bins = j_bins ^ (1 << r_min[pos])
+                S_j = _f32(lut.S[trees, j_bins])
+                S_jbar = _f32(lut.S[trees, jbar_bins])
+                gi = ((S_jbar - S_j) * output[pos, :lut.y_dim]).sum(axis=1)
+                sign_u = np.where(u_min[pos] > 0, 1.0, -1.0)
+                v = gi * (-0.5 * sign_u / (1 + np.abs(u_min[pos]))**2)
+                n = x_grad.shape[1]
+                idx_a = lut.a_arr[trees, r_min[pos]]
+                idx_b = lut.b_arr[trees, r_min[pos]]
+                x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
+                x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
+                lut.S[trees, j_bins] -= learning_rate * output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
         VOCAB_HI = args.vocab_hi
@@ -208,21 +258,25 @@ class FactoredOutputHead:
 
 
 class Model:
-    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN', 'FFN_cache', 'head', 'output_head']
+    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
+                 '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head']
     def __init__(self, args):
         VOCAB_SIZE = args.vocab_size
         EMBEDDING_DIM = args.embedding_dim
         NUM_LAYERS = args.num_layers
         NUM_HEADS = args.num_heads
         N_T = args.n_t
+        CS = args.context_size
 
         self.Token_embedder = np.zeros((VOCAB_SIZE, EMBEDDING_DIM), dtype=np.float32)
-        self.tokens = np.zeros(args.context_size + 1, dtype=np.int32)
-        self.z = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
+        self.tokens = np.zeros(CS + 1, dtype=np.int32)
+        self.z = np.zeros((CS, EMBEDDING_DIM), dtype=np.float32)
         self._x_buf = np.zeros_like(self.z)
 
         self.FFN = [LUT(N_T) for _ in range(NUM_LAYERS)]
-        self.FFN_cache = [[LUTcache(N_T) for _ in range(args.context_size)] for _ in range(NUM_LAYERS)]
+        self._ffn_j = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
+        self._ffn_r_min = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
+        self._ffn_u_min = [np.zeros((CS, N_T), dtype=np.float32) for _ in range(NUM_LAYERS)]
 
         self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
 
@@ -272,11 +326,31 @@ def cache_index(lut, cache, x, args):
     cache.u_min[:] = u[lut.trees, cache.r_min]
 
 
+def cache_index_batch(lut, x_batch, j_out, r_min_out, u_min_out):
+    """Batch cache_index across all positions. x_batch: (CS, dim), outputs: (CS, N_T)."""
+    u = x_batch[:, lut.a_arr] - x_batch[:, lut.b_arr]      # (CS, N_T, N_C)
+    j_out[:] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=2)
+    abs_u = np.abs(u)
+    r_min_out[:] = abs_u.argmin(axis=2)
+    cs_idx = np.arange(x_batch.shape[0])[:, np.newaxis]
+    u_min_out[:] = u[cs_idx, lut.trees, r_min_out]
+
+
 def cache_PE_index(cache, u, args):
     cache.j[:] = ((u > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=1)
     abs_u = np.abs(u)
     cache.r_min[:] = abs_u.argmin(axis=1)
     cache.u_min[:] = u[np.arange(u.shape[0]), cache.r_min]
+
+
+def cache_PE_index_batch(u_batch, j_out, r_min_out, u_min_out, args):
+    """Batch cache_PE_index across all positions. u_batch: (CS, N_T, PD), outputs: (CS, N_T)."""
+    j_out[:] = ((u_batch > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=2)
+    abs_u = np.abs(u_batch)
+    r_min_out[:] = abs_u.argmin(axis=2)
+    cs_idx = np.arange(u_batch.shape[0])[:, np.newaxis]
+    tree_idx = np.arange(u_batch.shape[1])
+    u_min_out[:] = u_batch[cs_idx, tree_idx, r_min_out]
 
 
 def _f32(arr):
@@ -286,6 +360,11 @@ def _f32(arr):
 
 def LUT_forward(lut, cache, y, args):
     y[:lut.y_dim] += _f32(lut.S[lut.trees, cache.j]).sum(axis=0)
+
+
+def LUT_forward_batch(lut, j):
+    """Batch LUT_forward across all positions. j: (CS, N_T). Returns (CS, y_dim)."""
+    return _f32(lut.S[lut.trees, j]).sum(axis=1)  # (CS, y_dim)
 
 
 def backward_update(lut, cache, i, j_bin, jbar_bin, y_gradient, gradient):
@@ -316,6 +395,40 @@ def LUT_backward(lut, cache, x_gradient, y_gradient, args):
     x_gradient -= np.bincount(idx_b, weights=v, minlength=n)
 
     lut.S[trees, j_bins] -= learning_rate * y_gradient[:lut.y_dim]
+
+
+def LUT_backward_batch(lut, j, r_min, u_min, x_grad_batch, y_grad_batch):
+    """Batch LUT_backward across all positions.
+    j, r_min: (CS, N_T) int, u_min: (CS, N_T) float,
+    x_grad_batch, y_grad_batch: (CS, dim)."""
+    global learning_rate
+    trees = lut.trees
+    CS, N_T = j.shape
+    y_dim = lut.y_dim
+    jbar = j ^ (1 << r_min)
+
+    S_j = _f32(lut.S[trees, j])        # (CS, N_T, y_dim)
+    S_jbar = _f32(lut.S[trees, jbar])   # (CS, N_T, y_dim)
+
+    gi = ((S_jbar - S_j) * y_grad_batch[:, np.newaxis, :y_dim]).sum(axis=2)  # (CS, N_T)
+    sign_u = np.where(u_min > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)  # (CS, N_T)
+
+    # Gradient scatter via flat bincount
+    ED = x_grad_batch.shape[1]
+    pos_idx = np.arange(CS)[:, np.newaxis]
+    idx_a = lut.a_arr[trees, r_min]  # (CS, N_T)
+    idx_b = lut.b_arr[trees, r_min]  # (CS, N_T)
+    flat_a = (pos_idx * ED + idx_a).ravel()
+    flat_b = (pos_idx * ED + idx_b).ravel()
+    v_flat = v.ravel()
+    flat_size = x_grad_batch.size
+    x_grad_batch.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
+    x_grad_batch.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
+
+    # S update: per position to use fast direct indexed assignment (no duplicates within a position)
+    for pos_i in range(CS):
+        lut.S[trees, j[pos_i]] -= learning_rate * y_grad_batch[pos_i, :y_dim]
 
 
 def CONCATENATE(Q, P, PE, args):
@@ -431,13 +544,11 @@ def attention_forward(head, x, y, args):
     trees = lut.trees
     y_dim = lut.y_dim
 
-    for pos in range(CS):
-        cache_index(lut, head.V_cache[pos], x[pos], args)
-        cache_PE_index(head.PE_cache[pos], head.Positional_encoding[pos], args)
+    cache_index_batch(lut, x, head._v_j, head._v_r_min, head._v_u_min)
+    cache_PE_index_batch(head.Positional_encoding, head._pe_j, head._pe_r_min, head._pe_u_min, args)
 
-    # Pre-gather all cache j values
-    all_jV = np.array([head.V_cache[p].j for p in range(CS)])    # (CS, N_T)
-    all_jPE = np.array([head.PE_cache[p].j for p in range(CS)])  # (CS, N_T)
+    all_jV = head._v_j    # (CS, N_T) — zero-copy
+    all_jPE = head._pe_j  # (CS, N_T) — zero-copy
 
     # All (pos1, pos) pairs where pos1 < pos
     all_pos1, all_pos = np.triu_indices(CS, k=1)
@@ -462,14 +573,22 @@ def attention_backward(head, x_grad, y_grad, args):
     y_dim = lut.y_dim
 
     pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+    ED = x_grad.shape[1]
+    flat_size = x_grad.size
 
-    # Pre-gather all cache values into contiguous arrays
-    all_jV = np.array([head.V_cache[p].j for p in range(CS)])        # (CS, N_T)
-    all_rV = np.array([head.V_cache[p].r_min for p in range(CS)])    # (CS, N_T)
-    all_uV = np.array([head.V_cache[p].u_min for p in range(CS)])    # (CS, N_T)
-    all_jPE = np.array([head.PE_cache[p].j for p in range(CS)])      # (CS, N_T)
-    all_rPE = np.array([head.PE_cache[p].r_min for p in range(CS)])  # (CS, N_T)
-    all_uPE = np.array([head.PE_cache[p].u_min for p in range(CS)])  # (CS, N_T)
+    # Cache arrays already computed in attention_forward — zero-copy references
+    all_jV = head._v_j        # (CS, N_T)
+    all_rV = head._v_r_min    # (CS, N_T)
+    all_uV = head._v_u_min    # (CS, N_T)
+    all_jPE = head._pe_j      # (CS, N_T)
+    all_rPE = head._pe_r_min  # (CS, N_T)
+    all_uPE = head._pe_u_min  # (CS, N_T)
+
+    # Pre-compute abs values and reusable index grids
+    abs_all_uV = np.abs(all_uV)    # (CS, N_T)
+    abs_all_uPE = np.abs(all_uPE)  # (CS, N_T)
+    trees_b_full = np.broadcast_to(trees, (CS, N_T))
+    pos1_grid = np.broadcast_to(np.arange(CS)[:, np.newaxis], (CS, N_T))
 
     for pos in range(1, CS):
         P = pos  # number of pos1 values to batch
@@ -478,26 +597,23 @@ def attention_backward(head, x_grad, y_grad, args):
         # Q cache (same for all pos1, broadcasts to (P, N_T))
         jQ = all_jV[pos]     # (N_T,)
         rQ = all_rV[pos]     # (N_T,)
-        uQ = all_uV[pos]     # (N_T,)
+        abs_uQ = abs_all_uV[pos]  # (N_T,)
 
         # K caches (vary by pos1)
         jK = all_jV[:P]      # (P, N_T)
         rK = all_rV[:P]      # (P, N_T)
-        uK = all_uV[:P]      # (P, N_T)
+        abs_uK = abs_all_uV[:P]  # (P, N_T)
 
         # PE caches (indexed by pos - pos1)
         pe_idx = pos - np.arange(P)   # [pos, pos-1, ..., 1]
         jPE = all_jPE[pe_idx]   # (P, N_T)
         rPE = all_rPE[pe_idx]   # (P, N_T)
-        uPE = all_uPE[pe_idx]   # (P, N_T)
 
         # Compute concatenated bin indices
         j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
         S_j = _f32(lut.S[trees, j_bins])  # (P, N_T, y_dim)
 
         # Q/K branch: which (pair, tree) elements have |u_Q| < |u_K|?
-        abs_uQ = np.abs(uQ)   # (N_T,) broadcasts to (P, N_T)
-        abs_uK = np.abs(uK)   # (P, N_T)
         q_mask = abs_uQ < abs_uK  # (P, N_T)
 
         # Compute jbar for both branches, then select
@@ -506,15 +622,17 @@ def attention_backward(head, x_grad, y_grad, args):
         jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
         S_jbar = _f32(lut.S[trees, jbar_bins])  # (P, N_T, y_dim)
 
-        # Gradient computation
+        # Gradient computation — use pre-computed abs values to avoid redundant np.abs
         gi = ((S_jbar - S_j) * y_g).sum(axis=2)        # (P, N_T)
-        u_min_qk = np.where(q_mask, uQ, uK)            # (P, N_T)
+        uQ_vals = all_uV[pos]
+        uK_vals = all_uV[:P]
+        u_min_qk = np.where(q_mask, uQ_vals, uK_vals)  # (P, N_T)
+        abs_u_min_qk = np.where(q_mask, abs_uQ, abs_uK) # (P, N_T) — no redundant abs
         sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
-        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min_qk))**2)
+        v = gi * (-0.5 * sign_u / (1 + abs_u_min_qk)**2)
         r_min_qk = np.where(q_mask, rQ, rK)            # (P, N_T)
 
-        trees_b = np.broadcast_to(trees, (P, N_T))
-        ED = x_grad.shape[1]
+        trees_b = trees_b_full[:P]  # zero-copy slice
 
         # Q gradient scatter -> all go to x_grad[pos]
         if q_mask.any():
@@ -530,26 +648,26 @@ def attention_backward(head, x_grad, y_grad, args):
             k_t = trees_b[k_mask]
             k_r = r_min_qk[k_mask]
             k_v = v[k_mask]
-            k_pos1 = np.broadcast_to(np.arange(P)[:, np.newaxis], (P, N_T))[k_mask]
+            k_pos1 = pos1_grid[:P][k_mask]
             flat_a = k_pos1 * ED + lut.a_arr[k_t, k_r]
             flat_b = k_pos1 * ED + lut.b_arr[k_t, k_r]
-            flat_size = x_grad.size
             x_grad.ravel()[:] += np.bincount(flat_a, weights=k_v, minlength=flat_size)
             x_grad.ravel()[:] -= np.bincount(flat_b, weights=k_v, minlength=flat_size)
 
-        # PE gradient
-        abs_uPE = np.abs(uPE)
+        # PE gradient — use pre-computed abs values
+        abs_uPE = abs_all_uPE[pe_idx]  # (P, N_T)
         pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
         if pe_mask.any():
             jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << rPE), args)
             S_jbarPE = _f32(lut.S[trees, jbarPE_bins])  # (P, N_T, y_dim)
             giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)  # (P, N_T)
-            u_pe = uPE[pe_mask]
+            uPE_vals = all_uPE[pe_idx]
+            u_pe = uPE_vals[pe_mask]
             sign_pe = np.where(u_pe > 0, 1.0, -1.0)
             deltaPE = giPE[pe_mask] * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
             pe_t = trees_b[pe_mask]
             pe_r = rPE[pe_mask]
-            pe_pair = np.broadcast_to(np.arange(P)[:, np.newaxis], (P, N_T))[pe_mask]
+            pe_pair = pos1_grid[:P][pe_mask]
             np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
 
         # S update: accumulate for duplicate (tree, bin) across pos1 values
@@ -571,9 +689,10 @@ def model_forward(m, args):
         for h in range(NUM_HEADS):
             attention_forward(m.head[l][h], m._x_buf, m.z, args)
 
+        cache_index_batch(m.FFN[l], m.z, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
+        lut = m.FFN[l]
         for pos in range(args.context_size):
-            cache_index(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
-            LUT_forward(m.FFN[l], m.FFN_cache[l][pos], m.z[pos], args)
+            m.z[pos, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l][pos]]).sum(axis=0)
 
     m.output_head.forward(m.z, args)
 
@@ -589,8 +708,22 @@ def model_backward(m, args):
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
+        lut = m.FFN[l]
+        trees = lut.trees
         for pos in range(args.context_size):
-            LUT_backward(m.FFN[l], m.FFN_cache[l][pos], x_grad[pos], y_grad[pos], args)
+            j_bins = m._ffn_j[l][pos]
+            jbar_bins = j_bins ^ (1 << m._ffn_r_min[l][pos])
+            S_j = _f32(lut.S[trees, j_bins])
+            S_jbar = _f32(lut.S[trees, jbar_bins])
+            gi = ((S_jbar - S_j) * y_grad[pos, :lut.y_dim]).sum(axis=1)
+            sign_u = np.where(m._ffn_u_min[l][pos] > 0, 1.0, -1.0)
+            v = gi * (-0.5 * sign_u / (1 + np.abs(m._ffn_u_min[l][pos]))**2)
+            n = x_grad.shape[1]
+            idx_a = lut.a_arr[trees, m._ffn_r_min[l][pos]]
+            idx_b = lut.b_arr[trees, m._ffn_r_min[l][pos]]
+            x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
+            x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
+            lut.S[trees, j_bins] -= learning_rate * y_grad[pos, :lut.y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         for h in range(NUM_HEADS):
