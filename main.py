@@ -122,8 +122,7 @@ class StandardOutputHead:
         self.output[:] = 0.0
         cache_index_batch(self.unembedder, z, self._j, self._r_min, self._u_min)
         lut = self.unembedder
-        for pos in range(args.context_size):
-            self.output[pos, :lut.y_dim] += _f32(lut.S[lut.trees, self._j[pos]]).sum(axis=0)
+        self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
 
     def backward(self, x_grad, args):
         global learning_rate
@@ -200,9 +199,8 @@ class FactoredOutputHead:
         self.output_lo[:] = 0.0
         cache_index_batch(self.unembedder_hi, z, self._hi_j, self._hi_r_min, self._hi_u_min)
         cache_index_batch(self.unembedder_lo, z, self._lo_j, self._lo_r_min, self._lo_u_min)
-        for pos in range(args.context_size):
-            self.output_hi[pos, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j[pos]]).sum(axis=0)
-            self.output_lo[pos, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j[pos]]).sum(axis=0)
+        self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
+        self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
 
     def backward(self, x_grad, args):
         global learning_rate
@@ -683,8 +681,7 @@ def model_forward(m, args):
 
         cache_index_batch(m.FFN[l], m.z, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
         lut = m.FFN[l]
-        for pos in range(args.context_size):
-            m.z[pos, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l][pos]]).sum(axis=0)
+        m.z[:, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l]]).sum(axis=1)
 
     m.output_head.forward(m.z, args)
 
