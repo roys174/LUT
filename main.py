@@ -13,6 +13,15 @@ import numpy as np
 import tiktoken
 from tqdm import tqdm
 
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        def decorator(f): return f
+        return decorator
+
 
 # Global learning rate (updated each step)
 learning_rate = 0.0
@@ -113,21 +122,27 @@ class StandardOutputHead:
     def backward(self, x_grad, args):
         global learning_rate
         lut = self.unembedder
-        trees = lut.trees
-        for pos in range(args.context_size):
-            j_bins = self._j[pos]
-            jbar_bins = j_bins ^ (1 << self._r_min[pos])
-            S_j = _f32(lut.S[trees, j_bins])
-            S_jbar = _f32(lut.S[trees, jbar_bins])
-            gi = ((S_jbar - S_j) * self.output[pos, :lut.y_dim]).sum(axis=1)
-            sign_u = np.where(self._u_min[pos] > 0, 1.0, -1.0)
-            v = gi * (-0.5 * sign_u / (1 + np.abs(self._u_min[pos]))**2)
-            n = x_grad.shape[1]
-            idx_a = lut.a_arr[trees, self._r_min[pos]]
-            idx_b = lut.b_arr[trees, self._r_min[pos]]
-            x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
-            x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
-            lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
+        if HAS_NUMBA and lut.S.dtype == np.float32:
+            _lut_backward_kernel(lut.S, lut.trees, self._j, self._r_min, self._u_min,
+                                  self.output, x_grad, lut.a_arr, lut.b_arr,
+                                  lut.y_dim, args.context_size, args.n_t,
+                                  np.float32(learning_rate))
+        else:
+            trees = lut.trees
+            for pos in range(args.context_size):
+                j_bins = self._j[pos]
+                jbar_bins = j_bins ^ (1 << self._r_min[pos])
+                S_j = _f32(lut.S[trees, j_bins])
+                S_jbar = _f32(lut.S[trees, jbar_bins])
+                gi = ((S_jbar - S_j) * self.output[pos, :lut.y_dim]).sum(axis=1)
+                sign_u = np.where(self._u_min[pos] > 0, 1.0, -1.0)
+                v = gi * (-0.5 * sign_u / (1 + np.abs(self._u_min[pos]))**2)
+                n = x_grad.shape[1]
+                idx_a = lut.a_arr[trees, self._r_min[pos]]
+                idx_b = lut.b_arr[trees, self._r_min[pos]]
+                x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
+                x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
+                lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
         VOCAB_SIZE = args.vocab_size
@@ -194,21 +209,27 @@ class FactoredOutputHead:
             (self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
             (self.unembedder_lo, self._lo_j, self._lo_r_min, self._lo_u_min, self.output_lo),
         ]:
-            trees = lut.trees
-            for pos in range(args.context_size):
-                j_bins = j[pos]
-                jbar_bins = j_bins ^ (1 << r_min[pos])
-                S_j = _f32(lut.S[trees, j_bins])
-                S_jbar = _f32(lut.S[trees, jbar_bins])
-                gi = ((S_jbar - S_j) * output[pos, :lut.y_dim]).sum(axis=1)
-                sign_u = np.where(u_min[pos] > 0, 1.0, -1.0)
-                v = gi * (-0.5 * sign_u / (1 + np.abs(u_min[pos]))**2)
-                n = x_grad.shape[1]
-                idx_a = lut.a_arr[trees, r_min[pos]]
-                idx_b = lut.b_arr[trees, r_min[pos]]
-                x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
-                x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
-                lut.S[trees, j_bins] -= learning_rate * output[pos, :lut.y_dim]
+            if HAS_NUMBA and lut.S.dtype == np.float32:
+                _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
+                                      output, x_grad, lut.a_arr, lut.b_arr,
+                                      lut.y_dim, args.context_size, args.n_t,
+                                      np.float32(learning_rate))
+            else:
+                trees = lut.trees
+                for pos in range(args.context_size):
+                    j_bins = j[pos]
+                    jbar_bins = j_bins ^ (1 << r_min[pos])
+                    S_j = _f32(lut.S[trees, j_bins])
+                    S_jbar = _f32(lut.S[trees, jbar_bins])
+                    gi = ((S_jbar - S_j) * output[pos, :lut.y_dim]).sum(axis=1)
+                    sign_u = np.where(u_min[pos] > 0, 1.0, -1.0)
+                    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min[pos]))**2)
+                    n = x_grad.shape[1]
+                    idx_a = lut.a_arr[trees, r_min[pos]]
+                    idx_b = lut.b_arr[trees, r_min[pos]]
+                    x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
+                    x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
+                    lut.S[trees, j_bins] -= learning_rate * output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
         VOCAB_HI = args.vocab_hi
@@ -333,6 +354,116 @@ def CONCATENATE_vec(Q, P, PE, args):
 
 
 # ---------------------------------------------------------------------------
+# Numba JIT kernels (fused loops — no temporary allocations)
+# ---------------------------------------------------------------------------
+
+@njit(cache=True)
+def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_dim):
+    """Fused attention forward: eliminates all (P, N_T, y_dim) temporaries."""
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            for t in range(N_T):
+                j = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
+                for d in range(y_dim):
+                    y[pos, d] += S[t, j, d]
+
+
+@njit(cache=True)
+def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+                                y_grad, x_grad, pos_grad, a_arr, b_arr,
+                                shift_qk, pd, CS, N_T, y_dim, lr):
+    """Fused attention backward: S reads + dot + surrogate grad + scatter + PE + S update."""
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            pe_pos = pos - pos1
+            for t in range(N_T):
+                jQ = all_jV[pos, t]
+                jK = all_jV[pos1, t]
+                j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
+
+                abs_uQ = abs(all_uV[pos, t])
+                abs_uK = abs(all_uV[pos1, t])
+                q_wins = abs_uQ < abs_uK
+
+                if q_wins:
+                    flip_bit = all_rV[pos, t] + shift_qk
+                else:
+                    flip_bit = all_rV[pos1, t] + pd
+                jbar = j_bin ^ (1 << flip_bit)
+
+                # gi = dot(S[t,jbar,:] - S[t,j_bin,:], y_grad[pos,:y_dim])
+                gi = 0.0
+                for d in range(y_dim):
+                    gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
+
+                if q_wins:
+                    u_min = all_uV[pos, t]
+                    r = all_rV[pos, t]
+                else:
+                    u_min = all_uV[pos1, t]
+                    r = all_rV[pos1, t]
+
+                sign_u = 1.0 if u_min > 0.0 else -1.0
+                abs_u_min = abs(u_min)
+                v = gi * (-0.5 * sign_u / (1.0 + abs_u_min) ** 2)
+
+                idx_a = a_arr[t, r]
+                idx_b = b_arr[t, r]
+                if q_wins:
+                    x_grad[pos, idx_a] += v
+                    x_grad[pos, idx_b] -= v
+                else:
+                    x_grad[pos1, idx_a] += v
+                    x_grad[pos1, idx_b] -= v
+
+                # PE branch
+                abs_uPE = abs(all_uPE[pe_pos, t])
+                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                    rPE = all_rPE[pe_pos, t]
+                    jbarPE = j_bin ^ (1 << rPE)
+                    giPE = 0.0
+                    for d in range(y_dim):
+                        giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
+                    u_pe = all_uPE[pe_pos, t]
+                    sign_pe = 1.0 if u_pe > 0.0 else -1.0
+                    deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
+                    pos_grad[pe_pos, t, rPE] += deltaPE
+
+                # S update
+                for d in range(y_dim):
+                    S[t, j_bin, d] -= lr * y_grad[pos, d]
+
+
+@njit(cache=True)
+def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
+                          y_dim, CS, N_T, lr):
+    """Fused backward for simple LUT (FFN, output head). grad: (CS, >=y_dim)."""
+    for pos in range(CS):
+        for t in range(N_T):
+            tree = trees[t]
+            j_bin = j[pos, t]
+            r = r_min[pos, t]
+            jbar_bin = j_bin ^ (1 << r)
+
+            gi = 0.0
+            for d in range(y_dim):
+                gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
+
+            u = u_min[pos, t]
+            sign_u = 1.0 if u > 0.0 else -1.0
+            abs_u = abs(u)
+            v = gi * (-0.5 * sign_u / (1.0 + abs_u) ** 2)
+
+            idx_a = a_arr[t, r]
+            idx_b = b_arr[t, r]
+            x_grad[pos, idx_a] += v
+            x_grad[pos, idx_b] -= v
+
+            for d in range(y_dim):
+                S[tree, j_bin, d] -= lr * grad[pos, d]
+
+
+# ---------------------------------------------------------------------------
 # Model operations
 # ---------------------------------------------------------------------------
 
@@ -371,13 +502,18 @@ def attention_forward(head, x, y, args):
     all_jV = head._v_j    # (CS, N_T) — zero-copy
     all_jPE = head._pe_j  # (CS, N_T) — zero-copy
 
-    for pos in range(1, CS):
-        P = pos  # number of pos1 values (0..pos-1)
-        jQ = all_jV[pos]                          # (N_T,) broadcasts to (P, N_T)
-        jK = all_jV[:P]                           # (P, N_T)
-        jPE = all_jPE[pos - np.arange(P)]         # (P, N_T)
-        j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
-        y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
+    if HAS_NUMBA and lut.S.dtype == np.float32:
+        _attention_forward_kernel(lut.S, all_jV, all_jPE, y,
+                                   args.shift_qk, args.positional_dim,
+                                   CS, args.n_t, y_dim)
+    else:
+        for pos in range(1, CS):
+            P = pos
+            jQ = all_jV[pos]
+            jK = all_jV[:P]
+            jPE = all_jPE[pos - np.arange(P)]
+            j_bins = CONCATENATE_vec(jQ, jK, jPE, args)
+            y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
 def attention_backward(head, x_grad, y_grad, args):
@@ -390,8 +526,6 @@ def attention_backward(head, x_grad, y_grad, args):
     y_dim = lut.y_dim
 
     pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
-    ED = x_grad.shape[1]
-    flat_size = x_grad.size
 
     # Cache arrays already computed in attention_forward — zero-copy references
     all_jV = head._v_j        # (CS, N_T)
@@ -401,94 +535,92 @@ def attention_backward(head, x_grad, y_grad, args):
     all_rPE = head._pe_r_min  # (CS, N_T)
     all_uPE = head._pe_u_min  # (CS, N_T)
 
-    # Pre-compute abs values and reusable index grids
-    abs_all_uV = np.abs(all_uV)    # (CS, N_T)
-    abs_all_uPE = np.abs(all_uPE)  # (CS, N_T)
-    trees_b_full = np.broadcast_to(trees, (CS, N_T))
-    pos1_grid = np.broadcast_to(np.arange(CS)[:, np.newaxis], (CS, N_T))
+    if HAS_NUMBA and lut.S.dtype == np.float32:
+        _attention_backward_kernel(lut.S, all_jV, all_rV, all_uV,
+                                    all_jPE, all_rPE, all_uPE,
+                                    y_grad, x_grad, pos_grad,
+                                    lut.a_arr, lut.b_arr,
+                                    args.shift_qk, POSITIONAL_DIM,
+                                    CS, N_T, y_dim,
+                                    np.float32(learning_rate))
+    else:
+        ED = x_grad.shape[1]
+        flat_size = x_grad.size
+        abs_all_uV = np.abs(all_uV)
+        abs_all_uPE = np.abs(all_uPE)
+        trees_b_full = np.broadcast_to(trees, (CS, N_T))
+        pos1_grid = np.broadcast_to(np.arange(CS)[:, np.newaxis], (CS, N_T))
 
-    for pos in range(1, CS):
-        P = pos  # number of pos1 values to batch
-        y_g = y_grad[pos, :y_dim]  # (y_dim,)
+        for pos in range(1, CS):
+            P = pos
+            y_g = y_grad[pos, :y_dim]
 
-        # Q cache (same for all pos1, broadcasts to (P, N_T))
-        jQ = all_jV[pos]     # (N_T,)
-        rQ = all_rV[pos]     # (N_T,)
-        abs_uQ = abs_all_uV[pos]  # (N_T,)
+            jQ = all_jV[pos]
+            rQ = all_rV[pos]
+            abs_uQ = abs_all_uV[pos]
 
-        # K caches (vary by pos1)
-        jK = all_jV[:P]      # (P, N_T)
-        rK = all_rV[:P]      # (P, N_T)
-        abs_uK = abs_all_uV[:P]  # (P, N_T)
+            jK = all_jV[:P]
+            rK = all_rV[:P]
+            abs_uK = abs_all_uV[:P]
 
-        # PE caches (indexed by pos - pos1)
-        pe_idx = pos - np.arange(P)   # [pos, pos-1, ..., 1]
-        jPE = all_jPE[pe_idx]   # (P, N_T)
-        rPE = all_rPE[pe_idx]   # (P, N_T)
+            pe_idx = pos - np.arange(P)
+            jPE = all_jPE[pe_idx]
+            rPE = all_rPE[pe_idx]
 
-        # Compute concatenated bin indices
-        j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
-        S_j = _f32(lut.S[trees, j_bins])  # (P, N_T, y_dim)
+            j_bins = CONCATENATE_vec(jQ, jK, jPE, args)
+            S_j = _f32(lut.S[trees, j_bins])
 
-        # Q/K branch: which (pair, tree) elements have |u_Q| < |u_K|?
-        q_mask = abs_uQ < abs_uK  # (P, N_T)
+            q_mask = abs_uQ < abs_uK
+            flip_bit = np.where(q_mask, rQ + args.shift_qk, rK + POSITIONAL_DIM)
+            jbar_bins = j_bins ^ (1 << flip_bit)
+            S_jbar = _f32(lut.S[trees, jbar_bins])
 
-        # Compute jbar by flipping the relevant bit directly in j_bins
-        flip_bit = np.where(q_mask, rQ + args.shift_qk, rK + POSITIONAL_DIM)
-        jbar_bins = j_bins ^ (1 << flip_bit)
-        S_jbar = _f32(lut.S[trees, jbar_bins])  # (P, N_T, y_dim)
+            gi = ((S_jbar - S_j) * y_g).sum(axis=2)
+            uQ_vals = all_uV[pos]
+            uK_vals = all_uV[:P]
+            u_min_qk = np.where(q_mask, uQ_vals, uK_vals)
+            abs_u_min_qk = np.where(q_mask, abs_uQ, abs_uK)
+            sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
+            v = gi * (-0.5 * sign_u / (1 + abs_u_min_qk)**2)
+            r_min_qk = np.where(q_mask, rQ, rK)
 
-        # Gradient computation — use pre-computed abs values to avoid redundant np.abs
-        gi = ((S_jbar - S_j) * y_g).sum(axis=2)        # (P, N_T)
-        uQ_vals = all_uV[pos]
-        uK_vals = all_uV[:P]
-        u_min_qk = np.where(q_mask, uQ_vals, uK_vals)  # (P, N_T)
-        abs_u_min_qk = np.where(q_mask, abs_uQ, abs_uK) # (P, N_T) — no redundant abs
-        sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
-        v = gi * (-0.5 * sign_u / (1 + abs_u_min_qk)**2)
-        r_min_qk = np.where(q_mask, rQ, rK)            # (P, N_T)
+            trees_b = trees_b_full[:P]
 
-        trees_b = trees_b_full[:P]  # zero-copy slice
+            if q_mask.any():
+                q_t = trees_b[q_mask]
+                q_r = r_min_qk[q_mask]
+                q_v = v[q_mask]
+                x_grad[pos] += np.bincount(lut.a_arr[q_t, q_r], weights=q_v, minlength=ED)
+                x_grad[pos] -= np.bincount(lut.b_arr[q_t, q_r], weights=q_v, minlength=ED)
 
-        # Q gradient scatter -> all go to x_grad[pos]
-        if q_mask.any():
-            q_t = trees_b[q_mask]
-            q_r = r_min_qk[q_mask]
-            q_v = v[q_mask]
-            x_grad[pos] += np.bincount(lut.a_arr[q_t, q_r], weights=q_v, minlength=ED)
-            x_grad[pos] -= np.bincount(lut.b_arr[q_t, q_r], weights=q_v, minlength=ED)
+            k_mask = ~q_mask
+            if k_mask.any():
+                k_t = trees_b[k_mask]
+                k_r = r_min_qk[k_mask]
+                k_v = v[k_mask]
+                k_pos1 = pos1_grid[:P][k_mask]
+                flat_a = k_pos1 * ED + lut.a_arr[k_t, k_r]
+                flat_b = k_pos1 * ED + lut.b_arr[k_t, k_r]
+                x_grad.ravel()[:] += np.bincount(flat_a, weights=k_v, minlength=flat_size)
+                x_grad.ravel()[:] -= np.bincount(flat_b, weights=k_v, minlength=flat_size)
 
-        # K gradient scatter -> x_grad[pos1] for each pair (flat bincount)
-        k_mask = ~q_mask
-        if k_mask.any():
-            k_t = trees_b[k_mask]
-            k_r = r_min_qk[k_mask]
-            k_v = v[k_mask]
-            k_pos1 = pos1_grid[:P][k_mask]
-            flat_a = k_pos1 * ED + lut.a_arr[k_t, k_r]
-            flat_b = k_pos1 * ED + lut.b_arr[k_t, k_r]
-            x_grad.ravel()[:] += np.bincount(flat_a, weights=k_v, minlength=flat_size)
-            x_grad.ravel()[:] -= np.bincount(flat_b, weights=k_v, minlength=flat_size)
+            abs_uPE = abs_all_uPE[pe_idx]
+            pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
+            if pe_mask.any():
+                jbarPE_bins = j_bins ^ (1 << rPE)
+                S_jbarPE = _f32(lut.S[trees, jbarPE_bins])
+                giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)
+                uPE_vals = all_uPE[pe_idx]
+                u_pe = uPE_vals[pe_mask]
+                sign_pe = np.where(u_pe > 0, 1.0, -1.0)
+                deltaPE = giPE[pe_mask] * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
+                pe_t = trees_b[pe_mask]
+                pe_r = rPE[pe_mask]
+                pe_pair = pos1_grid[:P][pe_mask]
+                np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
 
-        # PE gradient — use pre-computed abs values
-        abs_uPE = abs_all_uPE[pe_idx]  # (P, N_T)
-        pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
-        if pe_mask.any():
-            jbarPE_bins = j_bins ^ (1 << rPE)
-            S_jbarPE = _f32(lut.S[trees, jbarPE_bins])  # (P, N_T, y_dim)
-            giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)  # (P, N_T)
-            uPE_vals = all_uPE[pe_idx]
-            u_pe = uPE_vals[pe_mask]
-            sign_pe = np.where(u_pe > 0, 1.0, -1.0)
-            deltaPE = giPE[pe_mask] * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
-            pe_t = trees_b[pe_mask]
-            pe_r = rPE[pe_mask]
-            pe_pair = pos1_grid[:P][pe_mask]
-            np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
-
-        # S update: accumulate for duplicate (tree, bin) across pos1 values
-        np.subtract.at(lut.S, (trees_b.ravel(), j_bins.ravel()),
-                        np.float32(learning_rate) * y_g)
+            np.subtract.at(lut.S, (trees_b.ravel(), j_bins.ravel()),
+                            np.float32(learning_rate) * y_g)
 
     head.Positional_encoding -= learning_rate * pos_grad
 
@@ -521,35 +653,41 @@ def model_backward(m, args):
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         lut = m.FFN[l]
-        trees = lut.trees
         CS = args.context_size
-        y_dim = lut.y_dim
-        j = m._ffn_j[l]          # (CS, N_T)
-        r_min = m._ffn_r_min[l]  # (CS, N_T)
-        u_min = m._ffn_u_min[l]  # (CS, N_T)
 
-        jbar = j ^ (1 << r_min)                              # (CS, N_T)
-        S_j = _f32(lut.S[trees, j])                          # (CS, N_T, y_dim)
-        S_jbar = _f32(lut.S[trees, jbar])                    # (CS, N_T, y_dim)
-        gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)  # (CS, N_T)
-        sign_u = np.where(u_min > 0, 1.0, -1.0)
-        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)   # (CS, N_T)
+        if HAS_NUMBA and lut.S.dtype == np.float32:
+            _lut_backward_kernel(lut.S, lut.trees, m._ffn_j[l], m._ffn_r_min[l],
+                                  m._ffn_u_min[l], y_grad, x_grad,
+                                  lut.a_arr, lut.b_arr,
+                                  lut.y_dim, CS, args.n_t,
+                                  np.float32(learning_rate))
+        else:
+            trees = lut.trees
+            y_dim = lut.y_dim
+            j = m._ffn_j[l]
+            r_min = m._ffn_r_min[l]
+            u_min = m._ffn_u_min[l]
 
-        # Gradient scatter via flat bincount
-        ED = EMBEDDING_DIM
-        pos_idx = np.arange(CS)[:, np.newaxis]
-        idx_a = lut.a_arr[trees, r_min]                      # (CS, N_T)
-        idx_b = lut.b_arr[trees, r_min]                      # (CS, N_T)
-        flat_a = (pos_idx * ED + idx_a).ravel()
-        flat_b = (pos_idx * ED + idx_b).ravel()
-        v_flat = v.ravel()
-        flat_size = x_grad.size
-        x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
-        x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
+            jbar = j ^ (1 << r_min)
+            S_j = _f32(lut.S[trees, j])
+            S_jbar = _f32(lut.S[trees, jbar])
+            gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)
+            sign_u = np.where(u_min > 0, 1.0, -1.0)
+            v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
 
-        # S update per position (no duplicates within a position)
-        for pos in range(CS):
-            lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
+            ED = EMBEDDING_DIM
+            pos_idx = np.arange(CS)[:, np.newaxis]
+            idx_a = lut.a_arr[trees, r_min]
+            idx_b = lut.b_arr[trees, r_min]
+            flat_a = (pos_idx * ED + idx_a).ravel()
+            flat_b = (pos_idx * ED + idx_b).ravel()
+            v_flat = v.ravel()
+            flat_size = x_grad.size
+            x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
+            x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
+
+            for pos in range(CS):
+                lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         for h in range(NUM_HEADS):
