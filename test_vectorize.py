@@ -5,13 +5,111 @@ import pytest
 from types import SimpleNamespace
 
 from main import (
-    LUT, LUTcache, build_LUT, cache_index, cache_PE_index,
-    LUT_forward, LUT_backward, CONCATENATE,
-    concatenated_LUT_forward, concatenated_LUT_backward,
+    LUT, build_LUT, CONCATENATE_vec, _f32,
     fill_vector_with_random_integers,
     fill_vector_with_random_integers_different_from_vector2,
 )
 import main as main_module
+
+
+# ---------------------------------------------------------------------------
+# Functions moved from main.py (used only by tests)
+# ---------------------------------------------------------------------------
+
+class LUTcache:
+    __slots__ = ['r_min', 'u_min', 'j']
+    def __init__(self, n_t):
+        self.r_min = np.zeros(n_t, dtype=np.int32)
+        self.u_min = np.zeros(n_t, dtype=np.float32)
+        self.j = np.zeros(n_t, dtype=np.int32)
+
+
+def cache_index(lut, cache, x, args):
+    u = x[lut.a_arr] - x[lut.b_arr]
+    cache.j[:] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=1)
+    abs_u = np.abs(u)
+    cache.r_min[:] = abs_u.argmin(axis=1)
+    cache.u_min[:] = u[lut.trees, cache.r_min]
+
+
+def cache_PE_index(cache, u, args):
+    cache.j[:] = ((u > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=1)
+    abs_u = np.abs(u)
+    cache.r_min[:] = abs_u.argmin(axis=1)
+    cache.u_min[:] = u[np.arange(u.shape[0]), cache.r_min]
+
+
+def LUT_forward(lut, cache, y, args):
+    y[:lut.y_dim] += _f32(lut.S[lut.trees, cache.j]).sum(axis=0)
+
+
+def LUT_backward(lut, cache, x_gradient, y_gradient, args):
+    trees = lut.trees
+    j_bins = cache.j
+    jbar_bins = j_bins ^ (1 << cache.r_min)
+    S_j = _f32(lut.S[trees, j_bins])
+    S_jbar = _f32(lut.S[trees, jbar_bins])
+    gi = ((S_jbar - S_j) * y_gradient[:lut.y_dim]).sum(axis=1)
+    sign_u = np.where(cache.u_min > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(cache.u_min))**2)
+    n = x_gradient.shape[0]
+    idx_a = lut.a_arr[trees, cache.r_min]
+    idx_b = lut.b_arr[trees, cache.r_min]
+    x_gradient += np.bincount(idx_a, weights=v, minlength=n)
+    x_gradient -= np.bincount(idx_b, weights=v, minlength=n)
+    lut.S[trees, j_bins] -= main_module.learning_rate * y_gradient[:lut.y_dim]
+
+
+def concatenated_LUT_forward(lut, cacheQ, cacheK, cachePE, y, args):
+    j_bins = CONCATENATE_vec(cacheQ.j, cacheK.j, cachePE.j, args)
+    y[:lut.y_dim] += _f32(lut.S[lut.trees, j_bins]).sum(axis=0)
+
+
+def concatenated_LUT_backward(lut, cacheQ, cacheK, cachePE,
+                                x_gradientQ, x_gradientK, PE_grad, y_gradient, args):
+    trees = lut.trees
+    y_g = y_gradient[:lut.y_dim]
+    jQ, jK, jPE = cacheQ.j, cacheK.j, cachePE.j
+    j_bins = CONCATENATE_vec(jQ, jK, jPE, args)
+    S_j = _f32(lut.S[trees, j_bins])
+    abs_uQ = np.abs(cacheQ.u_min)
+    abs_uK = np.abs(cacheK.u_min)
+    q_mask = abs_uQ < abs_uK
+    jbar_Q = CONCATENATE_vec(jQ ^ (1 << cacheQ.r_min), jK, jPE, args)
+    jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << cacheK.r_min), jPE, args)
+    jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
+    S_jbar = _f32(lut.S[trees, jbar_bins])
+    gi = ((S_jbar - S_j) * y_g).sum(axis=1)
+    u_min_qk = np.where(q_mask, cacheQ.u_min, cacheK.u_min)
+    sign_u = np.where(u_min_qk > 0, 1.0, -1.0)
+    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min_qk))**2)
+    r_min_qk = np.where(q_mask, cacheQ.r_min, cacheK.r_min)
+    nQ = x_gradientQ.shape[0]
+    q_trees = trees[q_mask]
+    if len(q_trees) > 0:
+        q_r = r_min_qk[q_mask]
+        q_v = v[q_mask]
+        x_gradientQ += np.bincount(lut.a_arr[q_trees, q_r], weights=q_v, minlength=nQ)
+        x_gradientQ -= np.bincount(lut.b_arr[q_trees, q_r], weights=q_v, minlength=nQ)
+    k_trees = trees[~q_mask]
+    if len(k_trees) > 0:
+        k_r = r_min_qk[~q_mask]
+        k_v = v[~q_mask]
+        x_gradientK += np.bincount(lut.a_arr[k_trees, k_r], weights=k_v, minlength=nQ)
+        x_gradientK -= np.bincount(lut.b_arr[k_trees, k_r], weights=k_v, minlength=nQ)
+    abs_uPE = np.abs(cachePE.u_min)
+    pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
+    pe_trees = trees[pe_mask]
+    if len(pe_trees) > 0:
+        jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << cachePE.r_min), args)
+        S_jbarPE = _f32(lut.S[pe_trees, jbarPE_bins[pe_mask]])
+        giPE = ((S_jbarPE - S_j[pe_mask]) * y_g).sum(axis=1)
+        u_pe = cachePE.u_min[pe_mask]
+        sign_pe = np.where(u_pe > 0, 1.0, -1.0)
+        deltaPE = giPE * (-0.5 * sign_pe / (1 + np.abs(u_pe))**2)
+        pe_r = cachePE.r_min[pe_mask]
+        np.add.at(PE_grad, (pe_trees, pe_r), deltaPE)
+    lut.S[trees, j_bins] -= main_module.learning_rate * y_g
 
 
 # ---------------------------------------------------------------------------
