@@ -550,17 +550,13 @@ def attention_forward(head, x, y, args):
     all_jV = head._v_j    # (CS, N_T) — zero-copy
     all_jPE = head._pe_j  # (CS, N_T) — zero-copy
 
-    # All (pos1, pos) pairs where pos1 < pos
-    all_pos1, all_pos = np.triu_indices(CS, k=1)
-    jQ = all_jV[all_pos]                          # (num_pairs, N_T)
-    jK = all_jV[all_pos1]                         # (num_pairs, N_T)
-    jPE = all_jPE[all_pos - all_pos1]             # (num_pairs, N_T)
-
-    j_bins = CONCATENATE_vec(jQ, jK, jPE, args)   # (num_pairs, N_T)
-    S_sums = _f32(lut.S[trees, j_bins]).sum(axis=1)  # (num_pairs, y_dim)
-
-    # Scatter-add to y by target position
-    np.add.at(y[:, :y_dim], all_pos, S_sums)
+    for pos in range(1, CS):
+        P = pos  # number of pos1 values (0..pos-1)
+        jQ = all_jV[pos]                          # (N_T,) broadcasts to (P, N_T)
+        jK = all_jV[:P]                           # (P, N_T)
+        jPE = all_jPE[pos - np.arange(P)]         # (P, N_T)
+        j_bins = CONCATENATE_vec(jQ, jK, jPE, args)  # (P, N_T)
+        y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
 def attention_backward(head, x_grad, y_grad, args):
