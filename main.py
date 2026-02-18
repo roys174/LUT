@@ -612,10 +612,9 @@ def attention_backward(head, x_grad, y_grad, args):
         # Q/K branch: which (pair, tree) elements have |u_Q| < |u_K|?
         q_mask = abs_uQ < abs_uK  # (P, N_T)
 
-        # Compute jbar for both branches, then select
-        jbar_Q = CONCATENATE_vec(jQ ^ (1 << rQ), jK, jPE, args)
-        jbar_K = CONCATENATE_vec(jQ, jK ^ (1 << rK), jPE, args)
-        jbar_bins = np.where(q_mask, jbar_Q, jbar_K)
+        # Compute jbar by flipping the relevant bit directly in j_bins
+        flip_bit = np.where(q_mask, rQ + args.shift_qk, rK + POSITIONAL_DIM)
+        jbar_bins = j_bins ^ (1 << flip_bit)
         S_jbar = _f32(lut.S[trees, jbar_bins])  # (P, N_T, y_dim)
 
         # Gradient computation — use pre-computed abs values to avoid redundant np.abs
@@ -654,7 +653,7 @@ def attention_backward(head, x_grad, y_grad, args):
         abs_uPE = abs_all_uPE[pe_idx]  # (P, N_T)
         pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
         if pe_mask.any():
-            jbarPE_bins = CONCATENATE_vec(jQ, jK, jPE ^ (1 << rPE), args)
+            jbarPE_bins = j_bins ^ (1 << rPE)
             S_jbarPE = _f32(lut.S[trees, jbarPE_bins])  # (P, N_T, y_dim)
             giPE = ((S_jbarPE - S_j) * y_g).sum(axis=2)  # (P, N_T)
             uPE_vals = all_uPE[pe_idx]
@@ -667,11 +666,8 @@ def attention_backward(head, x_grad, y_grad, args):
             np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
 
         # S update: accumulate for duplicate (tree, bin) across pos1 values
-        trees_flat = trees_b.ravel()
-        j_flat = j_bins.ravel()
-        neg_lr_y_g = np.empty((P * N_T, y_dim), dtype=lut.S.dtype)
-        neg_lr_y_g[:] = -(learning_rate * y_g)
-        np.add.at(lut.S, (trees_flat, j_flat), neg_lr_y_g)
+        np.subtract.at(lut.S, (trees_b.ravel(), j_bins.ravel()),
+                        np.float32(learning_rate) * y_g)
 
     head.Positional_encoding -= learning_rate * pos_grad
 
