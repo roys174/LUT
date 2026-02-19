@@ -1,4 +1,4 @@
-"""Tests verifying that prange-parallelized attention forward matches sequential."""
+"""Tests verifying that prange-parallelized attention kernels match sequential."""
 
 import numpy as np
 import pytest
@@ -9,9 +9,10 @@ from numba import njit
 import main as main_module
 from main import (
     LUT, Model, AttentionHead, build_LUT, build_Model,
-    attention_forward, model_forward, model_training_step,
+    attention_forward, attention_backward,
+    model_forward, model_training_step,
     cache_index_batch, cache_PE_index_batch,
-    _attention_forward_kernel,
+    _attention_forward_kernel, _attention_backward_kernel,
 )
 
 
@@ -89,6 +90,164 @@ class TestPrangeForwardKernel:
         for i in range(1, len(results)):
             np.testing.assert_array_equal(results[0], results[i],
                 err_msg=f"Non-deterministic output on run {i}")
+
+
+@njit(cache=False)
+def _attention_backward_kernel_sequential(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+                                           y_grad, x_grad, pos_grad, a_arr, b_arr,
+                                           shift_qk, pd, CS, N_T, y_dim, lr):
+    """Sequential 3-phase reference (same read-before-write semantics as parallel).
+
+    All gradient computation reads original S, then S is updated afterwards.
+    This matches the parallel kernel's behavior, so differences are only
+    floating-point accumulation order.
+    """
+    # Phase 1: gradient computation (reads S, does not modify it)
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            pe_pos = pos - pos1
+            for t in range(N_T):
+                jQ = all_jV[pos, t]
+                jK = all_jV[pos1, t]
+                j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
+                abs_uQ = abs(all_uV[pos, t])
+                abs_uK = abs(all_uV[pos1, t])
+                q_wins = abs_uQ < abs_uK
+                if q_wins:
+                    flip_bit = all_rV[pos, t] + shift_qk
+                else:
+                    flip_bit = all_rV[pos1, t] + pd
+                jbar = j_bin ^ (1 << flip_bit)
+                gi = 0.0
+                for d in range(y_dim):
+                    gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
+                if q_wins:
+                    u_min = all_uV[pos, t]
+                    r = all_rV[pos, t]
+                else:
+                    u_min = all_uV[pos1, t]
+                    r = all_rV[pos1, t]
+                sign_u = 1.0 if u_min > 0.0 else -1.0
+                abs_u_min = abs(u_min)
+                v = gi * (-0.5 * sign_u / (1.0 + abs_u_min) ** 2)
+                idx_a = a_arr[t, r]
+                idx_b = b_arr[t, r]
+                if q_wins:
+                    x_grad[pos, idx_a] += v
+                    x_grad[pos, idx_b] -= v
+                else:
+                    x_grad[pos1, idx_a] += v
+                    x_grad[pos1, idx_b] -= v
+                abs_uPE = abs(all_uPE[pe_pos, t])
+                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                    rPE = all_rPE[pe_pos, t]
+                    jbarPE = j_bin ^ (1 << rPE)
+                    giPE = 0.0
+                    for d in range(y_dim):
+                        giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
+                    u_pe = all_uPE[pe_pos, t]
+                    sign_pe = 1.0 if u_pe > 0.0 else -1.0
+                    deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
+                    pos_grad[pe_pos, t, rPE] += deltaPE
+    # Phase 2: S update (sequential, after all gradients computed)
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            for t in range(N_T):
+                j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
+                for d in range(y_dim):
+                    S[t, j_bin, d] -= lr * y_grad[pos, d]
+
+
+class TestPrangeBackwardKernel:
+    """Direct kernel-level comparison: sequential vs prange backward."""
+
+    @pytest.mark.parametrize("context_size", [8, 32, 64])
+    def test_backward_kernel_matches_sequential(self, context_size):
+        n_t, n_c, pd, ed = 8, 4, 4, 16
+        shift_qk = n_c + pd
+        total_n_c = n_c + n_c + pd
+        num_bins = 1 << total_n_c
+        lr = 0.01
+
+        np.random.seed(42)
+        S_orig = np.random.randn(n_t, num_bins, ed).astype(np.float32) * 0.1
+        all_jV = np.random.randint(0, 1 << n_c, (context_size, n_t)).astype(np.int32)
+        all_rV = np.random.randint(0, n_c, (context_size, n_t)).astype(np.int32)
+        all_uV = np.random.randn(context_size, n_t).astype(np.float32)
+        all_jPE = np.random.randint(0, 1 << pd, (context_size, n_t)).astype(np.int32)
+        all_rPE = np.random.randint(0, pd, (context_size, n_t)).astype(np.int32)
+        all_uPE = np.random.randn(context_size, n_t).astype(np.float32)
+        a_arr = np.random.randint(0, ed, (n_t, max(n_c, pd))).astype(np.int32)
+        b_arr = np.random.randint(0, ed, (n_t, max(n_c, pd))).astype(np.int32)
+        y_grad = np.random.randn(context_size, ed).astype(np.float32)
+
+        # Sequential
+        S_seq = S_orig.copy()
+        x_grad_seq = np.zeros((context_size, ed), dtype=np.float32)
+        pos_grad_seq = np.zeros((context_size, n_t, pd), dtype=np.float32)
+        _attention_backward_kernel_sequential(
+            S_seq, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+            y_grad, x_grad_seq, pos_grad_seq, a_arr, b_arr,
+            shift_qk, pd, context_size, n_t, ed, lr)
+
+        # Parallel
+        S_par = S_orig.copy()
+        x_grad_par = np.zeros((context_size, ed), dtype=np.float32)
+        pos_grad_par = np.zeros((context_size, n_t, pd), dtype=np.float32)
+        _attention_backward_kernel(
+            S_par, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+            y_grad, x_grad_par, pos_grad_par, a_arr, b_arr,
+            shift_qk, pd, context_size, n_t, ed, lr)
+
+        np.testing.assert_allclose(x_grad_par, x_grad_seq, atol=1e-5,
+            err_msg=f"x_grad mismatch at context_size={context_size}")
+        np.testing.assert_allclose(pos_grad_par, pos_grad_seq, atol=1e-5,
+            err_msg=f"pos_grad mismatch at context_size={context_size}")
+        np.testing.assert_allclose(S_par, S_seq, atol=1e-5,
+            err_msg=f"S update mismatch at context_size={context_size}")
+
+    def test_backward_kernel_deterministic(self):
+        """Run parallel backward multiple times, verify identical output."""
+        n_t, n_c, pd, ed = 8, 4, 4, 16
+        cs = 32
+        shift_qk = n_c + pd
+        num_bins = 1 << (n_c + n_c + pd)
+        lr = 0.01
+
+        np.random.seed(42)
+        S_orig = np.random.randn(n_t, num_bins, ed).astype(np.float32) * 0.1
+        all_jV = np.random.randint(0, 1 << n_c, (cs, n_t)).astype(np.int32)
+        all_rV = np.random.randint(0, n_c, (cs, n_t)).astype(np.int32)
+        all_uV = np.random.randn(cs, n_t).astype(np.float32)
+        all_jPE = np.random.randint(0, 1 << pd, (cs, n_t)).astype(np.int32)
+        all_rPE = np.random.randint(0, pd, (cs, n_t)).astype(np.int32)
+        all_uPE = np.random.randn(cs, n_t).astype(np.float32)
+        a_arr = np.random.randint(0, ed, (n_t, max(n_c, pd))).astype(np.int32)
+        b_arr = np.random.randint(0, ed, (n_t, max(n_c, pd))).astype(np.int32)
+        y_grad = np.random.randn(cs, ed).astype(np.float32)
+
+        results = []
+        for _ in range(5):
+            S = S_orig.copy()
+            x_grad = np.zeros((cs, ed), dtype=np.float32)
+            pos_grad = np.zeros((cs, n_t, pd), dtype=np.float32)
+            _attention_backward_kernel(
+                S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+                y_grad, x_grad, pos_grad, a_arr, b_arr,
+                shift_qk, pd, cs, n_t, ed, lr)
+            results.append((x_grad.copy(), pos_grad.copy(), S.copy()))
+
+        for i in range(1, len(results)):
+            # Per-thread reduction order causes ~1e-7 float32 variation
+            np.testing.assert_allclose(results[0][0], results[i][0],
+                atol=1e-6, rtol=1e-5,
+                err_msg=f"x_grad non-deterministic on run {i}")
+            np.testing.assert_allclose(results[0][1], results[i][1],
+                atol=1e-6, rtol=1e-5,
+                err_msg=f"pos_grad non-deterministic on run {i}")
+            np.testing.assert_allclose(results[0][2], results[i][2],
+                atol=1e-6, rtol=1e-5,
+                err_msg=f"S non-deterministic on run {i}")
 
 
 class TestAttentionForwardIntegration:
