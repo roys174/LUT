@@ -14,10 +14,11 @@ import tiktoken
 from tqdm import tqdm
 
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+    prange = range
     def njit(*args, **kwargs):
         def decorator(f): return f
         return decorator
@@ -357,10 +358,10 @@ def CONCATENATE_vec(Q, P, PE, args):
 # Numba JIT kernels (fused loops — no temporary allocations)
 # ---------------------------------------------------------------------------
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_dim):
     """Fused attention forward: eliminates all (P, N_T, y_dim) temporaries."""
-    for pos in range(1, CS):
+    for pos in prange(1, CS):
         for pos1 in range(pos):
             for t in range(N_T):
                 j = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
