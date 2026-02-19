@@ -922,6 +922,29 @@ def main():
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
     args.shift_qk = args.n_c + args.positional_dim
 
+    # Print hyperparameters
+    print("=" * 50)
+    print("Hyperparameters:")
+    print(f"  context_size      = {args.context_size}")
+    print(f"  vocab_size        = {args.vocab_size}")
+    print(f"  embedding_dim     = {args.embedding_dim}")
+    print(f"  positional_dim    = {args.positional_dim}")
+    print(f"  num_layers        = {args.num_layers}")
+    print(f"  num_heads         = {args.num_heads}")
+    print(f"  n_t               = {args.n_t}")
+    print(f"  n_c               = {args.n_c}")
+    print(f"  temperature       = {args.temperature}")
+    print(f"  factored_output   = {args.factored_output}")
+    print(f"  fp16              = {args.fp16}")
+    print(f"  tokenizer         = {args.tokenizer}")
+    print(f"  max_steps         = {args.max_steps}")
+    print(f"  validation_interval = {args.validation_interval}")
+    print(f"  testing_length    = {args.testing_length}")
+    print(f"  training_data     = {args.training_data}")
+    print(f"  validation_data   = {args.validation_data}")
+    print(f"  loss_file         = {args.loss_file}")
+    print("=" * 50)
+
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
         f.write("step, loss, perplexity\n")
