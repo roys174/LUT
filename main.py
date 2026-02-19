@@ -14,11 +14,13 @@ import tiktoken
 from tqdm import tqdm
 
 try:
-    from numba import njit, prange
+    from numba import njit, prange, get_num_threads, get_thread_id
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
     prange = range
+    get_num_threads = lambda: 1
+    get_thread_id = lambda: 0
     def njit(*args, **kwargs):
         def decorator(f): return f
         return decorator
@@ -369,17 +371,28 @@ def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_di
                     y[pos, d] += S[t, j, d]
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                 y_grad, x_grad, pos_grad, a_arr, b_arr,
                                 shift_qk, pd, CS, N_T, y_dim, lr):
-    """Fused attention backward: S reads + dot + surrogate grad + scatter + PE + S update.
+    """Fused attention backward with parallel gradient computation.
 
-    Two-pass per pos: (1) read S & compute gradients for all pos1, (2) update S.
-    This matches the NumPy semantics where all pos1 read S before any updates.
+    Three-phase approach using per-thread buffers to avoid O(CS^2) memory:
+      Phase 1 (parallel over pos): each thread accumulates x_grad and pe_grad
+        contributions into its own buffer. x_grad[pos] (q_wins) goes directly;
+        x_grad[pos1] (k_wins) goes into per-thread buffer.
+      Phase 2: reduce per-thread buffers into x_grad and pos_grad.
+      Phase 3 (sequential): update S tables.
     """
-    for pos in range(1, CS):
-        # Pass 1: gradient computation (reads S, does not modify it)
+    ED = x_grad.shape[1]
+    n_threads = get_num_threads()
+    # Per-thread buffers for contributions that cross pos boundaries
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
+    pe_grad_thr = np.zeros((n_threads, CS, N_T, pd), dtype=np.float32)
+
+    # Phase 1: parallel gradient computation
+    for pos in prange(1, CS):
+        tid = get_thread_id()
         for pos1 in range(pos):
             pe_pos = pos - pos1
             for t in range(N_T):
@@ -415,11 +428,13 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                 idx_a = a_arr[t, r]
                 idx_b = b_arr[t, r]
                 if q_wins:
+                    # x_grad[pos] is unique per thread's pos — safe to write directly
                     x_grad[pos, idx_a] += v
                     x_grad[pos, idx_b] -= v
                 else:
-                    x_grad[pos1, idx_a] += v
-                    x_grad[pos1, idx_b] -= v
+                    # x_grad[pos1] may conflict — accumulate in per-thread buffer
+                    x_grad_thr[tid, pos1, idx_a] += v
+                    x_grad_thr[tid, pos1, idx_b] -= v
 
                 # PE branch
                 abs_uPE = abs(all_uPE[pe_pos, t])
@@ -432,9 +447,26 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                     u_pe = all_uPE[pe_pos, t]
                     sign_pe = 1.0 if u_pe > 0.0 else -1.0
                     deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
-                    pos_grad[pe_pos, t, rPE] += deltaPE
+                    pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
 
-        # Pass 2: S update (after all pos1 have been read for this pos)
+    # Phase 2: reduce per-thread buffers
+    for target in prange(CS):
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, target, d]
+            x_grad[target, d] += total
+
+    for pe_pos in prange(CS):
+        for t in range(N_T):
+            for r in range(pd):
+                total = np.float32(0.0)
+                for thr in range(n_threads):
+                    total += pe_grad_thr[thr, pe_pos, t, r]
+                pos_grad[pe_pos, t, r] += total
+
+    # Phase 3: S update (sequential — different pos can hit same S entry)
+    for pos in range(1, CS):
         for pos1 in range(pos):
             for t in range(N_T):
                 j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
