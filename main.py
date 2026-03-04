@@ -487,22 +487,32 @@ def build_LUT(lut, total_n_c, y_dim, args):
 
 def cache_index_batch(lut, x_batch, j_out, r_min_out, u_min_out):
     """Batch cache_index across all positions. x_batch: (CS, dim), outputs: (CS, N_T)."""
-    u = x_batch[:, lut.a_arr] - x_batch[:, lut.b_arr]      # (CS, N_T, N_C)
-    j_out[:] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=2)
-    abs_u = np.abs(u)
-    r_min_out[:] = abs_u.argmin(axis=2)
-    cs_idx = np.arange(x_batch.shape[0])[:, np.newaxis]
-    u_min_out[:] = u[cs_idx, lut.trees, r_min_out]
+    if HAS_NUMBA and x_batch.dtype == np.float32:
+        _cache_index_kernel(x_batch, lut.a_arr, lut.b_arr, lut.bitmasks,
+                            j_out, r_min_out, u_min_out,
+                            x_batch.shape[0], lut.a_arr.shape[0], lut.a_arr.shape[1])
+    else:
+        u = x_batch[:, lut.a_arr] - x_batch[:, lut.b_arr]      # (CS, N_T, N_C)
+        j_out[:] = ((u > 0).astype(np.int32) * lut.bitmasks).sum(axis=2)
+        abs_u = np.abs(u)
+        r_min_out[:] = abs_u.argmin(axis=2)
+        cs_idx = np.arange(x_batch.shape[0])[:, np.newaxis]
+        u_min_out[:] = u[cs_idx, lut.trees, r_min_out]
 
 
 def cache_PE_index_batch(u_batch, j_out, r_min_out, u_min_out, args):
     """Batch cache_PE_index across all positions. u_batch: (CS, N_T, PD), outputs: (CS, N_T)."""
-    j_out[:] = ((u_batch > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=2)
-    abs_u = np.abs(u_batch)
-    r_min_out[:] = abs_u.argmin(axis=2)
-    cs_idx = np.arange(u_batch.shape[0])[:, np.newaxis]
-    tree_idx = np.arange(u_batch.shape[1])
-    u_min_out[:] = u_batch[cs_idx, tree_idx, r_min_out]
+    if HAS_NUMBA and u_batch.dtype == np.float32:
+        _cache_pe_index_kernel(u_batch, args.pe_bitmasks,
+                               j_out, r_min_out, u_min_out,
+                               u_batch.shape[0], u_batch.shape[1], u_batch.shape[2])
+    else:
+        j_out[:] = ((u_batch > 0).astype(np.int32) * args.pe_bitmasks).sum(axis=2)
+        abs_u = np.abs(u_batch)
+        r_min_out[:] = abs_u.argmin(axis=2)
+        cs_idx = np.arange(u_batch.shape[0])[:, np.newaxis]
+        tree_idx = np.arange(u_batch.shape[1])
+        u_min_out[:] = u_batch[cs_idx, tree_idx, r_min_out]
 
 
 def _f32(arr):
@@ -714,6 +724,62 @@ def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_
                 for thr in range(n_threads):
                     total += pe_grad_thr[thr, pe_pos, t, r]
                 pos_grad[pe_pos, t, r] += total
+
+
+@njit(parallel=True, cache=True)
+def _cache_index_kernel(x, a_arr, b_arr, bitmasks, j_out, r_min_out, u_min_out, CS, N_T, N_C):
+    """Parallel cache_index: computes j, r_min, u_min for all (pos, tree) pairs."""
+    for pos in prange(CS):
+        for t in range(N_T):
+            j = np.int32(0)
+            min_abs_u = np.float32(1e38)
+            r_min = np.int32(0)
+            u_min_val = np.float32(0.0)
+            for c in range(N_C):
+                u_val = x[pos, a_arr[t, c]] - x[pos, b_arr[t, c]]
+                if u_val > np.float32(0.0):
+                    j |= bitmasks[c]
+                au = abs(u_val)
+                if au < min_abs_u:
+                    min_abs_u = au
+                    r_min = np.int32(c)
+                    u_min_val = u_val
+            j_out[pos, t] = j
+            r_min_out[pos, t] = r_min
+            u_min_out[pos, t] = u_min_val
+
+
+@njit(parallel=True, cache=True)
+def _cache_pe_index_kernel(u_batch, pe_bitmasks, j_out, r_min_out, u_min_out, CS, N_T, PD):
+    """Parallel cache_PE_index: computes j, r_min, u_min from PE tensor."""
+    for pos in prange(CS):
+        for t in range(N_T):
+            j = np.int32(0)
+            min_abs_u = np.float32(1e38)
+            r_min = np.int32(0)
+            u_min_val = np.float32(0.0)
+            for p in range(PD):
+                u_val = u_batch[pos, t, p]
+                if u_val > np.float32(0.0):
+                    j |= pe_bitmasks[p]
+                au = abs(u_val)
+                if au < min_abs_u:
+                    min_abs_u = au
+                    r_min = np.int32(p)
+                    u_min_val = u_val
+            j_out[pos, t] = j
+            r_min_out[pos, t] = r_min
+            u_min_out[pos, t] = u_min_val
+
+
+@njit(parallel=True, cache=True)
+def _lut_forward_add_kernel(S, trees, j, output, CS, N_T, y_dim):
+    """Fused LUT forward that adds to output (no zeroing). Used for FFN residual."""
+    for pos in prange(CS):
+        for t in range(N_T):
+            j_bin = j[pos, t]
+            for d in range(y_dim):
+                output[pos, d] += S[trees[t], j_bin, d]
 
 
 @njit(parallel=True, cache=True)
@@ -1381,9 +1447,13 @@ def model_forward(m, args):
         for h in range(NUM_HEADS):
             attention_forward(m.head[l][h], m._x_buf, m.z, args)
 
-        cache_index_batch(m.FFN[l], m.z, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
         lut = m.FFN[l]
-        m.z[:, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l]]).sum(axis=1)
+        cache_index_batch(lut, m.z, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
+        if HAS_NUMBA and lut.S.dtype == np.float32:
+            _lut_forward_add_kernel(lut.S, lut.trees, m._ffn_j[l], m.z,
+                                    args.context_size, args.n_t, lut.y_dim)
+        else:
+            m.z[:, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l]]).sum(axis=1)
 
     m.output_head.forward(m.z, args)
 
