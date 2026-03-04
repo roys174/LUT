@@ -139,10 +139,14 @@ class StandardOutputHead:
         self.tokens = tokens
 
     def forward(self, z, args):
-        self.output[:] = 0.0
-        cache_index_batch(self.unembedder, z, self._j, self._r_min, self._u_min)
         lut = self.unembedder
-        self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
+        cache_index_batch(lut, z, self._j, self._r_min, self._u_min)
+        if HAS_NUMBA and lut.S.dtype == np.float32:
+            _lut_forward_kernel(lut.S, lut.trees, self._j, self.output,
+                                args.context_size, args.n_t, lut.y_dim)
+        else:
+            self.output[:] = 0.0
+            self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
 
     def backward(self, x_grad, args, skip_s_update=False):
         global learning_rate
@@ -232,12 +236,20 @@ class FactoredOutputHead:
         self.tokens_lo[:context_size + 1] = t % 256
 
     def forward(self, z, args):
-        self.output_hi[:] = 0.0
-        self.output_lo[:] = 0.0
+        CS = args.context_size
+        NT = args.n_t
         cache_index_batch(self.unembedder_hi, z, self._hi_j, self._hi_r_min, self._hi_u_min)
         cache_index_batch(self.unembedder_lo, z, self._lo_j, self._lo_r_min, self._lo_u_min)
-        self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
-        self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
+        if HAS_NUMBA and self.unembedder_hi.S.dtype == np.float32:
+            _lut_forward_kernel(self.unembedder_hi.S, self.unembedder_hi.trees, self._hi_j,
+                                self.output_hi, CS, NT, self.unembedder_hi.y_dim)
+            _lut_forward_kernel(self.unembedder_lo.S, self.unembedder_lo.trees, self._lo_j,
+                                self.output_lo, CS, NT, self.unembedder_lo.y_dim)
+        else:
+            self.output_hi[:] = 0.0
+            self.output_lo[:] = 0.0
+            self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
+            self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
 
     def backward(self, x_grad, args, skip_s_update=False):
         global learning_rate
@@ -704,59 +716,69 @@ def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_
                 pos_grad[pe_pos, t, r] += total
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
+def _lut_forward_kernel(S, trees, j, output, CS, N_T, y_dim):
+    """Fused LUT forward: parallel over CS, eliminates (CS, N_T, y_dim) temporary."""
+    for pos in prange(CS):
+        for d in range(y_dim):
+            output[pos, d] = np.float32(0.0)
+        for t in range(N_T):
+            j_bin = j[pos, t]
+            for d in range(y_dim):
+                output[pos, d] += S[trees[t], j_bin, d]
+
+
+@njit(parallel=True, cache=True)
 def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                           y_dim, CS, N_T, lr):
-    """Fused backward for simple LUT (FFN, output head). grad: (CS, >=y_dim)."""
-    for pos in range(CS):
+    """Fused backward for simple LUT (FFN, output head). grad: (CS, >=y_dim).
+
+    Phase 1 (parallel): compute x_grad using original S — each pos writes unique row.
+    Phase 2 (sequential): update S — bin collisions possible across positions.
+    """
+    # Phase 1: parallel x_grad computation
+    for pos in prange(CS):
         for t in range(N_T):
             tree = trees[t]
             j_bin = j[pos, t]
             r = r_min[pos, t]
             jbar_bin = j_bin ^ (1 << r)
-
-            gi = 0.0
+            gi = np.float32(0.0)
             for d in range(y_dim):
                 gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
-
             u = u_min[pos, t]
-            sign_u = 1.0 if u > 0.0 else -1.0
-            abs_u = abs(u)
-            v = gi * (-0.5 * sign_u / (1.0 + abs_u) ** 2)
+            sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
+            v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
+            x_grad[pos, a_arr[t, r]] += v
+            x_grad[pos, b_arr[t, r]] -= v
 
-            idx_a = a_arr[t, r]
-            idx_b = b_arr[t, r]
-            x_grad[pos, idx_a] += v
-            x_grad[pos, idx_b] -= v
-
+    # Phase 2: sequential S update
+    for pos in range(CS):
+        for t in range(N_T):
+            tree = trees[t]
+            j_bin = j[pos, t]
             for d in range(y_dim):
                 S[tree, j_bin, d] -= lr * grad[pos, d]
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _lut_backward_kernel_noupdate(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                                    y_dim, CS, N_T):
-    """Like _lut_backward_kernel but without the S update (x_grad only)."""
-    for pos in range(CS):
+    """Like _lut_backward_kernel but without the S update: fully parallel over CS."""
+    for pos in prange(CS):
         for t in range(N_T):
             tree = trees[t]
             j_bin = j[pos, t]
             r = r_min[pos, t]
             jbar_bin = j_bin ^ (1 << r)
-
-            gi = 0.0
+            gi = np.float32(0.0)
             for d in range(y_dim):
                 gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
-
             u = u_min[pos, t]
-            sign_u = 1.0 if u > 0.0 else -1.0
-            abs_u = abs(u)
-            v = gi * (-0.5 * sign_u / (1.0 + abs_u) ** 2)
-
-            idx_a = a_arr[t, r]
-            idx_b = b_arr[t, r]
-            x_grad[pos, idx_a] += v
-            x_grad[pos, idx_b] -= v
+            sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
+            v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
+            x_grad[pos, a_arr[t, r]] += v
+            x_grad[pos, b_arr[t, r]] -= v
 
 
 @njit(cache=True)
@@ -1411,8 +1433,12 @@ def model_backward(m, args, grad_accum=None):
             # Save y_grad for sparse replay at apply time
             grad_accum.ffn_y_grads[l] = y_grad[:, :y_dim].copy()
         else:
-            for pos in range(CS):
-                lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
+            if HAS_NUMBA and lut.S.dtype == np.float32:
+                _lut_s_replay_kernel(lut.S, trees, j, y_grad, y_dim, CS, args.n_t,
+                                     np.float32(learning_rate))
+            else:
+                for pos in range(CS):
+                    lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
         soft = getattr(args, 'soft_attention', False)
