@@ -81,14 +81,17 @@ class LUT:
 
 
 class AttentionHead:
-    __slots__ = ['V', 'Positional_encoding',
+    __slots__ = ['V', 'Score', 'Value', 'Positional_encoding',
                  '_v_j', '_v_r_min', '_v_u_min',
-                 '_pe_j', '_pe_r_min', '_pe_u_min']
+                 '_val_j', '_val_r_min', '_val_u_min',
+                 '_pe_j', '_pe_r_min', '_pe_u_min',
+                 '_attn_w', '_v_vecs']
     def __init__(self, args):
         N_T = args.n_t
         CS = args.context_size
         POSITIONAL_DIM = args.positional_dim
-        self.V = LUT(N_T)
+        ED = args.embedding_dim
+        soft = getattr(args, 'soft_attention', False)
         self.Positional_encoding = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
         self._v_j = np.zeros((CS, N_T), dtype=np.int32)
         self._v_r_min = np.zeros((CS, N_T), dtype=np.int32)
@@ -96,6 +99,24 @@ class AttentionHead:
         self._pe_j = np.zeros((CS, N_T), dtype=np.int32)
         self._pe_r_min = np.zeros((CS, N_T), dtype=np.int32)
         self._pe_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        if soft:
+            self.V = None
+            self.Score = LUT(N_T)
+            self.Value = LUT(N_T)
+            self._val_j     = np.zeros((CS, N_T), dtype=np.int32)
+            self._val_r_min = np.zeros((CS, N_T), dtype=np.int32)
+            self._val_u_min = np.zeros((CS, N_T), dtype=np.float32)
+            self._attn_w    = np.zeros((CS, CS),  dtype=np.float32)
+            self._v_vecs    = np.zeros((CS, ED),  dtype=np.float32)
+        else:
+            self.V = LUT(N_T)
+            self.Score = None
+            self.Value = None
+            self._val_j     = None
+            self._val_r_min = None
+            self._val_u_min = None
+            self._attn_w    = None
+            self._v_vecs    = None
 
 
 class StandardOutputHead:
@@ -331,7 +352,8 @@ class SparseGradAccumulator:
     time using the saved y_grads together with the cached index arrays that
     already live on each BatchElement.
     """
-    __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads']
+    __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads',
+                 'attn_score_grads', 'attn_val_grads']
 
     def __init__(self, args):
         NL = args.num_layers
@@ -339,16 +361,32 @@ class SparseGradAccumulator:
         CS = args.context_size
         NT = args.n_t
         PD = args.positional_dim
+        ED = args.embedding_dim
         self.ffn_y_grads = [None] * NL      # filled during backward
         self.attn_y_grads = [None] * NL     # filled during backward
         self.pe_grads = [[np.zeros((CS, NT, PD), dtype=np.float32)
                           for _ in range(NH)] for _ in range(NL)]
+        if getattr(args, 'soft_attention', False):
+            self.attn_score_grads = [[np.zeros((CS, CS), dtype=np.float32)
+                                      for _ in range(NH)] for _ in range(NL)]
+            self.attn_val_grads   = [[np.zeros((CS, ED), dtype=np.float32)
+                                      for _ in range(NH)] for _ in range(NL)]
+        else:
+            self.attn_score_grads = None
+            self.attn_val_grads   = None
 
     def zero(self):
         for i in range(len(self.ffn_y_grads)):
             self.ffn_y_grads[i] = None
         for i in range(len(self.attn_y_grads)):
             self.attn_y_grads[i] = None
+        if self.attn_score_grads is not None:
+            for layer in self.attn_score_grads:
+                for g in layer:
+                    g[:] = 0
+            for layer in self.attn_val_grads:
+                for g in layer:
+                    g[:] = 0
         for layer in self.pe_grads:
             for g in layer:
                 g[:] = 0
@@ -389,11 +427,15 @@ class BatchElement:
         self._ffn_r_min = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
         self._ffn_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
 
-        # Per-element attention heads (own scratch, shared V LUT and PE)
+        # Per-element attention heads (own scratch, shared LUTs and PE)
         self.head = [[AttentionHead(args) for _ in range(NH)] for _ in range(NL)]
         for l in range(NL):
             for h in range(NH):
-                _share_lut(self.head[l][h].V, m.head[l][h].V)
+                if getattr(args, 'soft_attention', False):
+                    _share_lut(self.head[l][h].Score, m.head[l][h].Score)
+                    _share_lut(self.head[l][h].Value, m.head[l][h].Value)
+                else:
+                    _share_lut(self.head[l][h].V, m.head[l][h].V)
                 self.head[l][h].Positional_encoding = m.head[l][h].Positional_encoding
 
         # Per-element output head (own output buffers, shared LUT)
@@ -757,6 +799,215 @@ def _softmax_cross_entropy_kernel(output, target_indices, CS, VOCAB):
 
 
 # ---------------------------------------------------------------------------
+# Soft attention Numba kernels
+# ---------------------------------------------------------------------------
+
+@njit(parallel=True, cache=True)
+def _soft_attn_forward_kernel(ScoreS, ValueS, jV, val_j, jPE, y, attn_w, v_vecs,
+                               shift_qk, pd, CS, N_T, ED):
+    """Fused soft attention forward: raw scores, softmax, value vectors, weighted sum."""
+    # Phase 1: raw scores + softmax (parallel over pos >= 1)
+    for pos in prange(1, CS):
+        for pos1 in range(pos):
+            pe_pos = pos - pos1
+            s = np.float32(0.0)
+            for t in range(N_T):
+                j_bin = (jV[pos, t] << shift_qk) | (jV[pos1, t] << pd) | jPE[pe_pos, t]
+                s += ScoreS[t, j_bin, 0]
+            attn_w[pos, pos1] = s
+        max_s = attn_w[pos, 0]
+        for pos1 in range(1, pos):
+            if attn_w[pos, pos1] > max_s:
+                max_s = attn_w[pos, pos1]
+        s_sum = np.float32(0.0)
+        for pos1 in range(pos):
+            val = np.exp(attn_w[pos, pos1] - max_s)
+            attn_w[pos, pos1] = val
+            s_sum += val
+        for pos1 in range(pos):
+            attn_w[pos, pos1] /= s_sum
+
+    # Phase 2: value vectors v_vecs[pos] = sum_t ValueS[t, val_j[pos,t], :] (parallel over pos)
+    for pos in prange(CS):
+        for d in range(ED):
+            v_vecs[pos, d] = np.float32(0.0)
+        for t in range(N_T):
+            j_val = val_j[pos, t]
+            for d in range(ED):
+                v_vecs[pos, d] += ValueS[t, j_val, d]
+
+    # Phase 3: weighted sum into y (parallel over pos >= 1)
+    for pos in prange(1, CS):
+        for pos1 in range(pos):
+            w = attn_w[pos, pos1]
+            for d in range(ED):
+                y[pos, d] += w * v_vecs[pos1, d]
+
+
+@njit(parallel=True, cache=True)
+def _soft_attn_backward_value_kernel(ValueS, val_j, val_r_min, val_u_min,
+                                      attn_w, y_grad, val_grad, x_grad,
+                                      val_a_arr, val_b_arr, CS, N_T, ED, lr, skip_s_update):
+    """Soft attention value backward: val_grad, STE x_grad update, optional Value.S update."""
+    n_threads = get_num_threads()
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
+
+    # Phase 1: val_grad[pos1] = sum_{pos>pos1} attn_w[pos,pos1] * y_grad[pos] (parallel over pos1)
+    for pos1 in prange(CS):
+        for d in range(ED):
+            val_grad[pos1, d] = np.float32(0.0)
+        for pos in range(pos1 + 1, CS):
+            w = attn_w[pos, pos1]
+            for d in range(ED):
+                val_grad[pos1, d] += w * y_grad[pos, d]
+
+    # Phase 2: Value STE — compute x_grad contribution (parallel over pos1)
+    for pos1 in prange(CS):
+        tid = get_thread_id()
+        for t in range(N_T):
+            j_val = val_j[pos1, t]
+            r = val_r_min[pos1, t]
+            jbar = j_val ^ (1 << r)
+            gi = np.float32(0.0)
+            for d in range(ED):
+                gi += (ValueS[t, jbar, d] - ValueS[t, j_val, d]) * val_grad[pos1, d]
+            u = val_u_min[pos1, t]
+            sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
+            v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
+            x_grad_thr[tid, pos1, val_a_arr[t, r]] += v
+            x_grad_thr[tid, pos1, val_b_arr[t, r]] -= v
+
+    # Phase 3: reduce x_grad_thr into x_grad (parallel over pos)
+    for pos in prange(CS):
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, pos, d]
+            x_grad[pos, d] += total
+
+    # Phase 4: Value.S update (sequential — collisions possible across pos1)
+    if not skip_s_update:
+        for pos1 in range(CS):
+            for t in range(N_T):
+                j_val = val_j[pos1, t]
+                for d in range(ED):
+                    ValueS[t, j_val, d] -= lr * val_grad[pos1, d]
+
+
+@njit(parallel=True, cache=True)
+def _soft_attn_backward_score_kernel(ScoreS, jV, rV, uV, jPE, rPE, uPE,
+                                      attn_w, v_vecs, y_grad, score_grad, x_grad, pos_grad,
+                                      score_a_arr, score_b_arr,
+                                      shift_qk, pd, CS, N_T, ED, lr, skip_s_update):
+    """Soft attention score backward: score_grad, STE x_grad + pe_grad, optional Score.S update."""
+    n_threads = get_num_threads()
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
+    pe_grad_thr = np.zeros((n_threads, CS, N_T, pd), dtype=np.float32)
+
+    # Phase 1: compute score_grad (parallel over pos >= 1)
+    # score_grad[pos, pos1] = attn_w[pos,pos1] * (a[pos,pos1] - baseline[pos])
+    # Uses score_grad as temp for affinities, then overwrites with score_grad.
+    for pos in prange(1, CS):
+        baseline = np.float32(0.0)
+        for pos1 in range(pos):
+            a = np.float32(0.0)
+            for d in range(ED):
+                a += y_grad[pos, d] * v_vecs[pos1, d]
+            score_grad[pos, pos1] = a
+            baseline += attn_w[pos, pos1] * a
+        for pos1 in range(pos):
+            score_grad[pos, pos1] = attn_w[pos, pos1] * (score_grad[pos, pos1] - baseline)
+
+    # Phase 2: Score STE — x_grad and pe_grad contributions (parallel over pos >= 1)
+    for pos in prange(1, CS):
+        tid = get_thread_id()
+        for pos1 in range(pos):
+            sg = score_grad[pos, pos1]
+            pe_pos = pos - pos1
+            for t in range(N_T):
+                jQ_t  = jV[pos, t];  jK_t = jV[pos1, t];  jPE_t = jPE[pe_pos, t]
+                j_bin = (jQ_t << shift_qk) | (jK_t << pd) | jPE_t
+                abs_uQ  = abs(uV[pos, t])
+                abs_uK  = abs(uV[pos1, t])
+                abs_uPE = abs(uPE[pe_pos, t])
+                q_wins = abs_uQ < abs_uK
+                if q_wins:
+                    flip_bit = rV[pos, t] + shift_qk
+                    u_min = uV[pos, t];  r = rV[pos, t]
+                else:
+                    flip_bit = rV[pos1, t] + pd
+                    u_min = uV[pos1, t];  r = rV[pos1, t]
+                jbar = j_bin ^ (1 << flip_bit)
+                gi = (ScoreS[t, jbar, 0] - ScoreS[t, j_bin, 0]) * sg
+                sign_u = np.float32(1.0) if u_min > np.float32(0.0) else np.float32(-1.0)
+                v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u_min)) ** 2)
+                idx_a = score_a_arr[t, r];  idx_b = score_b_arr[t, r]
+                if q_wins:
+                    x_grad[pos, idx_a] += v   # unique per prange pos — no race
+                    x_grad[pos, idx_b] -= v
+                else:
+                    x_grad_thr[tid, pos1, idx_a] += v
+                    x_grad_thr[tid, pos1, idx_b] -= v
+                # PE branch
+                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                    rPE_t = rPE[pe_pos, t]
+                    jbarPE = j_bin ^ (1 << rPE_t)
+                    giPE = (ScoreS[t, jbarPE, 0] - ScoreS[t, j_bin, 0]) * sg
+                    u_pe = uPE[pe_pos, t]
+                    sign_pe = np.float32(1.0) if u_pe > np.float32(0.0) else np.float32(-1.0)
+                    deltaPE = giPE * (np.float32(-0.5) * sign_pe / (np.float32(1.0) + abs(u_pe)) ** 2)
+                    pe_grad_thr[tid, pe_pos, t, rPE_t] += deltaPE
+
+    # Phase 3: reduce thread-local buffers (parallel)
+    for target in prange(CS):
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, target, d]
+            x_grad[target, d] += total
+
+    for pe_pos in prange(CS):
+        for t in range(N_T):
+            for r in range(pd):
+                total = np.float32(0.0)
+                for thr in range(n_threads):
+                    total += pe_grad_thr[thr, pe_pos, t, r]
+                pos_grad[pe_pos, t, r] += total
+
+    # Phase 4: Score.S update (sequential — collisions possible across (pos,pos1) pairs)
+    if not skip_s_update:
+        for pos in range(1, CS):
+            for pos1 in range(pos):
+                sg = score_grad[pos, pos1]
+                pe_pos = pos - pos1
+                for t in range(N_T):
+                    j_bin = (jV[pos, t] << shift_qk) | (jV[pos1, t] << pd) | jPE[pe_pos, t]
+                    ScoreS[t, j_bin, 0] -= lr * sg
+
+
+@njit(cache=True)
+def _soft_attn_score_s_replay_kernel(ScoreS, jV, jPE, score_grad, shift_qk, pd, CS, N_T, scale):
+    """Replay Score.S updates from saved score_grad and cached j indices."""
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            sg = score_grad[pos, pos1]
+            pe_pos = pos - pos1
+            for t in range(N_T):
+                j_bin = (jV[pos, t] << shift_qk) | (jV[pos1, t] << pd) | jPE[pe_pos, t]
+                ScoreS[t, j_bin, 0] -= scale * sg
+
+
+@njit(cache=True)
+def _soft_attn_value_s_replay_kernel(ValueS, val_j, val_grad, CS, N_T, ED, scale):
+    """Replay Value.S updates from saved val_grad and cached j indices."""
+    for pos1 in range(CS):
+        for t in range(N_T):
+            j_val = val_j[pos1, t]
+            for d in range(ED):
+                ValueS[t, j_val, d] -= scale * val_grad[pos1, d]
+
+
+# ---------------------------------------------------------------------------
 # Model operations
 # ---------------------------------------------------------------------------
 
@@ -778,13 +1029,59 @@ def build_Model(m, args):
             m.head[l][h].Positional_encoding[:] = random_vector(
                 args.context_size * N_T * POSITIONAL_DIM, 1.0
             ).reshape(args.context_size, N_T, POSITIONAL_DIM)
-            build_LUT(m.head[l][h].V, N_C + N_C + POSITIONAL_DIM, EMBEDDING_DIM, args)
+            if getattr(args, 'soft_attention', False):
+                build_LUT(m.head[l][h].Score, N_C + N_C + POSITIONAL_DIM, 1, args)
+                build_LUT(m.head[l][h].Value, N_C, EMBEDDING_DIM, args)
+            else:
+                build_LUT(m.head[l][h].V, N_C + N_C + POSITIONAL_DIM, EMBEDDING_DIM, args)
 
     m.output_head.build(N_C, args)
 
 
 def attention_forward(head, x, y, args):
     CS = args.context_size
+
+    if getattr(args, 'soft_attention', False):
+        shift_qk = args.shift_qk
+        pd = args.positional_dim
+        ED = args.embedding_dim
+
+        # Two independent cache calls (Score: Q+K indexing; Value: K-only indexing)
+        cache_index_batch(head.Score, x, head._v_j, head._v_r_min, head._v_u_min)
+        cache_index_batch(head.Value, x, head._val_j, head._val_r_min, head._val_u_min)
+        cache_PE_index_batch(head.Positional_encoding, head._pe_j, head._pe_r_min, head._pe_u_min, args)
+
+        if HAS_NUMBA and head.Score.S.dtype == np.float32:
+            _soft_attn_forward_kernel(head.Score.S, head.Value.S,
+                                       head._v_j, head._val_j, head._pe_j,
+                                       y, head._attn_w, head._v_vecs,
+                                       shift_qk, pd, CS, args.n_t, ED)
+        else:
+            # Value vectors: v_vecs[pos] = sum_t Value.S[t, val_j[pos, t], :]
+            val_trees = head.Value.trees
+            v_vecs = _f32(head.Value.S[val_trees, head._val_j]).sum(axis=1)  # (CS, ED)
+            head._v_vecs[:] = v_vecs
+
+            # Raw scores for all causal (pos, pos1) pairs
+            score_trees = head.Score.trees
+            raw_scores = np.full((CS, CS), -1e9, dtype=np.float32)
+            for pos in range(1, CS):
+                jQ  = head._v_j[pos]                              # (N_T,)
+                jK  = head._v_j[:pos]                             # (pos, N_T)
+                jPE = head._pe_j[pos - np.arange(pos)]            # (pos, N_T)
+                j_bins = (jQ << shift_qk) | (jK << pd) | jPE     # (pos, N_T)
+                raw_scores[pos, :pos] = _f32(head.Score.S[score_trees, j_bins, 0]).sum(axis=1)
+
+            # Softmax + weighted sum
+            for pos in range(1, CS):
+                s = raw_scores[pos, :pos].copy()
+                s -= s.max()
+                np.exp(s, out=s)
+                s /= s.sum()
+                head._attn_w[pos, :pos] = s
+                y[pos, :ED] += (s[:, np.newaxis] * v_vecs[:pos]).sum(axis=0)
+        return
+
     lut = head.V
     trees = lut.trees
     y_dim = lut.y_dim
@@ -809,11 +1106,134 @@ def attention_forward(head, x, y, args):
             y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
-def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None):
+def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None,
+                       score_grad_out=None, val_grad_out=None):
     global learning_rate
     CS = args.context_size
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
+
+    if getattr(args, 'soft_attention', False):
+        shift_qk = args.shift_qk
+        pd = POSITIONAL_DIM
+        ED = x_grad.shape[1]
+        val_lut = head.Value
+        score_lut = head.Score
+
+        if HAS_NUMBA and score_lut.S.dtype == np.float32:
+            val_grad   = val_grad_out   if val_grad_out   is not None else np.zeros((CS, ED),              dtype=np.float32)
+            score_grad = score_grad_out if score_grad_out is not None else np.zeros((CS, CS),              dtype=np.float32)
+            pos_grad   = pe_grad_out    if pe_grad_out    is not None else np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+
+            _soft_attn_backward_value_kernel(
+                val_lut.S, head._val_j, head._val_r_min, head._val_u_min,
+                head._attn_w, y_grad, val_grad, x_grad,
+                val_lut.a_arr, val_lut.b_arr,
+                CS, N_T, ED, np.float32(learning_rate), skip_s_update)
+
+            _soft_attn_backward_score_kernel(
+                score_lut.S, head._v_j, head._v_r_min, head._v_u_min,
+                head._pe_j, head._pe_r_min, head._pe_u_min,
+                head._attn_w, head._v_vecs, y_grad, score_grad, x_grad, pos_grad,
+                score_lut.a_arr, score_lut.b_arr,
+                shift_qk, pd, CS, N_T, ED, np.float32(learning_rate), skip_s_update)
+
+            if pe_grad_out is None:
+                head.Positional_encoding -= learning_rate * pos_grad
+        else:
+            val_trees = val_lut.trees
+            score_trees = score_lut.trees
+
+            # --- Value path ---
+            val_grad = (_f32(head._attn_w)[:, :, np.newaxis] * y_grad[:, np.newaxis, :]).sum(axis=0)
+
+            jbar_val = head._val_j ^ (1 << head._val_r_min)
+            S_j_val    = _f32(val_lut.S[val_trees, head._val_j])
+            S_jbar_val = _f32(val_lut.S[val_trees, jbar_val])
+            gi_val = ((S_jbar_val - S_j_val) * val_grad[:, np.newaxis, :]).sum(axis=2)
+            sign_u_val = np.where(head._val_u_min > 0, 1.0, -1.0)
+            v_val = gi_val * (-0.5 * sign_u_val / (1 + np.abs(head._val_u_min))**2)
+
+            pos_idx = np.arange(CS)[:, np.newaxis]
+            idx_a_val = val_lut.a_arr[val_trees, head._val_r_min]
+            idx_b_val = val_lut.b_arr[val_trees, head._val_r_min]
+            flat_a_val = (pos_idx * ED + idx_a_val).ravel()
+            flat_b_val = (pos_idx * ED + idx_b_val).ravel()
+            flat_size = x_grad.size
+            x_grad.ravel()[:] += np.bincount(flat_a_val, weights=v_val.ravel(), minlength=flat_size)
+            x_grad.ravel()[:] -= np.bincount(flat_b_val, weights=v_val.ravel(), minlength=flat_size)
+
+            if not skip_s_update:
+                for pos1 in range(CS):
+                    val_lut.S[val_trees, head._val_j[pos1]] -= learning_rate * val_grad[pos1]
+
+            if val_grad_out is not None:
+                val_grad_out[:] = val_grad
+
+            # --- Score path ---
+            a = y_grad @ head._v_vecs.T
+            baseline = (head._attn_w * a).sum(axis=1, keepdims=True)
+            score_grad = head._attn_w * (a - baseline)
+
+            pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+
+            for pos in range(1, CS):
+                for pos1 in range(pos):
+                    sg = score_grad[pos, pos1]
+                    pe_pos = pos - pos1
+                    for t in range(N_T):
+                        jQ_t  = int(head._v_j[pos, t])
+                        jK_t  = int(head._v_j[pos1, t])
+                        jPE_t = int(head._pe_j[pe_pos, t])
+                        j_bin = (jQ_t << shift_qk) | (jK_t << pd) | jPE_t
+
+                        abs_uQ  = abs(float(head._v_u_min[pos, t]))
+                        abs_uK  = abs(float(head._v_u_min[pos1, t]))
+                        abs_uPE = abs(float(head._pe_u_min[pe_pos, t]))
+
+                        q_wins = abs_uQ < abs_uK
+                        if q_wins:
+                            flip_bit = int(head._v_r_min[pos, t]) + shift_qk
+                            u_min = float(head._v_u_min[pos, t])
+                            r = int(head._v_r_min[pos, t])
+                        else:
+                            flip_bit = int(head._v_r_min[pos1, t]) + pd
+                            u_min = float(head._v_u_min[pos1, t])
+                            r = int(head._v_r_min[pos1, t])
+
+                        jbar = j_bin ^ (1 << flip_bit)
+                        gi = (float(score_lut.S[t, jbar, 0]) - float(score_lut.S[t, j_bin, 0])) * sg
+                        sign_u = 1.0 if u_min > 0 else -1.0
+                        v = gi * (-0.5 * sign_u / (1.0 + abs(u_min))**2)
+
+                        if q_wins:
+                            x_grad[pos, score_lut.a_arr[t, r]] += v
+                            x_grad[pos, score_lut.b_arr[t, r]] -= v
+                        else:
+                            x_grad[pos1, score_lut.a_arr[t, r]] += v
+                            x_grad[pos1, score_lut.b_arr[t, r]] -= v
+
+                        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                            rPE = int(head._pe_r_min[pe_pos, t])
+                            jbarPE = j_bin ^ (1 << rPE)
+                            giPE = (float(score_lut.S[t, jbarPE, 0]) - float(score_lut.S[t, j_bin, 0])) * sg
+                            u_pe = float(head._pe_u_min[pe_pos, t])
+                            sign_pe = 1.0 if u_pe > 0 else -1.0
+                            deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe))**2)
+                            pos_grad[pe_pos, t, rPE] += deltaPE
+
+                        if not skip_s_update:
+                            score_lut.S[t, j_bin, 0] -= learning_rate * sg
+
+            if score_grad_out is not None:
+                score_grad_out[:] = score_grad
+
+            if pe_grad_out is not None:
+                pe_grad_out += pos_grad
+            else:
+                head.Positional_encoding -= learning_rate * pos_grad
+        return
+
     lut = head.V
     trees = lut.trees
     y_dim = lut.y_dim
@@ -995,14 +1415,17 @@ def model_backward(m, args, grad_accum=None):
                 lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
-        if grad_accum is not None:
-            # Save y_grad once per layer (shared across heads)
+        soft = getattr(args, 'soft_attention', False)
+        if grad_accum is not None and not soft:
+            # Save y_grad once per layer (shared across heads) for hard attention replay
             grad_accum.attn_y_grads[l] = y_grad.copy()
         for h in range(NUM_HEADS):
             if grad_accum is not None:
                 attention_backward(m.head[l][h], x_grad, y_grad, args,
                                    skip_s_update=True,
-                                   pe_grad_out=grad_accum.pe_grads[l][h])
+                                   pe_grad_out=grad_accum.pe_grads[l][h],
+                                   score_grad_out=grad_accum.attn_score_grads[l][h] if soft else None,
+                                   val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None)
             else:
                 attention_backward(m.head[l][h], x_grad, y_grad, args)
 
@@ -1069,6 +1492,32 @@ def _replay_output_task(S, trees, j_list, output_list, y_dim, CS, N_T, scale, us
                 S[trees, j[pos]] -= scale * output[pos, :y_dim]
 
 
+def _replay_soft_attn_task(ScoreS, ValueS, score_trees, val_trees,
+                            jV_list, jPE_list, val_j_list, score_grad_list, val_grad_list,
+                            PE, pe_grad_list, shift_qk, pd, CS, N_T, scale, use_numba=False):
+    """Replay soft attention Score + Value + PE updates across all batch elements."""
+    ED = ValueS.shape[2]
+    if use_numba:
+        for jV, jPE, val_j, sg, vg in zip(jV_list, jPE_list, val_j_list, score_grad_list, val_grad_list):
+            _soft_attn_value_s_replay_kernel(ValueS, val_j, vg, CS, N_T, ED, scale)
+            _soft_attn_score_s_replay_kernel(ScoreS, jV, jPE, sg, shift_qk, pd, CS, N_T, scale)
+    else:
+        for jV, jPE, val_j, sg, vg in zip(jV_list, jPE_list, val_j_list, score_grad_list, val_grad_list):
+            # Value LUT update: each tree gets the full val_grad
+            for pos1 in range(CS):
+                ValueS[val_trees, val_j[pos1]] -= scale * vg[pos1]
+            # Score LUT update (sequential to handle repeated j_bin collisions)
+            for pos in range(1, CS):
+                for pos1 in range(pos):
+                    pe_pos = pos - pos1
+                    scalar_sg = sg[pos, pos1]
+                    for t in range(N_T):
+                        j_bin = (int(jV[pos, t]) << shift_qk) | (int(jV[pos1, t]) << pd) | int(jPE[pe_pos, t])
+                        ScoreS[t, j_bin, 0] -= scale * scalar_sg
+    for pe_grad in pe_grad_list:
+        PE -= scale * pe_grad
+
+
 def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
     """Replay sparse S updates using saved y_grads and cached indices from batch elements.
 
@@ -1096,17 +1545,32 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
         # Attention: one task per (layer, head)
         for h in range(args.num_heads):
             head = m.head[l][h]
-            lut_v = head.V
-            jV_list = [be.head[l][h]._v_j for be in batch_elements]
+            jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
             jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
-            ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
             pe_grad_list = [be.grad_accum.pe_grads[l][h] for be in batch_elements]
-            work.append(lambda _S=lut_v.S, _jV=jV_list, _jPE=jPE_list,
-                               _y=ygrad_list, _PE=head.Positional_encoding,
-                               _pg=pe_grad_list, _yd=lut_v.y_dim:
-                        _replay_attn_task(_S, _jV, _jPE, _y, _PE, _pg,
-                                          args.shift_qk, args.positional_dim,
-                                          CS, N_T, _yd, scale, use_numba))
+            if getattr(args, 'soft_attention', False):
+                val_j_list      = [be.head[l][h]._val_j             for be in batch_elements]
+                score_grad_list = [be.grad_accum.attn_score_grads[l][h] for be in batch_elements]
+                val_grad_list   = [be.grad_accum.attn_val_grads[l][h]   for be in batch_elements]
+                work.append(lambda _SS=head.Score.S, _VS=head.Value.S,
+                                   _st=head.Score.trees, _vt=head.Value.trees,
+                                   _jV=jV_list, _jPE=jPE_list, _vj=val_j_list,
+                                   _sg=score_grad_list, _vg=val_grad_list,
+                                   _PE=head.Positional_encoding, _pg=pe_grad_list:
+                            _replay_soft_attn_task(_SS, _VS, _st, _vt,
+                                                   _jV, _jPE, _vj, _sg, _vg,
+                                                   _PE, _pg,
+                                                   args.shift_qk, args.positional_dim,
+                                                   CS, N_T, scale, use_numba))
+            else:
+                lut_v = head.V
+                ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+                work.append(lambda _S=lut_v.S, _jV=jV_list, _jPE=jPE_list,
+                                   _y=ygrad_list, _PE=head.Positional_encoding,
+                                   _pg=pe_grad_list, _yd=lut_v.y_dim:
+                            _replay_attn_task(_S, _jV, _jPE, _y, _PE, _pg,
+                                              args.shift_qk, args.positional_dim,
+                                              CS, N_T, _yd, scale, use_numba))
 
     # Output head: one task per LUT
     if args.factored_output:
@@ -1242,7 +1706,11 @@ def print_model_stats(m, args):
         # Attention heads
         for h in range(args.num_heads):
             head = m.head[l][h]
-            count_array(head.V.S)
+            if getattr(args, 'soft_attention', False):
+                count_array(head.Score.S)
+                count_array(head.Value.S)
+            else:
+                count_array(head.V.S)
             count_array(head.Positional_encoding)
 
     # Output head
@@ -1301,6 +1769,8 @@ def main():
                         help='Use float16 for LUT S tables (halves memory, may reduce precision)')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Number of sequences per training step (default: 1)')
+    parser.add_argument('--soft-attention', action='store_true',
+                        help='Decomposed Score+Value LUTs with softmax weighting (transformer-style)')
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
@@ -1331,6 +1801,7 @@ def main():
     print(f"  factored_output   = {args.factored_output}")
     print(f"  fp16              = {args.fp16}")
     print(f"  batch_size        = {args.batch_size}")
+    print(f"  soft_attention    = {args.soft_attention}")
     print(f"  tokenizer         = {args.tokenizer}")
     print(f"  max_steps         = {args.max_steps}")
     print(f"  validation_interval = {args.validation_interval}")
