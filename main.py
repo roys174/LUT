@@ -11,6 +11,7 @@ import random
 import sys
 import numpy as np
 import tiktoken
+from multiprocessing.pool import ThreadPool
 from tqdm import tqdm
 
 try:
@@ -122,14 +123,19 @@ class StandardOutputHead:
         lut = self.unembedder
         self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
 
-    def backward(self, x_grad, args):
+    def backward(self, x_grad, args, skip_s_update=False):
         global learning_rate
         lut = self.unembedder
         if HAS_NUMBA and lut.S.dtype == np.float32:
-            _lut_backward_kernel(lut.S, lut.trees, self._j, self._r_min, self._u_min,
-                                  self.output, x_grad, lut.a_arr, lut.b_arr,
-                                  lut.y_dim, args.context_size, args.n_t,
-                                  np.float32(learning_rate))
+            if skip_s_update:
+                _lut_backward_kernel_noupdate(lut.S, lut.trees, self._j, self._r_min, self._u_min,
+                                              self.output, x_grad, lut.a_arr, lut.b_arr,
+                                              lut.y_dim, args.context_size, args.n_t)
+            else:
+                _lut_backward_kernel(lut.S, lut.trees, self._j, self._r_min, self._u_min,
+                                      self.output, x_grad, lut.a_arr, lut.b_arr,
+                                      lut.y_dim, args.context_size, args.n_t,
+                                      np.float32(learning_rate))
         else:
             trees = lut.trees
             for pos in range(args.context_size):
@@ -145,13 +151,19 @@ class StandardOutputHead:
                 idx_b = lut.b_arr[trees, self._r_min[pos]]
                 x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
                 x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
-                lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
+                if not skip_s_update:
+                    lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
-        VOCAB_SIZE = args.vocab_size
-        for pos in range(args.context_size):
-            softmax(self.output[pos], VOCAB_SIZE, 1.0)
-            self.output[pos][self.tokens[pos + 1]] -= 1.0
+        if HAS_NUMBA:
+            _softmax_cross_entropy_kernel(self.output, self.tokens[1:args.context_size + 1],
+                                          args.context_size, args.vocab_size)
+        else:
+            x = self.output
+            x -= x.max(axis=1, keepdims=True)
+            np.exp(x, out=x)
+            x /= x.sum(axis=1, keepdims=True)
+            x[np.arange(args.context_size), self.tokens[1:args.context_size + 1]] -= 1.0
 
     def sample_token(self, args):
         VOCAB_SIZE = args.vocab_size
@@ -206,17 +218,23 @@ class FactoredOutputHead:
         self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
         self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
 
-    def backward(self, x_grad, args):
+    def backward(self, x_grad, args, skip_s_update=False):
         global learning_rate
-        for lut, j, r_min, u_min, output in [
+        lut_list = [
             (self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
             (self.unembedder_lo, self._lo_j, self._lo_r_min, self._lo_u_min, self.output_lo),
-        ]:
+        ]
+        for lut, j, r_min, u_min, output in lut_list:
             if HAS_NUMBA and lut.S.dtype == np.float32:
-                _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
-                                      output, x_grad, lut.a_arr, lut.b_arr,
-                                      lut.y_dim, args.context_size, args.n_t,
-                                      np.float32(learning_rate))
+                if skip_s_update:
+                    _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
+                                                  output, x_grad, lut.a_arr, lut.b_arr,
+                                                  lut.y_dim, args.context_size, args.n_t)
+                else:
+                    _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
+                                          output, x_grad, lut.a_arr, lut.b_arr,
+                                          lut.y_dim, args.context_size, args.n_t,
+                                          np.float32(learning_rate))
             else:
                 trees = lut.trees
                 for pos in range(args.context_size):
@@ -232,7 +250,8 @@ class FactoredOutputHead:
                     idx_b = lut.b_arr[trees, r_min[pos]]
                     x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
                     x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
-                    lut.S[trees, j_bins] -= learning_rate * output[pos, :lut.y_dim]
+                    if not skip_s_update:
+                        lut.S[trees, j_bins] -= learning_rate * output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
         VOCAB_HI = args.vocab_hi
@@ -302,6 +321,92 @@ class TrainingData:
         self.val_data = None
         self.val_length = 0
         self.testing_input_data = None
+
+
+class SparseGradAccumulator:
+    """Lightweight per-batch-element gradient storage (~1 MB vs ~3 GB for dense).
+
+    Instead of allocating full-size S gradient buffers, we save only the small
+    y_grad arrays during backward.  The actual S updates are replayed at apply
+    time using the saved y_grads together with the cached index arrays that
+    already live on each BatchElement.
+    """
+    __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads']
+
+    def __init__(self, args):
+        NL = args.num_layers
+        NH = args.num_heads
+        CS = args.context_size
+        NT = args.n_t
+        PD = args.positional_dim
+        self.ffn_y_grads = [None] * NL      # filled during backward
+        self.attn_y_grads = [None] * NL     # filled during backward
+        self.pe_grads = [[np.zeros((CS, NT, PD), dtype=np.float32)
+                          for _ in range(NH)] for _ in range(NL)]
+
+    def zero(self):
+        for i in range(len(self.ffn_y_grads)):
+            self.ffn_y_grads[i] = None
+        for i in range(len(self.attn_y_grads)):
+            self.attn_y_grads[i] = None
+        for layer in self.pe_grads:
+            for g in layer:
+                g[:] = 0
+
+
+def _share_lut(dst, src):
+    """Make dst LUT share src's S table and parameters."""
+    dst.S = src.S
+    dst.y_dim = src.y_dim
+    dst.a_arr = src.a_arr
+    dst.b_arr = src.b_arr
+    dst.bitmasks = src.bitmasks
+    dst.trees = src.trees
+
+
+class BatchElement:
+    """Per-sequence scratch space that duck-types as Model, sharing S tables."""
+    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
+                 '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
+                 'grad_accum']
+
+    def __init__(self, m, args):
+        CS = args.context_size
+        ED = args.embedding_dim
+        NT = args.n_t
+        NL = args.num_layers
+        NH = args.num_heads
+
+        # Shared (read-only during batch processing)
+        self.Token_embedder = m.Token_embedder
+        self.FFN = m.FFN  # shared LUT objects (S tables, a/b arrays)
+
+        # Per-element scratch
+        self.tokens = np.zeros(CS + 1, dtype=np.int32)
+        self.z = np.zeros((CS, ED), dtype=np.float32)
+        self._x_buf = np.zeros_like(self.z)
+        self._ffn_j = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
+        self._ffn_r_min = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
+        self._ffn_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
+
+        # Per-element attention heads (own scratch, shared V LUT and PE)
+        self.head = [[AttentionHead(args) for _ in range(NH)] for _ in range(NL)]
+        for l in range(NL):
+            for h in range(NH):
+                _share_lut(self.head[l][h].V, m.head[l][h].V)
+                self.head[l][h].Positional_encoding = m.head[l][h].Positional_encoding
+
+        # Per-element output head (own output buffers, shared LUT)
+        if args.factored_output:
+            self.output_head = FactoredOutputHead(args)
+            _share_lut(self.output_head.unembedder_hi, m.output_head.unembedder_hi)
+            _share_lut(self.output_head.unembedder_lo, m.output_head.unembedder_lo)
+        else:
+            self.output_head = StandardOutputHead(args)
+            _share_lut(self.output_head.unembedder, m.output_head.unembedder)
+
+        # Sparse gradient accumulators (saves y_grads, not full S buffers)
+        self.grad_accum = SparseGradAccumulator(args)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +579,89 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                     S[t, j_bin, d] -= lr * y_grad[pos, d]
 
 
+@njit(parallel=True, cache=True)
+def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
+                                         y_grad, x_grad, pos_grad, a_arr, b_arr,
+                                         shift_qk, pd, CS, N_T, y_dim):
+    """Like _attention_backward_kernel but without Phase 3 (no S update)."""
+    ED = x_grad.shape[1]
+    n_threads = get_num_threads()
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
+    pe_grad_thr = np.zeros((n_threads, CS, N_T, pd), dtype=np.float32)
+
+    # Phase 1: parallel gradient computation
+    for pos in prange(1, CS):
+        tid = get_thread_id()
+        for pos1 in range(pos):
+            pe_pos = pos - pos1
+            for t in range(N_T):
+                jQ = all_jV[pos, t]
+                jK = all_jV[pos1, t]
+                j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
+
+                abs_uQ = abs(all_uV[pos, t])
+                abs_uK = abs(all_uV[pos1, t])
+                q_wins = abs_uQ < abs_uK
+
+                if q_wins:
+                    flip_bit = all_rV[pos, t] + shift_qk
+                else:
+                    flip_bit = all_rV[pos1, t] + pd
+                jbar = j_bin ^ (1 << flip_bit)
+
+                gi = 0.0
+                for d in range(y_dim):
+                    gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
+
+                if q_wins:
+                    u_min = all_uV[pos, t]
+                    r = all_rV[pos, t]
+                else:
+                    u_min = all_uV[pos1, t]
+                    r = all_rV[pos1, t]
+
+                sign_u = 1.0 if u_min > 0.0 else -1.0
+                abs_u_min = abs(u_min)
+                v = gi * (-0.5 * sign_u / (1.0 + abs_u_min) ** 2)
+
+                idx_a = a_arr[t, r]
+                idx_b = b_arr[t, r]
+                if q_wins:
+                    x_grad[pos, idx_a] += v
+                    x_grad[pos, idx_b] -= v
+                else:
+                    x_grad_thr[tid, pos1, idx_a] += v
+                    x_grad_thr[tid, pos1, idx_b] -= v
+
+                abs_uPE = abs(all_uPE[pe_pos, t])
+                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                    rPE = all_rPE[pe_pos, t]
+                    jbarPE = j_bin ^ (1 << rPE)
+                    giPE = 0.0
+                    for d in range(y_dim):
+                        giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
+                    u_pe = all_uPE[pe_pos, t]
+                    sign_pe = 1.0 if u_pe > 0.0 else -1.0
+                    deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
+                    pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
+
+    # Phase 2: reduce per-thread buffers
+    for target in prange(CS):
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, target, d]
+            x_grad[target, d] += total
+
+    for pe_pos in prange(CS):
+        for t in range(N_T):
+            for r in range(pd):
+                total = np.float32(0.0)
+                for thr in range(n_threads):
+                    total += pe_grad_thr[thr, pe_pos, t, r]
+                pos_grad[pe_pos, t, r] += total
+
+
 @njit(cache=True)
 def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                           y_dim, CS, N_T, lr):
@@ -501,6 +689,71 @@ def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
 
             for d in range(y_dim):
                 S[tree, j_bin, d] -= lr * grad[pos, d]
+
+
+@njit(cache=True)
+def _lut_backward_kernel_noupdate(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
+                                   y_dim, CS, N_T):
+    """Like _lut_backward_kernel but without the S update (x_grad only)."""
+    for pos in range(CS):
+        for t in range(N_T):
+            tree = trees[t]
+            j_bin = j[pos, t]
+            r = r_min[pos, t]
+            jbar_bin = j_bin ^ (1 << r)
+
+            gi = 0.0
+            for d in range(y_dim):
+                gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
+
+            u = u_min[pos, t]
+            sign_u = 1.0 if u > 0.0 else -1.0
+            abs_u = abs(u)
+            v = gi * (-0.5 * sign_u / (1.0 + abs_u) ** 2)
+
+            idx_a = a_arr[t, r]
+            idx_b = b_arr[t, r]
+            x_grad[pos, idx_a] += v
+            x_grad[pos, idx_b] -= v
+
+
+@njit(cache=True)
+def _lut_s_replay_kernel(S, trees, j, y_grad, y_dim, CS, N_T, scale):
+    """Replay LUT S updates from saved y_grad and cached j indices."""
+    for pos in range(CS):
+        for t in range(N_T):
+            tree = trees[t]
+            j_bin = j[pos, t]
+            for d in range(y_dim):
+                S[tree, j_bin, d] -= scale * y_grad[pos, d]
+
+
+@njit(cache=True)
+def _attention_s_replay_kernel(S, all_jV, all_jPE, y_grad, shift_qk, pd, CS, N_T, y_dim, scale):
+    """Replay attention S updates from saved y_grad and cached j indices."""
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            for t in range(N_T):
+                j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
+                for d in range(y_dim):
+                    S[t, j_bin, d] -= scale * y_grad[pos, d]
+
+
+@njit(parallel=True, cache=True)
+def _softmax_cross_entropy_kernel(output, target_indices, CS, VOCAB):
+    """Parallel softmax + subtract one-hot over all context positions."""
+    for pos in prange(CS):
+        max_val = output[pos, 0]
+        for v in range(1, VOCAB):
+            if output[pos, v] > max_val:
+                max_val = output[pos, v]
+        s = np.float32(0.0)
+        for v in range(VOCAB):
+            output[pos, v] = np.exp(output[pos, v] - max_val)
+            s += output[pos, v]
+        for v in range(VOCAB):
+            output[pos, v] /= s
+        output[pos, target_indices[pos]] -= np.float32(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +809,7 @@ def attention_forward(head, x, y, args):
             y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
-def attention_backward(head, x_grad, y_grad, args):
+def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None):
     global learning_rate
     CS = args.context_size
     N_T = args.n_t
@@ -576,13 +829,21 @@ def attention_backward(head, x_grad, y_grad, args):
     all_uPE = head._pe_u_min  # (CS, N_T)
 
     if HAS_NUMBA and lut.S.dtype == np.float32:
-        _attention_backward_kernel(lut.S, all_jV, all_rV, all_uV,
-                                    all_jPE, all_rPE, all_uPE,
-                                    y_grad, x_grad, pos_grad,
-                                    lut.a_arr, lut.b_arr,
-                                    args.shift_qk, POSITIONAL_DIM,
-                                    CS, N_T, y_dim,
-                                    np.float32(learning_rate))
+        if skip_s_update:
+            _attention_backward_kernel_noupdate(lut.S, all_jV, all_rV, all_uV,
+                                                all_jPE, all_rPE, all_uPE,
+                                                y_grad, x_grad, pos_grad,
+                                                lut.a_arr, lut.b_arr,
+                                                args.shift_qk, POSITIONAL_DIM,
+                                                CS, N_T, y_dim)
+        else:
+            _attention_backward_kernel(lut.S, all_jV, all_rV, all_uV,
+                                        all_jPE, all_rPE, all_uPE,
+                                        y_grad, x_grad, pos_grad,
+                                        lut.a_arr, lut.b_arr,
+                                        args.shift_qk, POSITIONAL_DIM,
+                                        CS, N_T, y_dim,
+                                        np.float32(learning_rate))
     else:
         ED = x_grad.shape[1]
         flat_size = x_grad.size
@@ -659,10 +920,14 @@ def attention_backward(head, x_grad, y_grad, args):
                 pe_pair = pos1_grid[:P][pe_mask]
                 np.add.at(pos_grad, (pe_idx[pe_pair], pe_t, pe_r), deltaPE)
 
-            np.subtract.at(lut.S, (trees_b.ravel(), j_bins.ravel()),
-                            np.float32(learning_rate) * y_g)
+            if not skip_s_update:
+                np.subtract.at(lut.S, (trees_b.ravel(), j_bins.ravel()),
+                                np.float32(learning_rate) * y_g)
 
-    head.Positional_encoding -= learning_rate * pos_grad
+    if pe_grad_out is not None:
+        pe_grad_out += pos_grad
+    else:
+        head.Positional_encoding -= learning_rate * pos_grad
 
 
 def model_forward(m, args):
@@ -681,14 +946,15 @@ def model_forward(m, args):
     m.output_head.forward(m.z, args)
 
 
-def model_backward(m, args):
+def model_backward(m, args, grad_accum=None):
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
+    skip_s = grad_accum is not None
 
     x_grad = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
 
-    m.output_head.backward(x_grad, args)
+    m.output_head.backward(x_grad, args, skip_s_update=skip_s)
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
@@ -721,12 +987,24 @@ def model_backward(m, args):
         x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
         x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
 
-        for pos in range(CS):
-            lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
+        if grad_accum is not None:
+            # Save y_grad for sparse replay at apply time
+            grad_accum.ffn_y_grads[l] = y_grad[:, :y_dim].copy()
+        else:
+            for pos in range(CS):
+                lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
+        if grad_accum is not None:
+            # Save y_grad once per layer (shared across heads)
+            grad_accum.attn_y_grads[l] = y_grad.copy()
         for h in range(NUM_HEADS):
-            attention_backward(m.head[l][h], x_grad, y_grad, args)
+            if grad_accum is not None:
+                attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                   skip_s_update=True,
+                                   pe_grad_out=grad_accum.pe_grads[l][h])
+            else:
+                attention_backward(m.head[l][h], x_grad, y_grad, args)
 
     # no need to compute gradients for the embedder; just update the synaptic values
     # (disabled in the C version too)
@@ -739,6 +1017,120 @@ def model_training_step(m, args):
     model_forward(m, args)
     m.output_head.compute_gradients(args)
     model_backward(m, args)
+
+
+def _batch_element_step(be, args):
+    """Forward + compute_gradients + backward with gradient accumulation for one batch element."""
+    model_forward(be, args)
+    be.output_head.compute_gradients(args)
+    model_backward(be, args, grad_accum=be.grad_accum)
+
+
+def _replay_ffn_task(S, trees, j_list, ygrad_list, y_dim, CS, N_T, scale, use_numba):
+    """Replay FFN S updates for one layer across all batch elements."""
+    for j, y_grad in zip(j_list, ygrad_list):
+        if use_numba and S.dtype == np.float32:
+            _lut_s_replay_kernel(S, trees, j, y_grad, y_dim, CS, N_T, scale)
+        else:
+            for pos in range(CS):
+                S[trees, j[pos]] -= scale * y_grad[pos]
+
+
+def _replay_attn_task(S, jV_list, jPE_list, ygrad_list, PE, pe_grad_list,
+                      shift_qk, pd, CS, N_T, y_dim, scale, use_numba):
+    """Replay attention S + PE updates for one head across all batch elements."""
+    for jV, jPE, y_grad in zip(jV_list, jPE_list, ygrad_list):
+        if use_numba and S.dtype == np.float32:
+            _attention_s_replay_kernel(S, jV, jPE, y_grad,
+                                       shift_qk, pd, CS, N_T, y_dim, scale)
+        else:
+            trees = np.arange(N_T, dtype=np.int32)
+            trees_b_full = np.broadcast_to(trees, (CS, N_T))
+            for pos in range(1, CS):
+                y_g = y_grad[pos, :y_dim]
+                jQ = jV[pos]
+                jK = jV[:pos]
+                pe_idx = pos - np.arange(pos)
+                jPE_slice = jPE[pe_idx]
+                j_bins = (jQ << shift_qk) | (jK << pd) | jPE_slice
+                trees_b = trees_b_full[:pos]
+                np.subtract.at(S, (trees_b.ravel(), j_bins.ravel()), scale * y_g)
+    for pe_grad in pe_grad_list:
+        PE -= scale * pe_grad
+
+
+def _replay_output_task(S, trees, j_list, output_list, y_dim, CS, N_T, scale, use_numba):
+    """Replay output head S updates for one LUT across all batch elements."""
+    for j, output in zip(j_list, output_list):
+        if use_numba and S.dtype == np.float32:
+            _lut_s_replay_kernel(S, trees, j, output, y_dim, CS, N_T, scale)
+        else:
+            for pos in range(CS):
+                S[trees, j[pos]] -= scale * output[pos, :y_dim]
+
+
+def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
+    """Replay sparse S updates using saved y_grads and cached indices from batch elements.
+
+    When pool is provided, replays are parallelized across independent S tables
+    (6 FFN + 24 attention + 1-2 output = ~32 work units).
+    """
+    bs = len(batch_elements)
+    scale = np.float32(lr / bs)
+    CS = args.context_size
+    N_T = args.n_t
+    use_numba = HAS_NUMBA
+
+    # Build work items for all independent S tables
+    work = []
+
+    for l in range(args.num_layers):
+        # FFN: one task per layer
+        lut = m.FFN[l]
+        j_list = [be._ffn_j[l] for be in batch_elements]
+        ygrad_list = [be.grad_accum.ffn_y_grads[l] for be in batch_elements]
+        work.append(lambda _l=lut, _j=j_list, _y=ygrad_list:
+                    _replay_ffn_task(_l.S, _l.trees, _j, _y, _l.y_dim,
+                                     CS, N_T, scale, use_numba))
+
+        # Attention: one task per (layer, head)
+        for h in range(args.num_heads):
+            head = m.head[l][h]
+            lut_v = head.V
+            jV_list = [be.head[l][h]._v_j for be in batch_elements]
+            jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
+            ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+            pe_grad_list = [be.grad_accum.pe_grads[l][h] for be in batch_elements]
+            work.append(lambda _S=lut_v.S, _jV=jV_list, _jPE=jPE_list,
+                               _y=ygrad_list, _PE=head.Positional_encoding,
+                               _pg=pe_grad_list, _yd=lut_v.y_dim:
+                        _replay_attn_task(_S, _jV, _jPE, _y, _PE, _pg,
+                                          args.shift_qk, args.positional_dim,
+                                          CS, N_T, _yd, scale, use_numba))
+
+    # Output head: one task per LUT
+    if args.factored_output:
+        for lut, j_attr, out_attr in [(m.output_head.unembedder_hi, '_hi_j', 'output_hi'),
+                                      (m.output_head.unembedder_lo, '_lo_j', 'output_lo')]:
+            j_list = [getattr(be.output_head, j_attr) for be in batch_elements]
+            out_list = [getattr(be.output_head, out_attr) for be in batch_elements]
+            work.append(lambda _l=lut, _j=j_list, _o=out_list:
+                        _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
+                                            CS, N_T, scale, use_numba))
+    else:
+        lut = m.output_head.unembedder
+        j_list = [be.output_head._j for be in batch_elements]
+        out_list = [be.output_head.output for be in batch_elements]
+        work.append(lambda _l=lut, _j=j_list, _o=out_list:
+                    _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
+                                        CS, N_T, scale, use_numba))
+
+    # Dispatch: parallel if pool provided, sequential otherwise
+    if pool is not None:
+        pool.map(lambda f: f(), work)
+    else:
+        for f in work:
+            f()
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1299,8 @@ def main():
                         help='Use factored base-256 decomposition for unembedder (faster for large vocabs)')
     parser.add_argument('--fp16', action='store_true',
                         help='Use float16 for LUT S tables (halves memory, may reduce precision)')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Number of sequences per training step (default: 1)')
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
@@ -936,6 +1330,7 @@ def main():
     print(f"  temperature       = {args.temperature}")
     print(f"  factored_output   = {args.factored_output}")
     print(f"  fp16              = {args.fp16}")
+    print(f"  batch_size        = {args.batch_size}")
     print(f"  tokenizer         = {args.tokenizer}")
     print(f"  max_steps         = {args.max_steps}")
     print(f"  validation_interval = {args.validation_interval}")
@@ -956,17 +1351,39 @@ def main():
     build_Model(m, args)
     print_model_stats(m, args)
 
+    batch_size = args.batch_size
+    if batch_size > 1:
+        batch_elements = [BatchElement(m, args) for _ in range(batch_size)]
+        pool = ThreadPool(batch_size)
+        # Replay pool: one thread per independent S table
+        n_replay = args.num_layers * (1 + args.num_heads) + (2 if args.factored_output else 1)
+        replay_pool = ThreadPool(n_replay)
+    else:
+        batch_elements = None
+        pool = None
+        replay_pool = None
+
     pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
     last_ppl = None
     last_loss = None
 
     for t in pbar:
-        load_snippet(m, training.data, get_random_training_index(training), args)
-
         # Adam learning rate scheduler
         learning_rate = min(1.0 / math.sqrt(1 + t), t / 4000.0 / math.sqrt(4000))
 
-        model_training_step(m, args)
+        if batch_size == 1:
+            # Fast path: identical to original code (no overhead)
+            load_snippet(m, training.data, get_random_training_index(training), args)
+            model_training_step(m, args)
+        else:
+            # Batched path: parallel forward+backward, then averaged S update
+            for b in range(batch_size):
+                idx = get_random_training_index(training)
+                load_snippet(batch_elements[b], training.data, idx, args)
+                batch_elements[b].grad_accum.zero()
+
+            pool.map(lambda be: _batch_element_step(be, args), batch_elements)
+            apply_averaged_gradients(m, batch_elements, learning_rate, args, pool=replay_pool)
 
         if t % args.validation_interval == 0:
             pbar.set_description("Validating")
@@ -1002,6 +1419,13 @@ def main():
 
         if last_ppl is not None:
             pbar.set_postfix(ppl=f"{last_ppl:.2f}", loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
+
+    if pool is not None:
+        pool.close()
+        pool.join()
+    if replay_pool is not None:
+        replay_pool.close()
+        replay_pool.join()
 
 
 if __name__ == '__main__':
