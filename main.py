@@ -195,6 +195,15 @@ class StandardOutputHead:
         softmax(self.output[args.context_size - 1], VOCAB_SIZE, args.temperature)
         return sample(self.output[args.context_size - 1], VOCAB_SIZE)
 
+    def training_loss(self, args):
+        """Mean cross-entropy over all context positions from raw logits."""
+        CS = args.context_size
+        x = self.output[:CS]
+        targets = self.tokens[1:CS + 1]
+        x_max = x.max(axis=1)
+        log_sum_exp = x_max + np.log(np.exp(x - x_max[:, None]).sum(axis=1))
+        return float((log_sum_exp - x[np.arange(CS), targets]).mean())
+
     def validation_loss(self, args):
         last = args.context_size - 1
         softmax(self.output[last], args.vocab_size, 1.0)
@@ -306,6 +315,17 @@ class FactoredOutputHead:
             token_id = hi * 256
         return token_id
 
+    def training_loss(self, args):
+        """Mean cross-entropy over all context positions (hi + lo components)."""
+        CS = args.context_size
+        loss = 0.0
+        for x, targets in [(self.output_hi[:CS], self.tokens_hi[1:CS + 1]),
+                            (self.output_lo[:CS], self.tokens_lo[1:CS + 1])]:
+            x_max = x.max(axis=1)
+            log_sum_exp = x_max + np.log(np.exp(x - x_max[:, None]).sum(axis=1))
+            loss += float((log_sum_exp - x[np.arange(CS), targets]).mean())
+        return loss
+
     def validation_loss(self, args):
         last = args.context_size - 1
         softmax(self.output_hi[last], args.vocab_hi, 1.0)
@@ -319,7 +339,10 @@ class FactoredOutputHead:
 
 class Model:
     __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
-                 '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head']
+                 '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
+                 'ln_attn_gamma', 'ln_attn_beta', 'ln_ffn_gamma', 'ln_ffn_beta',
+                 '_ln_attn_xhat', '_ln_attn_rstd', '_ln_ffn_xhat', '_ln_ffn_rstd',
+                 '_ln_ffn_buf', '_drop_attn_mask', '_drop_ffn_mask']
     def __init__(self, args):
         VOCAB_SIZE = args.vocab_size
         EMBEDDING_DIM = args.embedding_dim
@@ -345,6 +368,21 @@ class Model:
         else:
             self.output_head = StandardOutputHead(args)
 
+        # LayerNorm parameters (NL x ED)
+        self.ln_attn_gamma = np.ones((NUM_LAYERS, EMBEDDING_DIM), dtype=np.float32)
+        self.ln_attn_beta  = np.zeros((NUM_LAYERS, EMBEDDING_DIM), dtype=np.float32)
+        self.ln_ffn_gamma  = np.ones((NUM_LAYERS, EMBEDDING_DIM), dtype=np.float32)
+        self.ln_ffn_beta   = np.zeros((NUM_LAYERS, EMBEDDING_DIM), dtype=np.float32)
+        # LN caches
+        self._ln_attn_xhat = [np.zeros((CS, EMBEDDING_DIM), np.float32) for _ in range(NUM_LAYERS)]
+        self._ln_attn_rstd = [np.zeros((CS, 1), np.float32) for _ in range(NUM_LAYERS)]
+        self._ln_ffn_xhat  = [np.zeros((CS, EMBEDDING_DIM), np.float32) for _ in range(NUM_LAYERS)]
+        self._ln_ffn_rstd  = [np.zeros((CS, 1), np.float32) for _ in range(NUM_LAYERS)]
+        self._ln_ffn_buf   = np.zeros((CS, EMBEDDING_DIM), dtype=np.float32)
+        # Dropout masks
+        self._drop_attn_mask = [None] * NUM_LAYERS
+        self._drop_ffn_mask  = [None] * NUM_LAYERS
+
 
 class TrainingData:
     __slots__ = ['data', 'length', 'val_data', 'val_length', 'testing_input_data']
@@ -365,7 +403,8 @@ class SparseGradAccumulator:
     already live on each BatchElement.
     """
     __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads',
-                 'attn_score_grads', 'attn_val_grads']
+                 'attn_score_grads', 'attn_val_grads',
+                 'ln_attn_dgamma', 'ln_attn_dbeta', 'ln_ffn_dgamma', 'ln_ffn_dbeta']
 
     def __init__(self, args):
         NL = args.num_layers
@@ -386,6 +425,10 @@ class SparseGradAccumulator:
         else:
             self.attn_score_grads = None
             self.attn_val_grads   = None
+        self.ln_attn_dgamma = np.zeros((NL, ED), dtype=np.float32)
+        self.ln_attn_dbeta  = np.zeros((NL, ED), dtype=np.float32)
+        self.ln_ffn_dgamma  = np.zeros((NL, ED), dtype=np.float32)
+        self.ln_ffn_dbeta   = np.zeros((NL, ED), dtype=np.float32)
 
     def zero(self):
         for i in range(len(self.ffn_y_grads)):
@@ -402,6 +445,10 @@ class SparseGradAccumulator:
         for layer in self.pe_grads:
             for g in layer:
                 g[:] = 0
+        self.ln_attn_dgamma[:] = 0
+        self.ln_attn_dbeta[:] = 0
+        self.ln_ffn_dgamma[:] = 0
+        self.ln_ffn_dbeta[:] = 0
 
 
 def _share_lut(dst, src):
@@ -418,7 +465,10 @@ class BatchElement:
     """Per-sequence scratch space that duck-types as Model, sharing S tables."""
     __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
                  '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
-                 'grad_accum']
+                 'grad_accum',
+                 'ln_attn_gamma', 'ln_attn_beta', 'ln_ffn_gamma', 'ln_ffn_beta',
+                 '_ln_attn_xhat', '_ln_attn_rstd', '_ln_ffn_xhat', '_ln_ffn_rstd',
+                 '_ln_ffn_buf', '_drop_attn_mask', '_drop_ffn_mask']
 
     def __init__(self, m, args):
         CS = args.context_size
@@ -430,6 +480,11 @@ class BatchElement:
         # Shared (read-only during batch processing)
         self.Token_embedder = m.Token_embedder
         self.FFN = m.FFN  # shared LUT objects (S tables, a/b arrays)
+        # Shared LN parameters
+        self.ln_attn_gamma = m.ln_attn_gamma
+        self.ln_attn_beta  = m.ln_attn_beta
+        self.ln_ffn_gamma  = m.ln_ffn_gamma
+        self.ln_ffn_beta   = m.ln_ffn_beta
 
         # Per-element scratch
         self.tokens = np.zeros(CS + 1, dtype=np.int32)
@@ -458,6 +513,15 @@ class BatchElement:
         else:
             self.output_head = StandardOutputHead(args)
             _share_lut(self.output_head.unembedder, m.output_head.unembedder)
+
+        # Per-element LN caches and dropout masks
+        self._ln_attn_xhat = [np.zeros((CS, ED), np.float32) for _ in range(NL)]
+        self._ln_attn_rstd = [np.zeros((CS, 1), np.float32) for _ in range(NL)]
+        self._ln_ffn_xhat  = [np.zeros((CS, ED), np.float32) for _ in range(NL)]
+        self._ln_ffn_rstd  = [np.zeros((CS, 1), np.float32) for _ in range(NL)]
+        self._ln_ffn_buf   = np.zeros((CS, ED), dtype=np.float32)
+        self._drop_attn_mask = [None] * NL
+        self._drop_ffn_mask  = [None] * NL
 
         # Sparse gradient accumulators (saves y_grads, not full S buffers)
         self.grad_accum = SparseGradAccumulator(args)
@@ -518,6 +582,27 @@ def cache_PE_index_batch(u_batch, j_out, r_min_out, u_min_out, args):
 def _f32(arr):
     """Cast to float32 if needed (no-op if already float32)."""
     return arr if arr.dtype == np.float32 else arr.astype(np.float32)
+
+
+def layernorm_forward(x, gamma, beta, eps=1e-5):
+    """x: (CS, ED). Returns (y, xhat, rstd)."""
+    mean = x.mean(axis=1, keepdims=True)
+    rstd = 1.0 / np.sqrt(x.var(axis=1, keepdims=True) + eps)
+    xhat = (x - mean) * rstd
+    return xhat * gamma + beta, xhat, rstd
+
+
+def layernorm_backward(dy, xhat, rstd, gamma):
+    """Returns (dx, dgamma, dbeta)."""
+    N = dy.shape[1]
+    dgamma = (dy * xhat).sum(axis=0)
+    dbeta  = dy.sum(axis=0)
+    dx = (gamma * rstd / N) * (
+        N * dy
+        - dy.sum(axis=1, keepdims=True)
+        - xhat * (dy * xhat).sum(axis=1, keepdims=True)
+    )
+    return dx, dgamma, dbeta
 
 
 def CONCATENATE_vec(Q, P, PE, args):
@@ -1438,38 +1523,71 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
         head.Positional_encoding -= learning_rate * pos_grad
 
 
-def model_forward(m, args):
+def model_forward(m, args, training=True):
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
+    use_ln = getattr(args, 'layernorm', False)
+    dr     = getattr(args, 'dropout', 0.0)
 
     for l in range(NUM_LAYERS):
-        np.copyto(m._x_buf, m.z)
+        # Attention (pre-norm)
+        if use_ln:
+            m._x_buf[:], m._ln_attn_xhat[l][:], m._ln_attn_rstd[l][:] = \
+                layernorm_forward(m.z, m.ln_attn_gamma[l], m.ln_attn_beta[l])
+        else:
+            np.copyto(m._x_buf, m.z)
+
+        z_pre_attn = m.z.copy() if (dr > 0.0 and training) else None
         for h in range(NUM_HEADS):
             attention_forward(m.head[l][h], m._x_buf, m.z, args)
+        if dr > 0.0 and training:
+            mask = (np.random.rand(*m.z.shape) >= dr).astype(np.float32) / (1.0 - dr)
+            m._drop_attn_mask[l] = mask
+            m.z[:] = z_pre_attn + (m.z - z_pre_attn) * mask
 
+        # FFN (pre-norm)
         lut = m.FFN[l]
-        cache_index_batch(lut, m.z, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
+        if use_ln:
+            m._ln_ffn_buf[:], m._ln_ffn_xhat[l][:], m._ln_ffn_rstd[l][:] = \
+                layernorm_forward(m.z, m.ln_ffn_gamma[l], m.ln_ffn_beta[l])
+            ffn_input = m._ln_ffn_buf
+        else:
+            ffn_input = m.z
+
+        z_pre_ffn = m.z.copy() if (dr > 0.0 and training) else None
+        cache_index_batch(lut, ffn_input, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
         if HAS_NUMBA and lut.S.dtype == np.float32:
             _lut_forward_add_kernel(lut.S, lut.trees, m._ffn_j[l], m.z,
                                     args.context_size, args.n_t, lut.y_dim)
         else:
             m.z[:, :lut.y_dim] += _f32(lut.S[lut.trees, m._ffn_j[l]]).sum(axis=1)
+        if dr > 0.0 and training:
+            mask = (np.random.rand(*m.z.shape) >= dr).astype(np.float32) / (1.0 - dr)
+            m._drop_ffn_mask[l] = mask
+            m.z[:] = z_pre_ffn + (m.z - z_pre_ffn) * mask
 
     m.output_head.forward(m.z, args)
 
 
 def model_backward(m, args, grad_accum=None):
+    global learning_rate
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
     skip_s = grad_accum is not None
+    use_ln = getattr(args, 'layernorm', False)
+    dr     = getattr(args, 'dropout', 0.0)
 
     x_grad = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
 
     m.output_head.backward(x_grad, args, skip_s_update=skip_s)
 
     for l in range(NUM_LAYERS - 1, -1, -1):
+        # FFN backward
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
+        if dr > 0.0 and m._drop_ffn_mask[l] is not None:
+            y_grad *= m._drop_ffn_mask[l]
+
         lut = m.FFN[l]
         trees = lut.trees
         CS = args.context_size
@@ -1477,6 +1595,8 @@ def model_backward(m, args, grad_accum=None):
         j = m._ffn_j[l]
         r_min = m._ffn_r_min[l]
         u_min = m._ffn_u_min[l]
+
+        x_before_ffn = x_grad.copy() if use_ln else None
 
         # FFN backward uses batch-read semantics: read S for ALL positions
         # before any updates. This can't be fused into a per-position kernel
@@ -1499,6 +1619,18 @@ def model_backward(m, args, grad_accum=None):
         x_grad.ravel()[:] += np.bincount(flat_a, weights=v_flat, minlength=flat_size)
         x_grad.ravel()[:] -= np.bincount(flat_b, weights=v_flat, minlength=flat_size)
 
+        if use_ln:
+            ln_ffn_dx = x_grad - x_before_ffn
+            dx, dgamma, dbeta = layernorm_backward(
+                ln_ffn_dx, m._ln_ffn_xhat[l], m._ln_ffn_rstd[l], m.ln_ffn_gamma[l])
+            x_grad[:] = x_before_ffn + dx
+            if grad_accum is not None:
+                grad_accum.ln_ffn_dgamma[l] += dgamma
+                grad_accum.ln_ffn_dbeta[l]  += dbeta
+            else:
+                m.ln_ffn_gamma[l] -= learning_rate * dgamma
+                m.ln_ffn_beta[l]  -= learning_rate * dbeta
+
         if grad_accum is not None:
             # Save y_grad for sparse replay at apply time
             grad_accum.ffn_y_grads[l] = y_grad[:, :y_dim].copy()
@@ -1510,7 +1642,13 @@ def model_backward(m, args, grad_accum=None):
                 for pos in range(CS):
                     lut.S[trees, j[pos]] -= learning_rate * y_grad[pos, :y_dim]
 
+        # Attention backward
         y_grad = x_grad.copy()  # don't zero-out x_grad, but add to it (resnet connections)
+        if dr > 0.0 and m._drop_attn_mask[l] is not None:
+            y_grad *= m._drop_attn_mask[l]
+
+        x_before_attn = x_grad.copy() if use_ln else None
+
         soft = getattr(args, 'soft_attention', False)
         if grad_accum is not None and not soft:
             # Save y_grad once per layer (shared across heads) for hard attention replay
@@ -1525,6 +1663,18 @@ def model_backward(m, args, grad_accum=None):
             else:
                 attention_backward(m.head[l][h], x_grad, y_grad, args)
 
+        if use_ln:
+            ln_attn_dx = x_grad - x_before_attn
+            dx, dgamma, dbeta = layernorm_backward(
+                ln_attn_dx, m._ln_attn_xhat[l], m._ln_attn_rstd[l], m.ln_attn_gamma[l])
+            x_grad[:] = x_before_attn + dx
+            if grad_accum is not None:
+                grad_accum.ln_attn_dgamma[l] += dgamma
+                grad_accum.ln_attn_dbeta[l]  += dbeta
+            else:
+                m.ln_attn_gamma[l] -= learning_rate * dgamma
+                m.ln_attn_beta[l]  -= learning_rate * dbeta
+
     # no need to compute gradients for the embedder; just update the synaptic values
     # (disabled in the C version too)
     # for pos in range(args.context_size):
@@ -1533,16 +1683,20 @@ def model_backward(m, args, grad_accum=None):
 
 
 def model_training_step(m, args):
-    model_forward(m, args)
+    model_forward(m, args, training=True)
+    loss = m.output_head.training_loss(args)
     m.output_head.compute_gradients(args)
     model_backward(m, args)
+    return loss
 
 
 def _batch_element_step(be, args):
     """Forward + compute_gradients + backward with gradient accumulation for one batch element."""
-    model_forward(be, args)
+    model_forward(be, args, training=True)
+    loss = be.output_head.training_loss(args)
     be.output_head.compute_gradients(args)
     model_backward(be, args, grad_accum=be.grad_accum)
+    return loss
 
 
 def _replay_ffn_task(S, trees, j_list, ygrad_list, y_dim, CS, N_T, scale, use_numba):
@@ -1692,6 +1846,15 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
         for f in work:
             f()
 
+    # LayerNorm parameter updates (averaged over batch)
+    if getattr(args, 'layernorm', False):
+        ln_scale = lr / len(batch_elements)
+        for l in range(args.num_layers):
+            m.ln_attn_gamma[l] -= ln_scale * sum(be.grad_accum.ln_attn_dgamma[l] for be in batch_elements)
+            m.ln_attn_beta[l]  -= ln_scale * sum(be.grad_accum.ln_attn_dbeta[l]  for be in batch_elements)
+            m.ln_ffn_gamma[l]  -= ln_scale * sum(be.grad_accum.ln_ffn_dgamma[l]  for be in batch_elements)
+            m.ln_ffn_beta[l]   -= ln_scale * sum(be.grad_accum.ln_ffn_dbeta[l]   for be in batch_elements)
+
 
 # ---------------------------------------------------------------------------
 # Training data
@@ -1753,7 +1916,7 @@ def load_snippet(m, data_array, char_start, args):
 
 
 def model_inference(m, args):
-    model_forward(m, args)
+    model_forward(m, args, training=False)
     return m.output_head.sample_token(args)
 
 
@@ -1816,6 +1979,12 @@ def print_model_stats(m, args):
     else:
         count_array(m.output_head.unembedder.S)
 
+    # LayerNorm parameters
+    if getattr(args, 'layernorm', False):
+        for l in range(args.num_layers):
+            count_array(m.ln_attn_gamma[l]); count_array(m.ln_attn_beta[l])
+            count_array(m.ln_ffn_gamma[l]);  count_array(m.ln_ffn_beta[l])
+
     if total_bytes < 1024**2:
         mem_str = f"{total_bytes / 1024:.1f} KB"
     elif total_bytes < 1024**3:
@@ -1867,6 +2036,10 @@ def main():
                         help='Number of sequences per training step (default: 1)')
     parser.add_argument('--soft-attention', action='store_true',
                         help='Decomposed Score+Value LUTs with softmax weighting (transformer-style)')
+    parser.add_argument('--layernorm', action='store_true',
+                        help='Pre-norm LayerNorm before attention and FFN (off by default)')
+    parser.add_argument('--dropout', type=float, default=0.0,
+                        help='Dropout rate applied to residual deltas (0.0 = disabled)')
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
@@ -1898,6 +2071,8 @@ def main():
     print(f"  fp16              = {args.fp16}")
     print(f"  batch_size        = {args.batch_size}")
     print(f"  soft_attention    = {args.soft_attention}")
+    print(f"  layernorm         = {args.layernorm}")
+    print(f"  dropout           = {args.dropout}")
     print(f"  tokenizer         = {args.tokenizer}")
     print(f"  max_steps         = {args.max_steps}")
     print(f"  validation_interval = {args.validation_interval}")
@@ -1933,6 +2108,8 @@ def main():
     pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
     last_ppl = None
     last_loss = None
+    ema_loss = None
+    ema_alpha = 0.02
 
     for t in pbar:
         # Adam learning rate scheduler
@@ -1941,7 +2118,8 @@ def main():
         if batch_size == 1:
             # Fast path: identical to original code (no overhead)
             load_snippet(m, training.data, get_random_training_index(training), args)
-            model_training_step(m, args)
+            loss = model_training_step(m, args)
+            ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
         else:
             # Batched path: parallel forward+backward, then averaged S update
             for b in range(batch_size):
@@ -1949,8 +2127,10 @@ def main():
                 load_snippet(batch_elements[b], training.data, idx, args)
                 batch_elements[b].grad_accum.zero()
 
-            pool.map(lambda be: _batch_element_step(be, args), batch_elements)
+            losses = pool.map(lambda be: _batch_element_step(be, args), batch_elements)
             apply_averaged_gradients(m, batch_elements, learning_rate, args, pool=replay_pool)
+            loss = sum(losses) / batch_size
+            ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
 
         if t % args.validation_interval == 0:
             pbar.set_description("Validating")
@@ -1958,7 +2138,7 @@ def main():
             validation_loss = 0.0
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args)
-                model_forward(m, args)
+                model_forward(m, args, training=False)
                 validation_loss += m.output_head.validation_loss(args)
             validation_loss /= args.testing_length
 
@@ -1984,8 +2164,12 @@ def main():
 
             pbar.set_description("Training")
 
+        train_ppl_str = f"{math.exp(min(ema_loss, 20.0)):.1f}" if ema_loss is not None else "-"
         if last_ppl is not None:
-            pbar.set_postfix(ppl=f"{last_ppl:.2f}", loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
+            pbar.set_postfix(train_ppl=train_ppl_str, val_ppl=f"{last_ppl:.2f}",
+                             loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
+        elif ema_loss is not None:
+            pbar.set_postfix(train_ppl=train_ppl_str, lr=f"{learning_rate:.4f}")
 
     if pool is not None:
         pool.close()
