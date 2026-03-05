@@ -11,6 +11,7 @@ import random
 import sys
 import numpy as np
 import tiktoken
+from word_tokenizer import WordTokenizer
 from multiprocessing.pool import ThreadPool
 from tqdm import tqdm
 
@@ -2013,7 +2014,9 @@ def main():
     parser.add_argument('--validation-data', type=str, default=None,
                         help='Path to validation data file (if not provided, samples from training data)')
     parser.add_argument('--tokenizer', type=str, default='gpt2',
-                        help='tiktoken encoding name (default: gpt2)')
+                        help='tiktoken encoding name, or "word" for word-based tokenizer (default: gpt2)')
+    parser.add_argument('--vocab-file', type=str, default='word_vocab.txt',
+                        help='Vocabulary file for --tokenizer word (built by build_word_vocab.py)')
     parser.add_argument('--context-size', type=int, default=32)
     parser.add_argument('--vocab-size', type=int, default=256,
                         help='(auto-detected from tokenizer, this default is overridden)')
@@ -2043,7 +2046,10 @@ def main():
     args = parser.parse_args()
 
     # Initialize tokenizer and auto-set vocab size
-    enc = tiktoken.get_encoding(args.tokenizer)
+    if args.tokenizer == 'word':
+        enc = WordTokenizer(args.vocab_file)
+    else:
+        enc = tiktoken.get_encoding(args.tokenizer)
     args.vocab_size = enc.n_vocab
     args.enc = enc
 
