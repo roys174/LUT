@@ -1212,6 +1212,67 @@ def build_Model(m, args):
     m.output_head.build(N_C, args)
 
 
+def _lut_save(d, prefix, lut):
+    d[f'{prefix}_S']   = lut.S
+    d[f'{prefix}_a']   = lut.a_arr
+    d[f'{prefix}_b']   = lut.b_arr
+
+def _lut_load(d, prefix, lut):
+    lut.S[:]      = d[f'{prefix}_S']
+    lut.a_arr[:]  = d[f'{prefix}_a']
+    lut.b_arr[:]  = d[f'{prefix}_b']
+
+def save_model(m, path, args):
+    """Save all learned weights to a .npz file."""
+    d = {'token_embedder': m.Token_embedder}
+    for l in range(args.num_layers):
+        _lut_save(d, f'ffn_{l}', m.FFN[l])
+        for h in range(args.num_heads):
+            d[f'pe_{l}_{h}'] = m.head[l][h].Positional_encoding
+            if getattr(args, 'soft_attention', False):
+                _lut_save(d, f'head_{l}_{h}_Score', m.head[l][h].Score)
+                _lut_save(d, f'head_{l}_{h}_Value', m.head[l][h].Value)
+            else:
+                _lut_save(d, f'head_{l}_{h}_V', m.head[l][h].V)
+    if args.factored_output:
+        _lut_save(d, 'output_hi', m.output_head.unembedder_hi)
+        _lut_save(d, 'output_lo', m.output_head.unembedder_lo)
+    else:
+        _lut_save(d, 'output', m.output_head.unembedder)
+    if getattr(args, 'layernorm', False):
+        d['ln_attn_gamma'] = m.ln_attn_gamma
+        d['ln_attn_beta']  = m.ln_attn_beta
+        d['ln_ffn_gamma']  = m.ln_ffn_gamma
+        d['ln_ffn_beta']   = m.ln_ffn_beta
+    np.savez_compressed(path, **d)
+
+def load_model(m, path, args):
+    """Load weights saved by save_model into an already-built model."""
+    d = np.load(path)
+    m.Token_embedder[:] = d['token_embedder']
+    for l in range(args.num_layers):
+        _lut_load(d, f'ffn_{l}', m.FFN[l])
+        for h in range(args.num_heads):
+            m.head[l][h].Positional_encoding[:] = d[f'pe_{l}_{h}']
+            if getattr(args, 'soft_attention', False):
+                _lut_load(d, f'head_{l}_{h}_Score', m.head[l][h].Score)
+                _lut_load(d, f'head_{l}_{h}_Value', m.head[l][h].Value)
+            else:
+                _lut_load(d, f'head_{l}_{h}_V', m.head[l][h].V)
+    if args.factored_output:
+        _lut_load(d, 'output_hi', m.output_head.unembedder_hi)
+        _lut_load(d, 'output_lo', m.output_head.unembedder_lo)
+    else:
+        _lut_load(d, 'output', m.output_head.unembedder)
+    if getattr(args, 'layernorm', False) and 'ln_attn_gamma' in d:
+        m.ln_attn_gamma[:] = d['ln_attn_gamma']
+        m.ln_attn_beta[:]  = d['ln_attn_beta']
+        m.ln_ffn_gamma[:]  = d['ln_ffn_gamma']
+        m.ln_ffn_beta[:]   = d['ln_ffn_beta']
+    d.close()
+    print(f"Loaded model weights from {path}")
+
+
 def attention_forward(head, x, y, args):
     CS = args.context_size
 
@@ -2043,7 +2104,18 @@ def main():
                         help='Pre-norm LayerNorm before attention and FFN (off by default)')
     parser.add_argument('--dropout', type=float, default=0.0,
                         help='Dropout rate applied to residual deltas (0.0 = disabled)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for Python and NumPy RNGs (default: no seeding)')
+    parser.add_argument('--save-model', type=str, default=None,
+                        help='Path to save model weights (.npz) at each validation interval and end of training')
+    parser.add_argument('--load-model', type=str, default=None,
+                        help='Path to load model weights (.npz) before training begins')
     args = parser.parse_args()
+
+    # Seed RNGs before anything else
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
 
     # Initialize tokenizer and auto-set vocab size
     if args.tokenizer == 'word':
@@ -2086,6 +2158,9 @@ def main():
     print(f"  training_data     = {args.training_data}")
     print(f"  validation_data   = {args.validation_data}")
     print(f"  loss_file         = {args.loss_file}")
+    print(f"  seed              = {args.seed}")
+    print(f"  save_model        = {args.save_model}")
+    print(f"  load_model        = {args.load_model}")
     print("=" * 50)
 
     # Initialize loss file with header
@@ -2097,6 +2172,8 @@ def main():
 
     m = Model(args)
     build_Model(m, args)
+    if args.load_model is not None:
+        load_model(m, args.load_model, args)
     print_model_stats(m, args)
 
     batch_size = args.batch_size
@@ -2155,6 +2232,10 @@ def main():
             with open(args.loss_file, 'a') as f:
                 f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}\n")
 
+            if args.save_model is not None:
+                save_model(m, args.save_model, args)
+                tqdm.write(f"Saved model to {args.save_model}.npz")
+
             # Print validation result and sample generation
             tqdm.write(f"\n--- step {t:,} | ppl={perplexity:.2f} | loss={validation_loss:.3f} ---")
             val_idx = random.randint(0, training.val_length - 1)
@@ -2176,6 +2257,10 @@ def main():
                              loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
         elif ema_loss is not None:
             pbar.set_postfix(train_ppl=train_ppl_str, lr=f"{learning_rate:.4f}")
+
+    if args.save_model is not None:
+        save_model(m, args.save_model, args)
+        print(f"Saved final model to {args.save_model}.npz")
 
     if pool is not None:
         pool.close()
