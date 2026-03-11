@@ -88,10 +88,10 @@ Progress is shown with a live tqdm bar displaying training perplexity, validatio
 |------|---------|-------------|
 | `training_data` | *(required)* | Path to training text or binary file |
 | `--validation-data` | None | Validation file; if omitted, samples from training data |
-| `--tokenizer` | `gpt2` | tiktoken encoding name, or `word` for word-level tokenizer |
+| `--tokenizer` | `word` | tiktoken encoding name, or `word` for word-level tokenizer |
 | `--vocab-file` | `word_vocab.txt` | Vocab file when using `--tokenizer word` |
-| `--context-size` | 32 | Sequence length (tokens) |
-| `--embedding-dim` | 32 | Token embedding dimension |
+| `--context-size` | 128 | Sequence length (tokens) |
+| `--embedding-dim` | 128 | Token embedding dimension |
 | `--positional-dim` | 4 | Positional encoding dimension |
 | `--num-layers` | 6 | Number of transformer-like layers |
 | `--num-heads` | 4 | Attention heads per layer |
