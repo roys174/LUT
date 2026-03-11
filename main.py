@@ -2074,14 +2074,14 @@ def main():
     parser.add_argument('training_data', type=str, help='Path to training data file')
     parser.add_argument('--validation-data', type=str, default=None,
                         help='Path to validation data file (if not provided, samples from training data)')
-    parser.add_argument('--tokenizer', type=str, default='gpt2',
-                        help='tiktoken encoding name, or "word" for word-based tokenizer (default: gpt2)')
+    parser.add_argument('--tokenizer', type=str, default='word',
+                        help='tiktoken encoding name, or "word" for word-based tokenizer (default: word)')
     parser.add_argument('--vocab-file', type=str, default='word_vocab.txt',
                         help='Vocabulary file for --tokenizer word (built by build_word_vocab.py)')
-    parser.add_argument('--context-size', type=int, default=32)
+    parser.add_argument('--context-size', type=int, default=128)
     parser.add_argument('--vocab-size', type=int, default=256,
                         help='(auto-detected from tokenizer, this default is overridden)')
-    parser.add_argument('--embedding-dim', type=int, default=32)
+    parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--positional-dim', type=int, default=4)
     parser.add_argument('--num-layers', type=int, default=6)
     parser.add_argument('--num-heads', type=int, default=4)
