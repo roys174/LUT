@@ -106,8 +106,9 @@ class LUTUpdateStats:
         arrays = {name: counts for name, counts in self.counts.items()}
         np.savez_compressed(path, **arrays)
         summary_path = path[:-4] + "_summary.csv" if path.endswith(".npz") else path + "_summary.csv"
+        hist_path = path[:-4] + "_histogram.csv" if path.endswith(".npz") else path + "_histogram.csv"
         with open(summary_path, "w") as f:
-            f.write("lut,table,total_updates,updated_rows,total_rows,mean_updates_per_row,max_updates_on_row\n")
+            f.write("lut,table,total_updates,updated_rows,total_rows,mean_updates_per_row,var_updates_per_row,max_updates_on_row\n")
             for name in sorted(self.counts):
                 counts = self.counts[name]
                 for table_idx in range(counts.shape[0]):
@@ -115,9 +116,20 @@ class LUTUpdateStats:
                     f.write(
                         f"{name},{table_idx},{int(row_counts.sum())},"
                         f"{int(np.count_nonzero(row_counts))},{row_counts.size},"
-                        f"{float(row_counts.mean()):.6f},{int(row_counts.max())}\n"
+                        f"{float(row_counts.mean()):.6f},"
+                        f"{float(row_counts.var()):.6f},{int(row_counts.max())}\n"
                     )
-        return summary_path
+        with open(hist_path, "w") as f:
+            f.write("lut,table,updates_per_row,num_rows\n")
+            for name in sorted(self.counts):
+                counts = self.counts[name]
+                for table_idx in range(counts.shape[0]):
+                    hist = np.bincount(counts[table_idx].astype(np.int64))
+                    for updates_per_row in range(hist.size - 1, -1, -1):
+                        num_rows = int(hist[updates_per_row])
+                        if num_rows:
+                            f.write(f"{name},{table_idx},{updates_per_row},{num_rows}\n")
+        return summary_path, hist_path
 
 
 class AttentionHead:
@@ -2333,8 +2345,8 @@ def main():
                 save_model(m, args.save_model, args)
                 tqdm.write(f"Saved model to {args.save_model}.npz")
             if update_stats is not None:
-                summary_path = update_stats.save(args.lut_update_stats_file)
-                tqdm.write(f"Saved LUT update stats to {args.lut_update_stats_file} and {summary_path}")
+                summary_path, hist_path = update_stats.save(args.lut_update_stats_file)
+                tqdm.write(f"Saved LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}")
 
             # Print validation result and sample generation
             tqdm.write(f"\n--- step {t:,} | ppl={perplexity:.2f} | loss={validation_loss:.3f} ---")
@@ -2362,8 +2374,8 @@ def main():
         save_model(m, args.save_model, args)
         print(f"Saved final model to {args.save_model}.npz")
     if update_stats is not None:
-        summary_path = update_stats.save(args.lut_update_stats_file)
-        print(f"Saved final LUT update stats to {args.lut_update_stats_file} and {summary_path}")
+        summary_path, hist_path = update_stats.save(args.lut_update_stats_file)
+        print(f"Saved final LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}")
 
     if pool is not None:
         pool.close()
