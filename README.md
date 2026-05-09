@@ -230,14 +230,15 @@ POS target: NOUN PUNCT SPACE
 
 ### Plotting Loss Curves
 
-`main.py` writes a CSV with `step`, `loss`, and `perplexity` columns. Plot it
-with:
+`main.py` writes a CSV with `step`, `loss`, `perplexity`, and `accuracy`
+columns. Plot it with:
 
 ```bash
 python plot_loss.py pos_loss.csv
 ```
 
-This saves `pos_loss.png` by default. Useful options:
+This saves `pos_loss.png` by default. If the CSV includes accuracy, the plot
+adds an accuracy panel. Useful options:
 
 ```bash
 python plot_loss.py pos_loss.csv --output plots/pos_loss.png

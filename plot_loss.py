@@ -17,12 +17,14 @@ def load_loss_csv(path):
     steps = []
     losses = []
     perplexities = []
+    accuracies = []
 
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, skipinitialspace=True)
         required = {"step", "loss", "perplexity"}
         if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
             raise ValueError("CSV must have columns: step, loss, perplexity")
+        has_accuracy = "accuracy" in reader.fieldnames
 
         for row in reader:
             if not row:
@@ -30,11 +32,13 @@ def load_loss_csv(path):
             steps.append(int(row["step"]))
             losses.append(float(row["loss"]))
             perplexities.append(float(row["perplexity"]))
+            if has_accuracy:
+                accuracies.append(float(row["accuracy"]))
 
     if not steps:
         raise ValueError(f"No data rows found in {path}")
 
-    return steps, losses, perplexities
+    return steps, losses, perplexities, accuracies if accuracies else None
 
 
 def main():
@@ -55,7 +59,7 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        steps, losses, perplexities = load_loss_csv(csv_path)
+        steps, losses, perplexities, accuracies = load_loss_csv(csv_path)
     except (OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -72,7 +76,8 @@ def main():
               file=sys.stderr)
         return 1
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    n_plots = 3 if accuracies is not None else 2
+    fig, axes = plt.subplots(n_plots, 1, figsize=(10, 3.5 * n_plots), sharex=True)
 
     axes[0].plot(steps, losses, marker="o", linewidth=1.5, markersize=3)
     axes[0].set_title(csv_path.name)
@@ -86,6 +91,14 @@ def main():
     axes[1].grid(True, alpha=0.3)
     if args.log_perplexity:
         axes[1].set_yscale("log")
+
+    if accuracies is not None:
+        axes[2].plot(steps, accuracies, marker="o", linewidth=1.5, markersize=3,
+                     color="tab:green")
+        axes[2].set_xlabel("step")
+        axes[2].set_ylabel("accuracy")
+        axes[2].set_ylim(0.0, 1.0)
+        axes[2].grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)

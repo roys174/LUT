@@ -267,6 +267,12 @@ class StandardOutputHead:
         prob = max(self.output[last][target], 1e-30)
         return -math.log(prob)
 
+    def validation_accuracy(self, args):
+        last = args.context_size - 1
+        pred = int(np.argmax(self.output[last]))
+        target = int(self.tokens[args.context_size])
+        return 1.0 if pred == target else 0.0
+
 
 class FactoredOutputHead:
     __slots__ = ['unembedder_hi', 'output_hi',
@@ -392,6 +398,14 @@ class FactoredOutputHead:
         prob_hi = max(self.output_hi[last][target_hi], 1e-30)
         prob_lo = max(self.output_lo[last][target_lo], 1e-30)
         return -math.log(prob_hi) + -math.log(prob_lo)
+
+    def validation_accuracy(self, args):
+        last = args.context_size - 1
+        pred_hi = int(np.argmax(self.output_hi[last]))
+        pred_lo = int(np.argmax(self.output_lo[last]))
+        target_hi = int(self.tokens_hi[args.context_size])
+        target_lo = int(self.tokens_lo[args.context_size])
+        return 1.0 if pred_hi == target_hi and pred_lo == target_lo else 0.0
 
 
 class Model:
@@ -2376,7 +2390,7 @@ def main():
 
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
-        f.write("step, loss, perplexity\n")
+        f.write("step, loss, perplexity, accuracy\n")
 
     training = TrainingData()
     load_training_data(training, args)
@@ -2403,6 +2417,7 @@ def main():
     pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
     last_ppl = None
     last_loss = None
+    last_acc = None
     ema_loss = None
     ema_alpha = 0.02
 
@@ -2436,19 +2451,23 @@ def main():
             pbar.set_description("Validating")
 
             validation_loss = 0.0
+            validation_accuracy = 0.0
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args,
                              training.val_pos_data if args.POS_task else None)
                 model_forward(m, args, training=False)
+                validation_accuracy += m.output_head.validation_accuracy(args)
                 validation_loss += m.output_head.validation_loss(args)
             validation_loss /= args.testing_length
+            validation_accuracy /= args.testing_length
 
             perplexity = math.exp(validation_loss)
             last_ppl = perplexity
             last_loss = validation_loss
+            last_acc = validation_accuracy
 
             with open(args.loss_file, 'a') as f:
-                f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}\n")
+                f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}, {validation_accuracy:.6f}\n")
 
             if args.save_model is not None:
                 save_model(m, args.save_model, args)
@@ -2458,7 +2477,10 @@ def main():
                 tqdm.write(f"Saved LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}")
 
             # Print validation result and sample generation
-            tqdm.write(f"\n--- step {t:,} | ppl={perplexity:.2f} | loss={validation_loss:.3f} ---")
+            tqdm.write(
+                f"\n--- step {t:,} | ppl={perplexity:.2f} | "
+                f"loss={validation_loss:.3f} | acc={validation_accuracy:.3f} ---"
+            )
             val_idx = random.randint(0, training.val_length - 1)
             prompt_tokens = training.val_data[val_idx:val_idx + args.context_size].tolist()
             prompt_text = enc.decode(prompt_tokens)
@@ -2480,7 +2502,8 @@ def main():
         train_ppl_str = f"{math.exp(min(ema_loss, 20.0)):.1f}" if ema_loss is not None else "-"
         if last_ppl is not None:
             pbar.set_postfix(train_ppl=train_ppl_str, val_ppl=f"{last_ppl:.2f}",
-                             loss=f"{last_loss:.3f}", lr=f"{learning_rate:.4f}")
+                             loss=f"{last_loss:.3f}", acc=f"{last_acc:.3f}",
+                             lr=f"{learning_rate:.4f}")
         elif ema_loss is not None:
             pbar.set_postfix(train_ppl=train_ppl_str, lr=f"{learning_rate:.4f}")
 
