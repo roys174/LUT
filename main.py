@@ -81,6 +81,45 @@ class LUT:
         self.trees = np.arange(n_t, dtype=np.int32)
 
 
+class LUTUpdateStats:
+    """Counts how often each LUT table row receives an S update."""
+    def __init__(self):
+        self.counts = {}
+
+    def ensure(self, name, lut):
+        if name not in self.counts:
+            self.counts[name] = np.zeros(lut.S.shape[:2], dtype=np.uint64)
+
+    def record_rows(self, name, lut, trees, rows):
+        self.ensure(name, lut)
+        counts = self.counts[name]
+        flat = (np.asarray(trees, dtype=np.int64) * counts.shape[1]
+                + np.asarray(rows, dtype=np.int64)).ravel()
+        if flat.size:
+            counts.ravel()[:] += np.bincount(flat, minlength=counts.size).astype(np.uint64)
+
+    def record_simple(self, name, lut, j):
+        trees = np.broadcast_to(lut.trees, j.shape)
+        self.record_rows(name, lut, trees, j)
+
+    def save(self, path):
+        arrays = {name: counts for name, counts in self.counts.items()}
+        np.savez_compressed(path, **arrays)
+        summary_path = path[:-4] + "_summary.csv" if path.endswith(".npz") else path + "_summary.csv"
+        with open(summary_path, "w") as f:
+            f.write("lut,table,total_updates,updated_rows,total_rows,mean_updates_per_row,max_updates_on_row\n")
+            for name in sorted(self.counts):
+                counts = self.counts[name]
+                for table_idx in range(counts.shape[0]):
+                    row_counts = counts[table_idx]
+                    f.write(
+                        f"{name},{table_idx},{int(row_counts.sum())},"
+                        f"{int(np.count_nonzero(row_counts))},{row_counts.size},"
+                        f"{float(row_counts.mean()):.6f},{int(row_counts.max())}\n"
+                    )
+        return summary_path
+
+
 class AttentionHead:
     __slots__ = ['V', 'Score', 'Value', 'Positional_encoding',
                  '_v_j', '_v_r_min', '_v_u_min',
@@ -149,9 +188,11 @@ class StandardOutputHead:
             self.output[:] = 0.0
             self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
 
-    def backward(self, x_grad, args, skip_s_update=False):
+    def backward(self, x_grad, args, skip_s_update=False, update_stats=None, stats_name='output'):
         global learning_rate
         lut = self.unembedder
+        if update_stats is not None and not skip_s_update:
+            update_stats.record_simple(stats_name, lut, self._j)
         if HAS_NUMBA and lut.S.dtype == np.float32:
             if skip_s_update:
                 _lut_backward_kernel_noupdate(lut.S, lut.trees, self._j, self._r_min, self._u_min,
@@ -261,13 +302,14 @@ class FactoredOutputHead:
             self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
             self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
 
-    def backward(self, x_grad, args, skip_s_update=False):
+    def backward(self, x_grad, args, skip_s_update=False, update_stats=None, stats_prefix='output'):
         global learning_rate
-        lut_list = [
-            (self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
-            (self.unembedder_lo, self._lo_j, self._lo_r_min, self._lo_u_min, self.output_lo),
-        ]
-        for lut, j, r_min, u_min, output in lut_list:
+        for stats_suffix, lut, j, r_min, u_min, output in [
+            ('hi', self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
+            ('lo', self.unembedder_lo, self._lo_j, self._lo_r_min, self._lo_u_min, self.output_lo),
+        ]:
+            if update_stats is not None and not skip_s_update:
+                update_stats.record_simple(f'{stats_prefix}_{stats_suffix}', lut, j)
             if HAS_NUMBA and lut.S.dtype == np.float32:
                 if skip_s_update:
                     _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
@@ -609,6 +651,18 @@ def layernorm_backward(dy, xhat, rstd, gamma):
 def CONCATENATE_vec(Q, P, PE, args):
     """Vectorized CONCATENATE for arrays of indices."""
     return (Q << args.shift_qk) | (P << args.positional_dim) | PE
+
+
+def record_attention_update_rows(update_stats, name, lut, jV, jPE, args):
+    CS = args.context_size
+    N_T = args.n_t
+    trees = np.arange(N_T, dtype=np.int32)
+    for pos in range(1, CS):
+        jQ = jV[pos]
+        jK = jV[:pos]
+        pe_idx = pos - np.arange(pos)
+        j_bins = (jQ << args.shift_qk) | (jK << args.positional_dim) | jPE[pe_idx]
+        update_stats.record_rows(name, lut, np.broadcast_to(trees, j_bins.shape), j_bins)
 
 
 # ---------------------------------------------------------------------------
@@ -1342,7 +1396,8 @@ def attention_forward(head, x, y, args):
 
 
 def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None,
-                       score_grad_out=None, val_grad_out=None):
+                       score_grad_out=None, val_grad_out=None, update_stats=None,
+                       stats_prefix='attention'):
     global learning_rate
     CS = args.context_size
     N_T = args.n_t
@@ -1354,6 +1409,10 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
         ED = x_grad.shape[1]
         val_lut = head.Value
         score_lut = head.Score
+        if update_stats is not None and not skip_s_update:
+            update_stats.record_simple(f'{stats_prefix}_Value', val_lut, head._val_j)
+            record_attention_update_rows(update_stats, f'{stats_prefix}_Score',
+                                         score_lut, head._v_j, head._pe_j, args)
 
         if HAS_NUMBA and score_lut.S.dtype == np.float32:
             val_grad   = val_grad_out   if val_grad_out   is not None else np.zeros((CS, ED),              dtype=np.float32)
@@ -1472,6 +1531,9 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
     lut = head.V
     trees = lut.trees
     y_dim = lut.y_dim
+    if update_stats is not None and not skip_s_update:
+        record_attention_update_rows(update_stats, stats_prefix, lut,
+                                     head._v_j, head._pe_j, args)
 
     pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
 
@@ -1631,7 +1693,7 @@ def model_forward(m, args, training=True):
     m.output_head.forward(m.z, args)
 
 
-def model_backward(m, args, grad_accum=None):
+def model_backward(m, args, grad_accum=None, update_stats=None):
     global learning_rate
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
@@ -1642,7 +1704,12 @@ def model_backward(m, args, grad_accum=None):
 
     x_grad = np.zeros((args.context_size, EMBEDDING_DIM), dtype=np.float32)
 
-    m.output_head.backward(x_grad, args, skip_s_update=skip_s)
+    if args.factored_output:
+        m.output_head.backward(x_grad, args, skip_s_update=skip_s,
+                               update_stats=update_stats, stats_prefix='output')
+    else:
+        m.output_head.backward(x_grad, args, skip_s_update=skip_s,
+                               update_stats=update_stats, stats_name='output')
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         # FFN backward
@@ -1697,6 +1764,8 @@ def model_backward(m, args, grad_accum=None):
             # Save y_grad for sparse replay at apply time
             grad_accum.ffn_y_grads[l] = y_grad[:, :y_dim].copy()
         else:
+            if update_stats is not None:
+                update_stats.record_simple(f'ffn_{l}', lut, j)
             if HAS_NUMBA and lut.S.dtype == np.float32:
                 _lut_s_replay_kernel(lut.S, trees, j, y_grad, y_dim, CS, args.n_t,
                                      np.float32(learning_rate))
@@ -1723,7 +1792,10 @@ def model_backward(m, args, grad_accum=None):
                                    score_grad_out=grad_accum.attn_score_grads[l][h] if soft else None,
                                    val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None)
             else:
-                attention_backward(m.head[l][h], x_grad, y_grad, args)
+                stats_prefix = f'head_{l}_{h}' if soft else f'head_{l}_{h}_V'
+                attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                   update_stats=update_stats,
+                                   stats_prefix=stats_prefix)
 
         if use_ln:
             ln_attn_dx = x_grad - x_before_attn
@@ -1744,11 +1816,11 @@ def model_backward(m, args, grad_accum=None):
     #         m.Token_embedder[m.tokens[pos]][k] -= learning_rate * x_grad[pos][k]
 
 
-def model_training_step(m, args):
+def model_training_step(m, args, update_stats=None):
     model_forward(m, args, training=True)
     loss = m.output_head.training_loss(args)
     m.output_head.compute_gradients(args)
-    model_backward(m, args)
+    model_backward(m, args, update_stats=update_stats)
     return loss
 
 
@@ -1830,7 +1902,7 @@ def _replay_soft_attn_task(ScoreS, ValueS, score_trees, val_trees,
         PE -= scale * pe_grad
 
 
-def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
+def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stats=None):
     """Replay sparse S updates using saved y_grads and cached indices from batch elements.
 
     When pool is provided, replays are parallelized across independent S tables
@@ -1850,6 +1922,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
         lut = m.FFN[l]
         j_list = [be._ffn_j[l] for be in batch_elements]
         ygrad_list = [be.grad_accum.ffn_y_grads[l] for be in batch_elements]
+        if update_stats is not None:
+            for j in j_list:
+                update_stats.record_simple(f'ffn_{l}', lut, j)
         work.append(lambda _l=lut, _j=j_list, _y=ygrad_list:
                     _replay_ffn_task(_l.S, _l.trees, _j, _y, _l.y_dim,
                                      CS, N_T, scale, use_numba))
@@ -1864,6 +1939,11 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
                 val_j_list      = [be.head[l][h]._val_j             for be in batch_elements]
                 score_grad_list = [be.grad_accum.attn_score_grads[l][h] for be in batch_elements]
                 val_grad_list   = [be.grad_accum.attn_val_grads[l][h]   for be in batch_elements]
+                if update_stats is not None:
+                    for val_j, jV, jPE in zip(val_j_list, jV_list, jPE_list):
+                        update_stats.record_simple(f'head_{l}_{h}_Value', head.Value, val_j)
+                        record_attention_update_rows(update_stats, f'head_{l}_{h}_Score',
+                                                     head.Score, jV, jPE, args)
                 work.append(lambda _SS=head.Score.S, _VS=head.Value.S,
                                    _st=head.Score.trees, _vt=head.Value.trees,
                                    _jV=jV_list, _jPE=jPE_list, _vj=val_j_list,
@@ -1877,6 +1957,10 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
             else:
                 lut_v = head.V
                 ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+                if update_stats is not None:
+                    for jV, jPE in zip(jV_list, jPE_list):
+                        record_attention_update_rows(update_stats, f'head_{l}_{h}_V',
+                                                     lut_v, jV, jPE, args)
                 work.append(lambda _S=lut_v.S, _jV=jV_list, _jPE=jPE_list,
                                    _y=ygrad_list, _PE=head.Positional_encoding,
                                    _pg=pe_grad_list, _yd=lut_v.y_dim:
@@ -1890,6 +1974,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
                                       (m.output_head.unembedder_lo, '_lo_j', 'output_lo')]:
             j_list = [getattr(be.output_head, j_attr) for be in batch_elements]
             out_list = [getattr(be.output_head, out_attr) for be in batch_elements]
+            if update_stats is not None:
+                for j in j_list:
+                    update_stats.record_simple(f'output_{j_attr[1:-2]}', lut, j)
             work.append(lambda _l=lut, _j=j_list, _o=out_list:
                         _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
                                             CS, N_T, scale, use_numba))
@@ -1897,6 +1984,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None):
         lut = m.output_head.unembedder
         j_list = [be.output_head._j for be in batch_elements]
         out_list = [be.output_head.output for be in batch_elements]
+        if update_stats is not None:
+            for j in j_list:
+                update_stats.record_simple('output', lut, j)
         work.append(lambda _l=lut, _j=j_list, _o=out_list:
                     _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
                                         CS, N_T, scale, use_numba))
@@ -2110,6 +2200,8 @@ def main():
                         help='Path to save model weights (.npz) at each validation interval and end of training')
     parser.add_argument('--load-model', type=str, default=None,
                         help='Path to load model weights (.npz) before training begins')
+    parser.add_argument('--lut-update-stats-file', type=str, default=None,
+                        help='Optional .npz path for per-LUT table-row update counts')
     args = parser.parse_args()
 
     # Seed RNGs before anything else
@@ -2161,6 +2253,7 @@ def main():
     print(f"  seed              = {args.seed}")
     print(f"  save_model        = {args.save_model}")
     print(f"  load_model        = {args.load_model}")
+    print(f"  lut_update_stats_file = {args.lut_update_stats_file}")
     print("=" * 50)
 
     # Initialize loss file with header
@@ -2175,6 +2268,7 @@ def main():
     if args.load_model is not None:
         load_model(m, args.load_model, args)
     print_model_stats(m, args)
+    update_stats = LUTUpdateStats() if args.lut_update_stats_file is not None else None
 
     batch_size = args.batch_size
     if batch_size > 1:
@@ -2201,7 +2295,8 @@ def main():
         if batch_size == 1:
             # Fast path: identical to original code (no overhead)
             load_snippet(m, training.data, get_random_training_index(training), args)
-            loss = model_training_step(m, args)
+            step_stats = update_stats if learning_rate != 0.0 else None
+            loss = model_training_step(m, args, update_stats=step_stats)
             ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
         else:
             # Batched path: parallel forward+backward, then averaged S update
@@ -2211,7 +2306,9 @@ def main():
                 batch_elements[b].grad_accum.zero()
 
             losses = pool.map(lambda be: _batch_element_step(be, args), batch_elements)
-            apply_averaged_gradients(m, batch_elements, learning_rate, args, pool=replay_pool)
+            step_stats = update_stats if learning_rate != 0.0 else None
+            apply_averaged_gradients(m, batch_elements, learning_rate, args,
+                                     pool=replay_pool, update_stats=step_stats)
             loss = sum(losses) / batch_size
             ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
 
@@ -2235,6 +2332,9 @@ def main():
             if args.save_model is not None:
                 save_model(m, args.save_model, args)
                 tqdm.write(f"Saved model to {args.save_model}.npz")
+            if update_stats is not None:
+                summary_path = update_stats.save(args.lut_update_stats_file)
+                tqdm.write(f"Saved LUT update stats to {args.lut_update_stats_file} and {summary_path}")
 
             # Print validation result and sample generation
             tqdm.write(f"\n--- step {t:,} | ppl={perplexity:.2f} | loss={validation_loss:.3f} ---")
@@ -2261,6 +2361,9 @@ def main():
     if args.save_model is not None:
         save_model(m, args.save_model, args)
         print(f"Saved final model to {args.save_model}.npz")
+    if update_stats is not None:
+        summary_path = update_stats.save(args.lut_update_stats_file)
+        print(f"Saved final LUT update stats to {args.lut_update_stats_file} and {summary_path}")
 
     if pool is not None:
         pool.close()
