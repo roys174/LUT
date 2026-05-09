@@ -5,13 +5,15 @@
 """Python port by Claude, February 2026"""
 
 import argparse
+import hashlib
 import io
 import math
+import os
 import random
 import sys
 import numpy as np
 import tiktoken
-from word_tokenizer import WordTokenizer
+from word_tokenizer import POS_LABELS, WordTokenizer
 from multiprocessing.pool import ThreadPool
 from tqdm import tqdm
 
@@ -176,7 +178,7 @@ class StandardOutputHead:
     def __init__(self, args):
         N_T = args.n_t
         CS = args.context_size
-        VOCAB_SIZE = args.vocab_size
+        VOCAB_SIZE = args.vocab_size_output
         self.unembedder = LUT(N_T)
         self.output = np.zeros((CS, VOCAB_SIZE), dtype=np.float32)
         self.tokens = None  # set by load_targets
@@ -185,7 +187,7 @@ class StandardOutputHead:
         self._u_min = np.zeros((CS, N_T), dtype=np.float32)
 
     def build(self, n_c, args):
-        build_LUT(self.unembedder, n_c, args.vocab_size, args)
+        build_LUT(self.unembedder, n_c, args.vocab_size_output, args)
 
     def load_targets(self, tokens, context_size):
         self.tokens = tokens
@@ -236,7 +238,7 @@ class StandardOutputHead:
     def compute_gradients(self, args):
         if HAS_NUMBA:
             _softmax_cross_entropy_kernel(self.output, self.tokens[1:args.context_size + 1],
-                                          args.context_size, args.vocab_size)
+                                          args.context_size, args.vocab_size_output)
         else:
             x = self.output
             x -= x.max(axis=1, keepdims=True)
@@ -245,7 +247,7 @@ class StandardOutputHead:
             x[np.arange(args.context_size), self.tokens[1:args.context_size + 1]] -= 1.0
 
     def sample_token(self, args):
-        VOCAB_SIZE = args.vocab_size
+        VOCAB_SIZE = args.vocab_size_output
         softmax(self.output[args.context_size - 1], VOCAB_SIZE, args.temperature)
         return sample(self.output[args.context_size - 1], VOCAB_SIZE)
 
@@ -260,7 +262,7 @@ class StandardOutputHead:
 
     def validation_loss(self, args):
         last = args.context_size - 1
-        softmax(self.output[last], args.vocab_size, 1.0)
+        softmax(self.output[last], args.vocab_size_output, 1.0)
         target = self.tokens[args.context_size]
         prob = max(self.output[last][target], 1e-30)
         return -math.log(prob)
@@ -359,7 +361,7 @@ class FactoredOutputHead:
             self.output_lo[pos][self.tokens_lo[pos + 1]] -= 1.0
 
     def sample_token(self, args):
-        VOCAB_SIZE = args.vocab_size
+        VOCAB_SIZE = args.vocab_size_output
         VOCAB_HI = args.vocab_hi
         softmax(self.output_hi[args.context_size - 1], VOCAB_HI, args.temperature)
         hi = sample(self.output_hi[args.context_size - 1], VOCAB_HI)
@@ -399,7 +401,7 @@ class Model:
                  '_ln_attn_xhat', '_ln_attn_rstd', '_ln_ffn_xhat', '_ln_ffn_rstd',
                  '_ln_ffn_buf', '_drop_attn_mask', '_drop_ffn_mask']
     def __init__(self, args):
-        VOCAB_SIZE = args.vocab_size
+        VOCAB_SIZE = args.vocab_size_input
         EMBEDDING_DIM = args.embedding_dim
         NUM_LAYERS = args.num_layers
         NUM_HEADS = args.num_heads
@@ -440,11 +442,15 @@ class Model:
 
 
 class TrainingData:
-    __slots__ = ['data', 'length', 'val_data', 'val_length', 'testing_input_data']
+    __slots__ = ['data', 'pos_data', 'length',
+                 'val_data', 'val_pos_data', 'val_length',
+                 'testing_input_data']
     def __init__(self):
         self.data = None
+        self.pos_data = None
         self.length = 0
         self.val_data = None
+        self.val_pos_data = None
         self.val_length = 0
         self.testing_input_data = None
 
@@ -1252,7 +1258,7 @@ def _soft_attn_value_s_replay_kernel(ValueS, val_j, val_grad, CS, N_T, ED, scale
 # ---------------------------------------------------------------------------
 
 def build_Model(m, args):
-    VOCAB_SIZE = args.vocab_size
+    VOCAB_SIZE_INPUT = args.vocab_size_input
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
@@ -1261,7 +1267,7 @@ def build_Model(m, args):
     
     N_T = args.n_t
 
-    m.Token_embedder[:] = random_vector(VOCAB_SIZE * EMBEDDING_DIM, 1.0).reshape(VOCAB_SIZE, EMBEDDING_DIM)
+    m.Token_embedder[:] = random_vector(VOCAB_SIZE_INPUT * EMBEDDING_DIM, 1.0).reshape(VOCAB_SIZE_INPUT, EMBEDDING_DIM)
 
     for l in range(NUM_LAYERS):
         build_LUT(m.FFN[l], N_C, EMBEDDING_DIM, args)
@@ -2024,6 +2030,40 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
 # Training data
 # ---------------------------------------------------------------------------
 
+def pos_cache_path(input_path, text, args):
+    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+    vocab_id = os.path.basename(args.vocab_file) if args.tokenizer == 'word' else args.tokenizer
+    cache_name = f"{os.path.basename(input_path)}.{vocab_id}.{text_hash}.pos.npy"
+    return os.path.join(args.pos_cache_dir, cache_name)
+
+
+def load_or_build_pos_encoding(input_path, text, token_count, args, name):
+    os.makedirs(args.pos_cache_dir, exist_ok=True)
+    cache_path = pos_cache_path(input_path, text, args)
+
+    if os.path.exists(cache_path):
+        pos_data = np.load(cache_path)
+        if len(pos_data) == token_count:
+            print(f"Loaded POS encoding for {name}: {cache_path}")
+            return pos_data.astype(np.int32, copy=False)
+        print(
+            f"Ignoring stale POS cache for {name}: expected {token_count} labels, "
+            f"found {len(pos_data)}"
+        )
+
+    print(f"Building POS encoding for {name}...")
+    pos_data = np.array(args.enc.encode(text, pos=True), dtype=np.int32)
+    if len(pos_data) != token_count:
+        print(
+            f"POS encoding length mismatch for {name}: "
+            f"{len(pos_data)} POS labels vs {token_count} tokens"
+        )
+        sys.exit(1)
+    np.save(cache_path, pos_data)
+    print(f"Saved POS encoding for {name}: {cache_path}")
+    return pos_data
+
+
 def load_training_data(training, args):
     
     TESTING_LENGTH = args.testing_length
@@ -2039,6 +2079,9 @@ def load_training_data(training, args):
 
     tokens = enc.encode(text)
     training.data = np.array(tokens, dtype=np.int32)
+    if args.POS_task:
+        training.pos_data = load_or_build_pos_encoding(
+            args.training_data, text, len(training.data), args, "training data")
     training.length = len(training.data) - args.context_size - 1
     print(f"Training data: {len(training.data)} tokens from {args.training_data}")
 
@@ -2052,11 +2095,15 @@ def load_training_data(training, args):
             sys.exit(1)
         val_tokens = enc.encode(val_text)
         training.val_data = np.array(val_tokens, dtype=np.int32)
+        if args.POS_task:
+            training.val_pos_data = load_or_build_pos_encoding(
+                args.validation_data, val_text, len(training.val_data), args, "validation data")
         training.val_length = len(training.val_data) - args.context_size - 1
         print(f"Validation data: {len(training.val_data)} tokens from {args.validation_data}")
     else:
         # No separate validation file: use random snippets from training data
         training.val_data = training.data
+        training.val_pos_data = training.pos_data
         training.val_length = training.length
         print("Validation data: sampled from training data")
 
@@ -2065,18 +2112,22 @@ def load_training_data(training, args):
     for i in range(TESTING_LENGTH):
         training.testing_input_data[i] = random.randint(0, training.val_length - 1)
 
-    print(f"Tokenizer: {args.tokenizer}, vocab_size: {args.vocab_size}")
+    print(f"Tokenizer: {args.tokenizer}, vocab_size: {args.vocab_size_input}")
 
 
 def get_random_training_index(training):
     return random.randint(0, training.length - 1)
 
 
-def load_snippet(m, data_array, char_start, args):
+def load_snippet(m, data_array, char_start, args, target_array=None):
     CS = args.context_size
     m.tokens[:CS + 1] = data_array[char_start:char_start + CS + 1]
     m.z[:] = m.Token_embedder[m.tokens[:CS]]
-    m.output_head.load_targets(m.tokens, CS)
+    if target_array is None:
+        target_array = m.tokens
+    else:
+        target_array = target_array[char_start:char_start + CS + 1]
+    m.output_head.load_targets(target_array, CS)
 
 
 def model_inference(m, args):
@@ -2084,18 +2135,46 @@ def model_inference(m, args):
     return m.output_head.sample_token(args)
 
 
-def model_prompt_response(m, prompt_text, response_length, args):
+def model_pos_response(m, prompt_text, response_length, args,
+                       data_array=None, start_idx=None, target_array=None):
     enc = args.enc
+    sys.stdout.write(prompt_text[:80])
 
-    # Encode prompt to token IDs
+    if data_array is not None and start_idx is not None and target_array is not None:
+        max_response = min(response_length, len(target_array) - start_idx - args.context_size)
+        preds = []
+        targets = []
+        for i in range(max_response):
+            load_snippet(m, data_array, start_idx + i, args, target_array)
+            model_forward(m, args, training=False)
+            preds.append(int(np.argmax(m.output_head.output[args.context_size - 1])))
+            targets.append(int(m.output_head.tokens[args.context_size]))
+        sys.stdout.write("\nPOS pred:   " + enc.decode_pos(preds))
+        sys.stdout.write("\nPOS target: " + enc.decode_pos(targets))
+        sys.stdout.flush()
+        return
+
     prompt_tokens = enc.encode(prompt_text)
-    # Truncate or pad to args.context_size
+    if len(prompt_tokens) > args.context_size:
+        prompt_tokens = prompt_tokens[:args.context_size]
+    else:
+        prompt_tokens = [0] * (args.context_size - len(prompt_tokens)) + list(prompt_tokens)
+    m.tokens[:args.context_size] = prompt_tokens
+    m.z[:] = m.Token_embedder[prompt_tokens]
+    model_forward(m, args, training=False)
+    pred = int(np.argmax(m.output_head.output[args.context_size - 1]))
+    sys.stdout.write("\nnext POS: " + enc.decode_pos([pred]))
+    sys.stdout.flush()
+
+
+def model_text_response(m, prompt_text, response_length, args):
+    enc = args.enc
+    prompt_tokens = enc.encode(prompt_text)
     if len(prompt_tokens) > args.context_size:
         prompt_tokens = prompt_tokens[:args.context_size]
     else:
         prompt_tokens = [0] * (args.context_size - len(prompt_tokens)) + list(prompt_tokens)
 
-    # Print the prompt
     sys.stdout.write(prompt_text[:80])
 
     for i in range(response_length):
@@ -2107,6 +2186,17 @@ def model_prompt_response(m, prompt_text, response_length, args):
         prompt_tokens = prompt_tokens[1:] + [response]
 
     sys.stdout.flush()
+
+
+def model_prompt_response(m, prompt_text, response_length, args,
+                          data_array=None, start_idx=None, target_array=None):
+    if args.POS_task:
+        model_pos_response(m, prompt_text, response_length, args,
+                           data_array=data_array,
+                           start_idx=start_idx,
+                           target_array=target_array)
+    else:
+        model_text_response(m, prompt_text, response_length, args)
 
 
 def print_model_stats(m, args):
@@ -2214,6 +2304,10 @@ def main():
                         help='Path to load model weights (.npz) before training begins')
     parser.add_argument('--lut-update-stats-file', type=str, default=None,
                         help='Optional .npz path for per-LUT table-row update counts')
+    parser.add_argument('--POS-task', '--pos-task', dest='POS_task', action='store_true',
+                        help='Whether to run the POS tagging task instead of language modeling')
+    parser.add_argument('--pos-cache-dir', type=str, default='.pos_cache',
+                        help='Directory for cached POS encodings used by --POS-task')
     args = parser.parse_args()
 
     # Seed RNGs before anything else
@@ -2221,16 +2315,25 @@ def main():
         random.seed(args.seed)
         np.random.seed(args.seed)
 
+    if args.POS_task and args.tokenizer != 'word':
+        print("POS task currently requires --tokenizer word.")
+        sys.exit(1)
+
     # Initialize tokenizer and auto-set vocab size
     if args.tokenizer == 'word':
         enc = WordTokenizer(args.vocab_file)
     else:
         enc = tiktoken.get_encoding(args.tokenizer)
-    args.vocab_size = enc.n_vocab
+    args.vocab_size_input = enc.n_vocab
+    args.vocab_size_output = len(POS_LABELS) if args.POS_task else enc.n_vocab
     args.enc = enc
+    if args.POS_task:
+        if args.factored_output:
+            print("POS task uses the standard output head; disable --factored-output.")
+            sys.exit(1)
 
     # Factored output dimensions
-    args.vocab_hi = (args.vocab_size + 255) // 256
+    args.vocab_hi = (args.vocab_size_output + 255) // 256
     args.vocab_lo = 256
 
     # Pre-compute positional encoding bitmasks and shift constants
@@ -2241,7 +2344,8 @@ def main():
     print("=" * 50)
     print("Hyperparameters:")
     print(f"  context_size      = {args.context_size}")
-    print(f"  vocab_size        = {args.vocab_size}")
+    print(f"  vocab_size_input  = {args.vocab_size_input}")
+    print(f"  vocab_size_output = {args.vocab_size_output}")
     print(f"  embedding_dim     = {args.embedding_dim}")
     print(f"  positional_dim    = {args.positional_dim}")
     print(f"  num_layers        = {args.num_layers}")
@@ -2266,6 +2370,8 @@ def main():
     print(f"  save_model        = {args.save_model}")
     print(f"  load_model        = {args.load_model}")
     print(f"  lut_update_stats_file = {args.lut_update_stats_file}")
+    print(f"  POS_task          = {args.POS_task}")
+    print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print("=" * 50)
 
     # Initialize loss file with header
@@ -2306,7 +2412,8 @@ def main():
 
         if batch_size == 1:
             # Fast path: identical to original code (no overhead)
-            load_snippet(m, training.data, get_random_training_index(training), args)
+            load_snippet(m, training.data, get_random_training_index(training), args,
+                         training.pos_data if args.POS_task else None)
             step_stats = update_stats if learning_rate != 0.0 else None
             loss = model_training_step(m, args, update_stats=step_stats)
             ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
@@ -2314,7 +2421,8 @@ def main():
             # Batched path: parallel forward+backward, then averaged S update
             for b in range(batch_size):
                 idx = get_random_training_index(training)
-                load_snippet(batch_elements[b], training.data, idx, args)
+                load_snippet(batch_elements[b], training.data, idx, args,
+                             training.pos_data if args.POS_task else None)
                 batch_elements[b].grad_accum.zero()
 
             losses = pool.map(lambda be: _batch_element_step(be, args), batch_elements)
@@ -2329,7 +2437,8 @@ def main():
 
             validation_loss = 0.0
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
-                load_snippet(m, training.val_data, int(training.testing_input_data[i]), args)
+                load_snippet(m, training.val_data, int(training.testing_input_data[i]), args,
+                             training.val_pos_data if args.POS_task else None)
                 model_forward(m, args, training=False)
                 validation_loss += m.output_head.validation_loss(args)
             validation_loss /= args.testing_length
@@ -2353,10 +2462,15 @@ def main():
             val_idx = random.randint(0, training.val_length - 1)
             prompt_tokens = training.val_data[val_idx:val_idx + args.context_size].tolist()
             prompt_text = enc.decode(prompt_tokens)
-            # Capture generation output
+            # Capture generation / POS prediction output
             old_stdout = sys.stdout
             sys.stdout = buf = io.StringIO()
-            model_prompt_response(m, prompt_text, 80, args)
+            model_prompt_response(
+                m, prompt_text, 80, args,
+                data_array=training.val_data if args.POS_task else None,
+                start_idx=val_idx if args.POS_task else None,
+                target_array=training.val_pos_data if args.POS_task else None,
+            )
             sys.stdout = old_stdout
             tqdm.write(buf.getvalue())
             tqdm.write("")

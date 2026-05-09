@@ -13,14 +13,27 @@ Usage:
 
   # Then train:
   python main.py wiki2_train.txt --tokenizer word --vocab-file word_vocab.txt
+
+  # POS labels for the same raw token stream:
+  tokenizer.encode(text, pos=True)
+  tokenizer.decode_pos(pos_ids)
 """
 
 import re
+from tqdm import tqdm
 
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]")
 
 UNK = '<unk>'
 EOL = '<eol>'
+
+POS_LABELS = [
+    "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
+    "NOUN", "NUM", "PART", "PRON", "PROPN", "PUNCT",
+    "SCONJ", "SYM", "VERB", "X", "SPACE",
+]
+POS_LABEL_TO_ID = {label: i for i, label in enumerate(POS_LABELS)}
+POS_CHUNK_SIZE = 50_000
 
 
 class WordTokenizer:
@@ -29,6 +42,7 @@ class WordTokenizer:
     def __init__(self, vocab_path):
         self.id_to_token = []
         self.token_to_id = {}
+        self._pos_nlp = None
         with open(vocab_path, 'r', encoding='utf-8') as f:
             for idx, line in enumerate(f):
                 token = line.rstrip('\n')
@@ -51,8 +65,65 @@ class WordTokenizer:
                 tokens.append(EOL)
         return tokens
 
-    def encode(self, text):
-        return [self.token_to_id.get(t, 0) for t in self._split(text)]
+    def _ensure_pos_tagger(self):
+        if self._pos_nlp is not None:
+            return self._pos_nlp
+        try:
+            import spacy
+            self._pos_nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer"])
+        except ImportError:
+            raise RuntimeError("POS encoding requires spaCy. Install it in this environment first.")
+        except OSError:
+            raise RuntimeError(
+                "POS encoding requires the spaCy model en_core_web_sm. "
+                "Install it with: python -m spacy download en_core_web_sm"
+            )
+        return self._pos_nlp
+
+    def _encode_pos(self, raw_tokens):
+        from spacy.tokens import Doc
+
+        nlp = self._ensure_pos_tagger()
+        pos_ids = [POS_LABEL_TO_ID["X"]] * len(raw_tokens)
+        chunk_starts = range(0, len(raw_tokens), POS_CHUNK_SIZE)
+
+        for chunk_start in tqdm(chunk_starts, desc="POS encoding", unit="chunk"):
+            chunk = raw_tokens[chunk_start:chunk_start + POS_CHUNK_SIZE]
+            words = []
+            spaces = []
+            positions = []
+
+            for offset, tok in enumerate(chunk):
+                target_pos = chunk_start + offset
+                if tok == EOL:
+                    pos_ids[target_pos] = POS_LABEL_TO_ID["SPACE"]
+                    if spaces:
+                        spaces[-1] = True
+                    continue
+
+                if spaces:
+                    spaces[-1] = not (len(tok) == 1 and not tok.isalnum())
+                words.append(tok)
+                spaces.append(False)
+                positions.append(target_pos)
+
+            if not words:
+                continue
+
+            doc = Doc(nlp.vocab, words=words, spaces=spaces)
+            for _, pipe in nlp.pipeline:
+                doc = pipe(doc)
+            for token, target_pos in zip(doc, positions):
+                pos_ids[target_pos] = POS_LABEL_TO_ID.get(token.pos_, POS_LABEL_TO_ID["X"])
+
+        return pos_ids
+
+    def encode(self, text, pos=False):
+        """Encode text as word token IDs, or POS label IDs when pos=True."""
+        raw_tokens = self._split(text)
+        if pos:
+            return self._encode_pos(raw_tokens)
+        return [self.token_to_id.get(t, 0) for t in raw_tokens]
 
     def decode(self, ids):
         """Convert token IDs to a human-readable string."""
@@ -69,6 +140,14 @@ class WordTokenizer:
             else:
                 out.append(' ' + tok)
         return ''.join(out)
+
+    def decode_pos(self, ids):
+        """Convert POS label IDs to a readable label string."""
+        labels = [
+            POS_LABELS[int(i)] if 0 <= int(i) < len(POS_LABELS) else "X"
+            for i in ids
+        ]
+        return " ".join(labels)
 
 
 def build_vocab(text, min_freq=3, vocab_path='word_vocab.txt'):

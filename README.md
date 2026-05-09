@@ -11,6 +11,8 @@ A lookup-table (LUT) based language model that replaces matrix multiplications w
 - [LUT Model](#lut-model)
   - [Quick Start](#quick-start)
   - [All CLI Options](#all-cli-options)
+  - [Part-of-Speech Prediction Task](#part-of-speech-prediction-task)
+  - [Plotting Loss Curves](#plotting-loss-curves)
   - [LUT Update Statistics](#lut-update-statistics)
   - [Saving and Loading Weights](#saving-and-loading-weights)
   - [Reproducibility (Random Seed)](#reproducibility-random-seed)
@@ -28,6 +30,20 @@ A lookup-table (LUT) based language model that replaces matrix multiplications w
 ```bash
 pip install -r requirements.txt
 # installs: numpy, numba, tiktoken, tqdm
+```
+
+The optional part-of-speech prediction task also requires spaCy and its English
+model:
+
+```bash
+pip install spacy
+python -m spacy download en_core_web_sm
+```
+
+Plotting helpers require matplotlib:
+
+```bash
+pip install matplotlib
 ```
 
 **PyTorch** (nanoGPT only):
@@ -113,6 +129,8 @@ Progress is shown with a live tqdm bar displaying training perplexity, validatio
 | `--save-model` | None | Save weights to this `.npz` path at each validation and end |
 | `--load-model` | None | Load weights from this `.npz` path before training |
 | `--lut-update-stats-file` | None | Save per-LUT row update counts to this `.npz` path |
+| `--POS-task`, `--pos-task` | off | Train the output head to predict the next POS label instead of the next token |
+| `--pos-cache-dir` | `.pos_cache` | Directory for cached POS label encodings |
 
 **Example — larger model with regularization:**
 
@@ -138,6 +156,93 @@ python main.py wiki2_train.txt --validation-data wiki2_val.txt \
 ```bash
 python main.py wiki2_train.txt --validation-data wiki2_val.txt \
     --fp16 --factored-output
+```
+
+### Part-of-Speech Prediction Task
+
+The LUT model can train on a POS prediction task instead of language modeling.
+The input stream is still word-token IDs, but the output head predicts the next
+universal POS label. There are 18 labels:
+
+```text
+ADJ ADP ADV AUX CCONJ DET INTJ NOUN NUM PART PRON PROPN PUNCT SCONJ SYM VERB X SPACE
+```
+
+POS mode currently requires the word tokenizer and standard output head:
+
+```bash
+python build_word_vocab.py nanoGPT/data/wiki2/train.txt --output word_vocab.txt
+
+python main.py nanoGPT/data/wiki2/train.txt \
+    --validation-data nanoGPT/data/wiki2/val.txt \
+    --tokenizer word \
+    --vocab-file word_vocab.txt \
+    --POS-task \
+    --context-size 32 \
+    --embedding-dim 64 \
+    --num-layers 2 \
+    --num-heads 2 \
+    --n-t 8 \
+    --n-c 4 \
+    --testing-length 100 \
+    --validation-interval 100 \
+    --max-steps 1000 \
+    --loss-file pos_loss.csv
+```
+
+The word tokenizer can encode either normal token IDs or POS label IDs:
+
+```python
+enc.encode(text)             # word token IDs
+enc.encode(text, pos=True)   # POS label IDs
+enc.decode_pos(pos_ids)      # readable POS labels
+```
+
+POS labels are generated from the original raw text before rare words are
+mapped to `<unk>`, so unknown input tokens can still receive meaningful POS
+targets.
+
+Because spaCy tagging can be slow on large corpora, POS encodings are cached
+automatically whenever `--POS-task` is used. The default cache directory is
+`.pos_cache`; change it with `--pos-cache-dir`. Cache files are keyed by the
+input file basename, vocab file basename, and a hash of the raw text contents.
+
+On a cold cache you will see:
+
+```text
+Building POS encoding for training data...
+POS encoding: 100%|██████████| ...
+Saved POS encoding for training data: ...
+```
+
+On later runs with the same data:
+
+```text
+Loaded POS encoding for training data: ...
+```
+
+Validation output in POS mode shows predicted and target label sequences:
+
+```text
+POS pred:   ADJ ADJ ADJ
+POS target: NOUN PUNCT SPACE
+```
+
+### Plotting Loss Curves
+
+`main.py` writes a CSV with `step`, `loss`, and `perplexity` columns. Plot it
+with:
+
+```bash
+python plot_loss.py pos_loss.csv
+```
+
+This saves `pos_loss.png` by default. Useful options:
+
+```bash
+python plot_loss.py pos_loss.csv --output plots/pos_loss.png
+python plot_loss.py pos_loss.csv --show
+python plot_loss.py pos_loss.csv --log-perplexity
 ```
 
 ### LUT Update Statistics
