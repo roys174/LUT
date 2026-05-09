@@ -11,6 +11,7 @@ A lookup-table (LUT) based language model that replaces matrix multiplications w
 - [LUT Model](#lut-model)
   - [Quick Start](#quick-start)
   - [All CLI Options](#all-cli-options)
+  - [LUT Update Statistics](#lut-update-statistics)
   - [Saving and Loading Weights](#saving-and-loading-weights)
   - [Reproducibility (Random Seed)](#reproducibility-random-seed)
 - [Transformer Baseline (nanoGPT)](#transformer-baseline-nanogpt)
@@ -111,6 +112,7 @@ Progress is shown with a live tqdm bar displaying training perplexity, validatio
 | `--seed` | None | Random seed for reproducibility |
 | `--save-model` | None | Save weights to this `.npz` path at each validation and end |
 | `--load-model` | None | Load weights from this `.npz` path before training |
+| `--lut-update-stats-file` | None | Save per-LUT row update counts to this `.npz` path |
 
 **Example — larger model with regularization:**
 
@@ -137,6 +139,48 @@ python main.py wiki2_train.txt --validation-data wiki2_val.txt \
 python main.py wiki2_train.txt --validation-data wiki2_val.txt \
     --fp16 --factored-output
 ```
+
+### LUT Update Statistics
+
+To inspect how often each row in each LUT table is updated during training, pass
+`--lut-update-stats-file`:
+
+```bash
+python main.py wiki2_train.txt --validation-data wiki2_val.txt \
+    --lut-update-stats-file lut_update_stats.npz
+```
+
+This writes three files:
+
+| File | Description |
+|------|-------------|
+| `lut_update_stats.npz` | Raw per-row counters. Each array is shaped `(n_t, num_rows)` for one LUT. |
+| `lut_update_stats_summary.csv` | Per-LUT/table summary: total updates, touched rows, mean, variance, and max updates per row. |
+| `lut_update_stats_histogram.csv` | Distribution summary: how many rows received exactly N updates. |
+
+The raw counter arrays are indexed as:
+
+```python
+counts[table_index, row_index]
+```
+
+where `table_index` is the LUT tree/table and `row_index` is the selected LUT
+row/bin. The counters record update attempts to `S` rows; repeated hits to the
+same row are counted repeatedly. Step 0 is skipped when its learning rate is
+zero.
+
+To plot row-by-row update counts, use the helper script with the raw `.npz`
+file:
+
+```bash
+python plot_lut_update_histograms.py lut_update_stats.npz \
+    --out-dir lut_update_plots \
+    --line
+```
+
+The plots use row index on the X axis and number of updates on the Y axis. By
+default, each LUT gets one PNG with one subplot per table. Use
+`--overlay-tables` to draw all tables for a LUT on one axis.
 
 ### Saving and Loading Weights
 
