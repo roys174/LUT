@@ -1,8 +1,8 @@
-local_files
+# local_files
 __pycache__
 .venv
 .pos_cache
-pos_loss.csv
-pos_loss.png
-pos.py
+#pos_loss.csv
+#pos_loss.png
+#pos.py
 .mplconfig
