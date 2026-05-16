@@ -4,3 +4,4 @@ tiktoken
 tqdm
 spacy
 matplotlib
+wandb

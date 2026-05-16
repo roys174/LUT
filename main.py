@@ -2318,11 +2318,27 @@ def main():
                         help='Path to load model weights (.npz) before training begins')
     parser.add_argument('--lut-update-stats-file', type=str, default=None,
                         help='Optional .npz path for per-LUT table-row update counts')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Log training and validation metrics to Weights & Biases')
+    parser.add_argument('--wandb-project', type=str, default='lut',
+                        help='Weights & Biases project name (default: lut)')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='Optional Weights & Biases run name')
+    parser.add_argument('--wandb-entity', type=str, default=None,
+                        help='Optional Weights & Biases entity/team')
+    parser.add_argument('--wandb-tags', nargs='*', default=None,
+                        help='Optional space-separated Weights & Biases tags')
+    parser.add_argument('--wandb-mode', choices=['online', 'offline', 'disabled'], default='online',
+                        help='Weights & Biases mode (default: online)')
+    parser.add_argument('--wandb-log-interval', type=int, default=100,
+                        help='Training metric logging interval in steps (default: 1)')
     parser.add_argument('--POS-task', '--pos-task', dest='POS_task', action='store_true',
                         help='Whether to run the POS tagging task instead of language modeling')
     parser.add_argument('--pos-cache-dir', type=str, default='.pos_cache',
                         help='Directory for cached POS encodings used by --POS-task')
     args = parser.parse_args()
+    if args.wandb_log_interval < 1:
+        parser.error('--wandb-log-interval must be at least 1')
 
     # Seed RNGs before anything else
     if args.seed is not None:
@@ -2384,9 +2400,41 @@ def main():
     print(f"  save_model        = {args.save_model}")
     print(f"  load_model        = {args.load_model}")
     print(f"  lut_update_stats_file = {args.lut_update_stats_file}")
+    print(f"  wandb             = {args.wandb}")
+    print(f"  wandb_project     = {args.wandb_project}")
+    print(f"  wandb_run_name    = {args.wandb_run_name}")
+    print(f"  wandb_entity      = {args.wandb_entity}")
+    print(f"  wandb_tags        = {args.wandb_tags}")
+    print(f"  wandb_mode        = {args.wandb_mode}")
+    print(f"  wandb_log_interval = {args.wandb_log_interval}")
     print(f"  POS_task          = {args.POS_task}")
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print("=" * 50)
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            print("Weights & Biases support requires installing wandb. Try: pip install wandb")
+            sys.exit(1)
+
+        wandb_config = {
+            key: value
+            for key, value in vars(args).items()
+            if key != 'enc' and isinstance(value, (int, float, bool, str, type(None), list, tuple))
+        }
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            tags=args.wandb_tags,
+            mode=args.wandb_mode,
+            config=wandb_config,
+        )
+        wandb.define_metric("step")
+        wandb.define_metric("train/*", step_metric="step")
+        wandb.define_metric("val/*", step_metric="step")
 
     # Initialize loss file with header
     with open(args.loss_file, 'w') as f:
@@ -2447,6 +2495,16 @@ def main():
             loss = sum(losses) / batch_size
             ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
 
+        train_ppl = math.exp(min(ema_loss, 20.0)) if ema_loss is not None else None
+        if wandb_run is not None and t % args.wandb_log_interval == 0:
+            wandb_run.log({
+                "step": t,
+                "train/loss": loss,
+                "train/ema_loss": ema_loss,
+                "train/perplexity": train_ppl,
+                "train/learning_rate": learning_rate,
+            })
+
         if t % args.validation_interval == 0:
             pbar.set_description("Validating")
 
@@ -2494,12 +2552,22 @@ def main():
                 target_array=training.val_pos_data if args.POS_task else None,
             )
             sys.stdout = old_stdout
-            tqdm.write(buf.getvalue())
+            sample_text = buf.getvalue()
+            tqdm.write(sample_text)
             tqdm.write("")
+
+            if wandb_run is not None:
+                wandb_run.log({
+                    "step": t,
+                    "val/loss": validation_loss,
+                    "val/perplexity": perplexity,
+                    "val/accuracy": validation_accuracy,
+                    "val/sample": sample_text,
+                })
 
             pbar.set_description("Training")
 
-        train_ppl_str = f"{math.exp(min(ema_loss, 20.0)):.1f}" if ema_loss is not None else "-"
+        train_ppl_str = f"{train_ppl:.1f}" if train_ppl is not None else "-"
         if last_ppl is not None:
             pbar.set_postfix(train_ppl=train_ppl_str, val_ppl=f"{last_ppl:.2f}",
                              loss=f"{last_loss:.3f}", acc=f"{last_acc:.3f}",
@@ -2520,6 +2588,8 @@ def main():
     if replay_pool is not None:
         replay_pool.close()
         replay_pool.join()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == '__main__':
