@@ -1,4 +1,4 @@
-# local_files
+local_files
 __pycache__
 .venv
 .pos_cache
@@ -6,3 +6,9 @@ __pycache__
 #pos_loss.png
 #pos.py
 .mplconfig
+.cache
+wandb
+sbatch_outputs
+saved_models
+run_files
+results
