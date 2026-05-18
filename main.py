@@ -18,13 +18,14 @@ from multiprocessing.pool import ThreadPool
 from tqdm import tqdm
 
 try:
-    from numba import njit, prange, get_num_threads, get_thread_id
+    from numba import njit, prange, get_num_threads, get_thread_id, set_num_threads
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
     prange = range
     get_num_threads = lambda: 1
     get_thread_id = lambda: 0
+    set_num_threads = lambda n: None
     def njit(*args, **kwargs):
         def decorator(f): return f
         return decorator
@@ -52,6 +53,56 @@ def random_vector(size, scale):
 def sample(probabilities, n):
     cumsum = np.cumsum(probabilities[:n])
     return min(int(np.searchsorted(cumsum, random.random())), n - 1)
+
+
+def configure_cpu_parallelism(args, parser):
+    if args.batch_size < 1:
+        parser.error('--batch-size must be at least 1')
+    if args.cpu_cores < 1:
+        parser.error('--cpu-cores must be at least 1')
+    if args.num_workers < 0:
+        parser.error('--num-workers must be non-negative')
+    if args.numba_threads < 0:
+        parser.error('--numba-threads must be non-negative')
+    if args.replay_workers < 0:
+        parser.error('--replay-workers must be non-negative')
+
+    cpu_cores = args.cpu_cores
+
+    if args.batch_size == 1:
+        batch_workers = 1
+    elif args.num_workers == 0:
+        batch_workers = min(args.batch_size, cpu_cores)
+    else:
+        batch_workers = min(args.batch_size, args.num_workers)
+
+    replay_units = args.num_layers * (1 + args.num_heads) + (2 if args.factored_output else 1)
+    if args.batch_size == 1:
+        replay_workers = 1
+    elif args.replay_workers == 0:
+        replay_workers = min(replay_units, cpu_cores)
+    else:
+        replay_workers = min(replay_units, args.replay_workers)
+
+    if HAS_NUMBA:
+        if args.numba_threads == 0:
+            requested_numba_threads = max(1, cpu_cores // max(1, batch_workers))
+        else:
+            requested_numba_threads = args.numba_threads
+        try:
+            set_num_threads(requested_numba_threads)
+        except ValueError as exc:
+            print(f"Warning: could not set Numba threads to {requested_numba_threads}: {exc}")
+            print("         If Numba was capped by the environment, start with NUMBA_NUM_THREADS=<cores>.")
+        actual_numba_threads = get_num_threads()
+    else:
+        requested_numba_threads = 1
+        actual_numba_threads = 1
+
+    args.num_workers = batch_workers
+    args.replay_workers = replay_workers
+    args.numba_threads = actual_numba_threads
+    args.requested_numba_threads = requested_numba_threads
 
 
 def fill_vector_with_random_integers(N, max_value):
@@ -2310,6 +2361,14 @@ def main():
                         help='Use float16 for LUT S tables (halves memory, may reduce precision)')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Number of sequences per training step (default: 1)')
+    parser.add_argument('--cpu-cores', type=int, default=1,
+                        help='CPU cores allocated to this run, e.g. $SLURM_CPUS_PER_TASK (default: 1)')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Batch worker threads for --batch-size > 1 (0 = derive from --cpu-cores)')
+    parser.add_argument('--numba-threads', type=int, default=0,
+                        help='Numba threads per worker/kernel (0 = derive from --cpu-cores)')
+    parser.add_argument('--replay-workers', type=int, default=0,
+                        help='Worker threads for batched sparse-gradient replay (0 = derive from --cpu-cores)')
     parser.add_argument('--soft-attention', action='store_true',
                         help='Decomposed Score+Value LUTs with softmax weighting (transformer-style)')
     parser.add_argument('--layernorm', action='store_true',
@@ -2376,6 +2435,8 @@ def main():
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
     args.shift_qk = args.n_c + args.positional_dim
 
+    configure_cpu_parallelism(args, parser)
+
     # Print hyperparameters
     print("=" * 50)
     print("Hyperparameters:")
@@ -2392,6 +2453,11 @@ def main():
     print(f"  factored_output   = {args.factored_output}")
     print(f"  fp16              = {args.fp16}")
     print(f"  batch_size        = {args.batch_size}")
+    print(f"  cpu_cores         = {args.cpu_cores}")
+    print(f"  num_workers       = {args.num_workers}")
+    print(f"  replay_workers    = {args.replay_workers}")
+    print(f"  numba_available   = {HAS_NUMBA}")
+    print(f"  numba_threads     = {args.numba_threads}")
     print(f"  soft_attention    = {args.soft_attention}")
     print(f"  layernorm         = {args.layernorm}")
     print(f"  dropout           = {args.dropout}")
@@ -2459,10 +2525,8 @@ def main():
     batch_size = args.batch_size
     if batch_size > 1:
         batch_elements = [BatchElement(m, args) for _ in range(batch_size)]
-        pool = ThreadPool(batch_size)
-        # Replay pool: one thread per independent S table
-        n_replay = args.num_layers * (1 + args.num_heads) + (2 if args.factored_output else 1)
-        replay_pool = ThreadPool(n_replay)
+        pool = ThreadPool(args.num_workers) if args.num_workers > 1 else None
+        replay_pool = ThreadPool(args.replay_workers) if args.replay_workers > 1 else None
     else:
         batch_elements = None
         pool = None
@@ -2494,7 +2558,10 @@ def main():
                              training.pos_data if args.POS_task else None)
                 batch_elements[b].grad_accum.zero()
 
-            losses = pool.map(lambda be: _batch_element_step(be, args), batch_elements)
+            if pool is not None:
+                losses = pool.map(lambda be: _batch_element_step(be, args), batch_elements)
+            else:
+                losses = [_batch_element_step(be, args) for be in batch_elements]
             step_stats = update_stats if learning_rate != 0.0 else None
             apply_averaged_gradients(m, batch_elements, learning_rate, args,
                                      pool=replay_pool, update_stats=step_stats)
