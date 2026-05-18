@@ -14,18 +14,21 @@ Usage:
   # Then train:
   python main.py wiki2_train.txt --tokenizer word --vocab-file word_vocab.txt
 
-  # POS labels for the same raw token stream:
-  tokenizer.encode(text, pos=True)
+  # POS labels for an already-tokenized stream, safest for training alignment:
+  token_ids = tokenizer.encode(text)
+  pos_ids = tokenizer.encode_pos_ids(token_ids)
   tokenizer.decode_pos(pos_ids)
 """
 
 import re
 from tqdm import tqdm
 
-_TOKEN_RE = re.compile(r"\w+|[^\w\s]")
-
 UNK = '<unk>'
 EOL = '<eol>'
+
+# Match special tokens before generic punctuation so strings like "<unk>" stay
+# aligned with the vocabulary instead of becoming "<", "unk", ">".
+_TOKEN_RE = re.compile(r"<unk>|<eol>|\w+|[^\w\s]")
 
 POS_LABELS = [
     "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
@@ -100,6 +103,9 @@ class WordTokenizer:
                     if spaces:
                         spaces[-1] = True
                     continue
+                if tok == UNK:
+                    pos_ids[target_pos] = POS_LABEL_TO_ID["X"]
+                    continue
 
                 if spaces:
                     spaces[-1] = not (len(tok) == 1 and not tok.isalnum())
@@ -118,12 +124,28 @@ class WordTokenizer:
 
         return pos_ids
 
+    def tokens_from_ids(self, ids):
+        """Convert token IDs back to the exact vocabulary tokens they represent."""
+        return [
+            self.id_to_token[int(i)] if 0 <= int(i) < len(self.id_to_token) else UNK
+            for i in ids
+        ]
+
+    def encode_pos_tokens(self, raw_tokens):
+        """POS-tag an already-tokenized stream of vocabulary tokens."""
+        return self._encode_pos(list(raw_tokens))
+
+    def encode_pos_ids(self, ids):
+        """POS-tag an already-tokenized stream of token IDs."""
+        return self.encode_pos_tokens(self.tokens_from_ids(ids))
+
     def encode(self, text, pos=False):
         """Encode text as word token IDs, or POS label IDs when pos=True."""
         raw_tokens = self._split(text)
+        token_ids = [self.token_to_id.get(t, 0) for t in raw_tokens]
         if pos:
-            return self._encode_pos(raw_tokens)
-        return [self.token_to_id.get(t, 0) for t in raw_tokens]
+            return self.encode_pos_ids(token_ids)
+        return token_ids
 
     def decode(self, ids):
         """Convert token IDs to a human-readable string."""

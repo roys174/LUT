@@ -2044,16 +2044,22 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
 # Training data
 # ---------------------------------------------------------------------------
 
-def pos_cache_path(input_path, text, args):
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+def token_stream_hash(token_ids):
+    tokens = np.asarray(token_ids, dtype=np.int32)
+    return hashlib.sha256(tokens.tobytes()).hexdigest()[:16]
+
+
+def pos_cache_path(input_path, token_ids, args):
+    token_hash = token_stream_hash(token_ids)
     vocab_id = os.path.basename(args.vocab_file) if args.tokenizer == 'word' else args.tokenizer
-    cache_name = f"{os.path.basename(input_path)}.{vocab_id}.{text_hash}.pos.npy"
+    cache_name = f"{os.path.basename(input_path)}.{vocab_id}.tokenized.{token_hash}.pos.npy"
     return os.path.join(args.pos_cache_dir, cache_name)
 
 
-def load_or_build_pos_encoding(input_path, text, token_count, args, name):
+def load_or_build_pos_encoding(input_path, token_ids, args, name):
     os.makedirs(args.pos_cache_dir, exist_ok=True)
-    cache_path = pos_cache_path(input_path, text, args)
+    cache_path = pos_cache_path(input_path, token_ids, args)
+    token_count = len(token_ids)
 
     if os.path.exists(cache_path):
         pos_data = np.load(cache_path)
@@ -2065,8 +2071,8 @@ def load_or_build_pos_encoding(input_path, text, token_count, args, name):
             f"found {len(pos_data)}"
         )
 
-    print(f"Building POS encoding for {name}...")
-    pos_data = np.array(args.enc.encode(text, pos=True), dtype=np.int32)
+    print(f"Building POS encoding for {name} from tokenized input...")
+    pos_data = np.array(args.enc.encode_pos_ids(token_ids), dtype=np.int32)
     if len(pos_data) != token_count:
         print(
             f"POS encoding length mismatch for {name}: "
@@ -2095,7 +2101,7 @@ def load_training_data(training, args):
     training.data = np.array(tokens, dtype=np.int32)
     if args.POS_task:
         training.pos_data = load_or_build_pos_encoding(
-            args.training_data, text, len(training.data), args, "training data")
+            args.training_data, training.data, args, "training data")
     training.length = len(training.data) - args.context_size - 1
     print(f"Training data: {len(training.data)} tokens from {args.training_data}")
 
@@ -2111,7 +2117,7 @@ def load_training_data(training, args):
         training.val_data = np.array(val_tokens, dtype=np.int32)
         if args.POS_task:
             training.val_pos_data = load_or_build_pos_encoding(
-                args.validation_data, val_text, len(training.val_data), args, "validation data")
+                args.validation_data, training.val_data, args, "validation data")
         training.val_length = len(training.val_data) - args.context_size - 1
         print(f"Validation data: {len(training.val_data)} tokens from {args.validation_data}")
     else:
