@@ -754,92 +754,92 @@ def record_attention_update_rows(update_stats, name, lut, jV, jPE, args):
 
 @njit(parallel=True, cache=True)
 def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_dim):
-    """Fused attention forward: eliminates all (P, N_T, y_dim) temporaries."""
-    for pos in prange(1, CS):
+    """Fused attention forward: parallel over independent output cells."""
+    for work in prange((CS - 1) * y_dim):
+        pos = work // y_dim + 1
+        d = work - (pos - 1) * y_dim
+        acc = np.float32(0.0)
         for pos1 in range(pos):
+            pe_pos = pos - pos1
             for t in range(N_T):
-                j = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
-                for d in range(y_dim):
-                    y[pos, d] += S[t, j, d]
+                j = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pe_pos, t]
+                acc += S[t, j, d]
+        y[pos, d] += acc
 
-
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                 y_grad, x_grad, pos_grad, a_arr, b_arr,
                                 shift_qk, pd, CS, N_T, y_dim, lr):
     """Fused attention backward with parallel gradient computation.
 
-    Three-phase approach using per-thread buffers to avoid O(CS^2) memory:
-      Phase 1 (parallel over pos): each thread accumulates x_grad and pe_grad
-        contributions into its own buffer. x_grad[pos] (q_wins) goes directly;
-        x_grad[pos1] (k_wins) goes into per-thread buffer.
+    Three-phase approach:
+      Phase 1 (parallel over causal-pair, tree): each thread accumulates all
+        x_grad and pe_grad contributions into its own buffer.
       Phase 2: reduce per-thread buffers into x_grad and pos_grad.
-      Phase 3 (sequential): update S tables.
+      Phase 3: update S tables in parallel over tree rows.
     """
     ED = x_grad.shape[1]
     n_threads = get_num_threads()
-    # Per-thread buffers for contributions that cross pos boundaries
     x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
     pe_grad_thr = np.zeros((n_threads, CS, N_T, pd), dtype=np.float32)
+    n_pairs = CS * (CS - 1) // 2
 
-    # Phase 1: parallel gradient computation
-    for pos in prange(1, CS):
+    # Phase 1: parallel gradient computation over all causal pairs and trees.
+    for work in prange(n_pairs * N_T):
         tid = get_thread_id()
-        for pos1 in range(pos):
-            pe_pos = pos - pos1
-            for t in range(N_T):
-                jQ = all_jV[pos, t]
-                jK = all_jV[pos1, t]
-                j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
+        pair = work // N_T
+        t = work - pair * N_T
+        pos = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+        pos1 = pair - (pos * (pos - 1)) // 2
+        pe_pos = pos - pos1
 
-                abs_uQ = abs(all_uV[pos, t])
-                abs_uK = abs(all_uV[pos1, t])
-                q_wins = abs_uQ < abs_uK
+        jQ = all_jV[pos, t]
+        jK = all_jV[pos1, t]
+        j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
 
-                if q_wins:
-                    flip_bit = all_rV[pos, t] + shift_qk
-                else:
-                    flip_bit = all_rV[pos1, t] + pd
-                jbar = j_bin ^ (1 << flip_bit)
+        abs_uQ = abs(all_uV[pos, t])
+        abs_uK = abs(all_uV[pos1, t])
+        q_wins = abs_uQ < abs_uK
 
-                gi = 0.0
-                for d in range(y_dim):
-                    gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
+        if q_wins:
+            flip_bit = all_rV[pos, t] + shift_qk
+        else:
+            flip_bit = all_rV[pos1, t] + pd
+        jbar = j_bin ^ (1 << flip_bit)
 
-                if q_wins:
-                    u_min = all_uV[pos, t]
-                    r = all_rV[pos, t]
-                else:
-                    u_min = all_uV[pos1, t]
-                    r = all_rV[pos1, t]
+        gi = np.float32(0.0)
+        for d in range(y_dim):
+            gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
 
-                sign_u = 1.0 if u_min > 0.0 else -1.0
-                abs_u_min = abs(u_min)
-                v = gi * (-0.5 * sign_u / (1.0 + abs_u_min) ** 2)
+        if q_wins:
+            u_min = all_uV[pos, t]
+            r = all_rV[pos, t]
+            target_pos = pos
+        else:
+            u_min = all_uV[pos1, t]
+            r = all_rV[pos1, t]
+            target_pos = pos1
 
-                idx_a = a_arr[t, r]
-                idx_b = b_arr[t, r]
-                if q_wins:
-                    # x_grad[pos] is unique per thread's pos — safe to write directly
-                    x_grad[pos, idx_a] += v
-                    x_grad[pos, idx_b] -= v
-                else:
-                    # x_grad[pos1] may conflict — accumulate in per-thread buffer
-                    x_grad_thr[tid, pos1, idx_a] += v
-                    x_grad_thr[tid, pos1, idx_b] -= v
+        sign_u = np.float32(1.0) if u_min > np.float32(0.0) else np.float32(-1.0)
+        abs_u_min = abs(u_min)
+        v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs_u_min) ** 2)
 
-                # PE branch
-                abs_uPE = abs(all_uPE[pe_pos, t])
-                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
-                    rPE = all_rPE[pe_pos, t]
-                    jbarPE = j_bin ^ (1 << rPE)
-                    giPE = 0.0
-                    for d in range(y_dim):
-                        giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
-                    u_pe = all_uPE[pe_pos, t]
-                    sign_pe = 1.0 if u_pe > 0.0 else -1.0
-                    deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
-                    pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
+        idx_a = a_arr[t, r]
+        idx_b = b_arr[t, r]
+        x_grad_thr[tid, target_pos, idx_a] += v
+        x_grad_thr[tid, target_pos, idx_b] -= v
+
+        abs_uPE = abs(all_uPE[pe_pos, t])
+        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+            rPE = all_rPE[pe_pos, t]
+            jbarPE = j_bin ^ (1 << rPE)
+            giPE = np.float32(0.0)
+            for d in range(y_dim):
+                giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
+            u_pe = all_uPE[pe_pos, t]
+            sign_pe = np.float32(1.0) if u_pe > np.float32(0.0) else np.float32(-1.0)
+            deltaPE = giPE * (np.float32(-0.5) * sign_pe / (np.float32(1.0) + abs(u_pe)) ** 2)
+            pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
 
     # Phase 2: reduce per-thread buffers
     for target in prange(CS):
@@ -857,16 +857,16 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
                     total += pe_grad_thr[thr, pe_pos, t, r]
                 pos_grad[pe_pos, t, r] += total
 
-    # Phase 3: S update (sequential — different pos can hit same S entry)
-    for pos in range(1, CS):
-        for pos1 in range(pos):
-            for t in range(N_T):
+    # Phase 3: S update. Parallel over tree rows; collisions are only within a
+    # tree row and are kept sequential.
+    for t in prange(N_T):
+        for pos in range(1, CS):
+            for pos1 in range(pos):
                 j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
                 for d in range(y_dim):
                     S[t, j_bin, d] -= lr * y_grad[pos, d]
 
-
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                          y_grad, x_grad, pos_grad, a_arr, b_arr,
                                          shift_qk, pd, CS, N_T, y_dim):
@@ -875,62 +875,64 @@ def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_
     n_threads = get_num_threads()
     x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
     pe_grad_thr = np.zeros((n_threads, CS, N_T, pd), dtype=np.float32)
+    n_pairs = CS * (CS - 1) // 2
 
-    # Phase 1: parallel gradient computation
-    for pos in prange(1, CS):
+    # Phase 1: parallel gradient computation over all causal pairs and trees.
+    for work in prange(n_pairs * N_T):
         tid = get_thread_id()
-        for pos1 in range(pos):
-            pe_pos = pos - pos1
-            for t in range(N_T):
-                jQ = all_jV[pos, t]
-                jK = all_jV[pos1, t]
-                j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
+        pair = work // N_T
+        t = work - pair * N_T
+        pos = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+        pos1 = pair - (pos * (pos - 1)) // 2
+        pe_pos = pos - pos1
 
-                abs_uQ = abs(all_uV[pos, t])
-                abs_uK = abs(all_uV[pos1, t])
-                q_wins = abs_uQ < abs_uK
+        jQ = all_jV[pos, t]
+        jK = all_jV[pos1, t]
+        j_bin = (jQ << shift_qk) | (jK << pd) | all_jPE[pe_pos, t]
 
-                if q_wins:
-                    flip_bit = all_rV[pos, t] + shift_qk
-                else:
-                    flip_bit = all_rV[pos1, t] + pd
-                jbar = j_bin ^ (1 << flip_bit)
+        abs_uQ = abs(all_uV[pos, t])
+        abs_uK = abs(all_uV[pos1, t])
+        q_wins = abs_uQ < abs_uK
 
-                gi = 0.0
-                for d in range(y_dim):
-                    gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
+        if q_wins:
+            flip_bit = all_rV[pos, t] + shift_qk
+        else:
+            flip_bit = all_rV[pos1, t] + pd
+        jbar = j_bin ^ (1 << flip_bit)
 
-                if q_wins:
-                    u_min = all_uV[pos, t]
-                    r = all_rV[pos, t]
-                else:
-                    u_min = all_uV[pos1, t]
-                    r = all_rV[pos1, t]
+        gi = np.float32(0.0)
+        for d in range(y_dim):
+            gi += (S[t, jbar, d] - S[t, j_bin, d]) * y_grad[pos, d]
 
-                sign_u = 1.0 if u_min > 0.0 else -1.0
-                abs_u_min = abs(u_min)
-                v = gi * (-0.5 * sign_u / (1.0 + abs_u_min) ** 2)
+        if q_wins:
+            u_min = all_uV[pos, t]
+            r = all_rV[pos, t]
+            target_pos = pos
+        else:
+            u_min = all_uV[pos1, t]
+            r = all_rV[pos1, t]
+            target_pos = pos1
 
-                idx_a = a_arr[t, r]
-                idx_b = b_arr[t, r]
-                if q_wins:
-                    x_grad[pos, idx_a] += v
-                    x_grad[pos, idx_b] -= v
-                else:
-                    x_grad_thr[tid, pos1, idx_a] += v
-                    x_grad_thr[tid, pos1, idx_b] -= v
+        sign_u = np.float32(1.0) if u_min > np.float32(0.0) else np.float32(-1.0)
+        abs_u_min = abs(u_min)
+        v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs_u_min) ** 2)
 
-                abs_uPE = abs(all_uPE[pe_pos, t])
-                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
-                    rPE = all_rPE[pe_pos, t]
-                    jbarPE = j_bin ^ (1 << rPE)
-                    giPE = 0.0
-                    for d in range(y_dim):
-                        giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
-                    u_pe = all_uPE[pe_pos, t]
-                    sign_pe = 1.0 if u_pe > 0.0 else -1.0
-                    deltaPE = giPE * (-0.5 * sign_pe / (1.0 + abs(u_pe)) ** 2)
-                    pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
+        idx_a = a_arr[t, r]
+        idx_b = b_arr[t, r]
+        x_grad_thr[tid, target_pos, idx_a] += v
+        x_grad_thr[tid, target_pos, idx_b] -= v
+
+        abs_uPE = abs(all_uPE[pe_pos, t])
+        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+            rPE = all_rPE[pe_pos, t]
+            jbarPE = j_bin ^ (1 << rPE)
+            giPE = np.float32(0.0)
+            for d in range(y_dim):
+                giPE += (S[t, jbarPE, d] - S[t, j_bin, d]) * y_grad[pos, d]
+            u_pe = all_uPE[pe_pos, t]
+            sign_pe = np.float32(1.0) if u_pe > np.float32(0.0) else np.float32(-1.0)
+            deltaPE = giPE * (np.float32(-0.5) * sign_pe / (np.float32(1.0) + abs(u_pe)) ** 2)
+            pe_grad_thr[tid, pe_pos, t, rPE] += deltaPE
 
     # Phase 2: reduce per-thread buffers
     for target in prange(CS):
@@ -948,149 +950,171 @@ def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_
                     total += pe_grad_thr[thr, pe_pos, t, r]
                 pos_grad[pe_pos, t, r] += total
 
-
 @njit(parallel=True, cache=True)
 def _cache_index_kernel(x, a_arr, b_arr, bitmasks, j_out, r_min_out, u_min_out, CS, N_T, N_C):
     """Parallel cache_index: computes j, r_min, u_min for all (pos, tree) pairs."""
-    for pos in prange(CS):
-        for t in range(N_T):
-            j = np.int32(0)
-            min_abs_u = np.float32(1e38)
-            r_min = np.int32(0)
-            u_min_val = np.float32(0.0)
-            for c in range(N_C):
-                u_val = x[pos, a_arr[t, c]] - x[pos, b_arr[t, c]]
-                if u_val > np.float32(0.0):
-                    j |= bitmasks[c]
-                au = abs(u_val)
-                if au < min_abs_u:
-                    min_abs_u = au
-                    r_min = np.int32(c)
-                    u_min_val = u_val
-            j_out[pos, t] = j
-            r_min_out[pos, t] = r_min
-            u_min_out[pos, t] = u_min_val
-
+    for work in prange(CS * N_T):
+        pos = work // N_T
+        t = work - pos * N_T
+        j = np.int32(0)
+        min_abs_u = np.float32(1e38)
+        r_min = np.int32(0)
+        u_min_val = np.float32(0.0)
+        for c in range(N_C):
+            u_val = x[pos, a_arr[t, c]] - x[pos, b_arr[t, c]]
+            if u_val > np.float32(0.0):
+                j |= bitmasks[c]
+            au = abs(u_val)
+            if au < min_abs_u:
+                min_abs_u = au
+                r_min = np.int32(c)
+                u_min_val = u_val
+        j_out[pos, t] = j
+        r_min_out[pos, t] = r_min
+        u_min_out[pos, t] = u_min_val
 
 @njit(parallel=True, cache=True)
 def _cache_pe_index_kernel(u_batch, pe_bitmasks, j_out, r_min_out, u_min_out, CS, N_T, PD):
     """Parallel cache_PE_index: computes j, r_min, u_min from PE tensor."""
-    for pos in prange(CS):
-        for t in range(N_T):
-            j = np.int32(0)
-            min_abs_u = np.float32(1e38)
-            r_min = np.int32(0)
-            u_min_val = np.float32(0.0)
-            for p in range(PD):
-                u_val = u_batch[pos, t, p]
-                if u_val > np.float32(0.0):
-                    j |= pe_bitmasks[p]
-                au = abs(u_val)
-                if au < min_abs_u:
-                    min_abs_u = au
-                    r_min = np.int32(p)
-                    u_min_val = u_val
-            j_out[pos, t] = j
-            r_min_out[pos, t] = r_min
-            u_min_out[pos, t] = u_min_val
-
+    for work in prange(CS * N_T):
+        pos = work // N_T
+        t = work - pos * N_T
+        j = np.int32(0)
+        min_abs_u = np.float32(1e38)
+        r_min = np.int32(0)
+        u_min_val = np.float32(0.0)
+        for p in range(PD):
+            u_val = u_batch[pos, t, p]
+            if u_val > np.float32(0.0):
+                j |= pe_bitmasks[p]
+            au = abs(u_val)
+            if au < min_abs_u:
+                min_abs_u = au
+                r_min = np.int32(p)
+                u_min_val = u_val
+        j_out[pos, t] = j
+        r_min_out[pos, t] = r_min
+        u_min_out[pos, t] = u_min_val
 
 @njit(parallel=True, cache=True)
 def _lut_forward_add_kernel(S, trees, j, output, CS, N_T, y_dim):
     """Fused LUT forward that adds to output (no zeroing). Used for FFN residual."""
-    for pos in prange(CS):
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
+        acc = np.float32(0.0)
         for t in range(N_T):
-            j_bin = j[pos, t]
-            for d in range(y_dim):
-                output[pos, d] += S[trees[t], j_bin, d]
-
+            acc += S[trees[t], j[pos, t], d]
+        output[pos, d] += acc
 
 @njit(parallel=True, cache=True)
 def _lut_forward_kernel(S, trees, j, output, CS, N_T, y_dim):
-    """Fused LUT forward: parallel over CS, eliminates (CS, N_T, y_dim) temporary."""
-    for pos in prange(CS):
-        for d in range(y_dim):
-            output[pos, d] = np.float32(0.0)
+    """Fused LUT forward: parallel over independent output cells."""
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
+        acc = np.float32(0.0)
         for t in range(N_T):
-            j_bin = j[pos, t]
-            for d in range(y_dim):
-                output[pos, d] += S[trees[t], j_bin, d]
+            acc += S[trees[t], j[pos, t], d]
+        output[pos, d] = acc
 
-
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                           y_dim, CS, N_T, lr):
     """Fused backward for simple LUT (FFN, output head). grad: (CS, >=y_dim).
 
-    Phase 1 (parallel): compute x_grad using original S — each pos writes unique row.
-    Phase 2 (sequential): update S — bin collisions possible across positions.
+    Phase 1 (parallel): compute x_grad using original S into thread-local rows.
+    Phase 2: update S in parallel over tree rows; repeated bins within a row
+    are still applied sequentially.
     """
-    # Phase 1: parallel x_grad computation
-    for pos in prange(CS):
-        for t in range(N_T):
-            tree = trees[t]
-            j_bin = j[pos, t]
-            r = r_min[pos, t]
-            jbar_bin = j_bin ^ (1 << r)
-            gi = np.float32(0.0)
-            for d in range(y_dim):
-                gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
-            u = u_min[pos, t]
-            sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
-            v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
-            x_grad[pos, a_arr[t, r]] += v
-            x_grad[pos, b_arr[t, r]] -= v
+    ED = x_grad.shape[1]
+    n_threads = get_num_threads()
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
 
-    # Phase 2: sequential S update
-    for pos in range(CS):
-        for t in range(N_T):
-            tree = trees[t]
+    # Phase 1: parallel x_grad computation
+    for work in prange(CS * N_T):
+        tid = get_thread_id()
+        pos = work // N_T
+        t = work - pos * N_T
+        tree = trees[t]
+        j_bin = j[pos, t]
+        r = r_min[pos, t]
+        jbar_bin = j_bin ^ (1 << r)
+        gi = np.float32(0.0)
+        for d in range(y_dim):
+            gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
+        u = u_min[pos, t]
+        sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
+        v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
+        x_grad_thr[tid, pos, a_arr[t, r]] += v
+        x_grad_thr[tid, pos, b_arr[t, r]] -= v
+
+    for pos in prange(CS):
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, pos, d]
+            x_grad[pos, d] += total
+
+    # Phase 2: S update
+    for t in prange(N_T):
+        tree = trees[t]
+        for pos in range(CS):
             j_bin = j[pos, t]
             for d in range(y_dim):
                 S[tree, j_bin, d] -= lr * grad[pos, d]
 
-
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _lut_backward_kernel_noupdate(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                                    y_dim, CS, N_T):
-    """Like _lut_backward_kernel but without the S update: fully parallel over CS."""
+    """Like _lut_backward_kernel but without the S update."""
+    ED = x_grad.shape[1]
+    n_threads = get_num_threads()
+    x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
+
+    for work in prange(CS * N_T):
+        tid = get_thread_id()
+        pos = work // N_T
+        t = work - pos * N_T
+        tree = trees[t]
+        j_bin = j[pos, t]
+        r = r_min[pos, t]
+        jbar_bin = j_bin ^ (1 << r)
+        gi = np.float32(0.0)
+        for d in range(y_dim):
+            gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
+        u = u_min[pos, t]
+        sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
+        v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
+        x_grad_thr[tid, pos, a_arr[t, r]] += v
+        x_grad_thr[tid, pos, b_arr[t, r]] -= v
+
     for pos in prange(CS):
-        for t in range(N_T):
-            tree = trees[t]
-            j_bin = j[pos, t]
-            r = r_min[pos, t]
-            jbar_bin = j_bin ^ (1 << r)
-            gi = np.float32(0.0)
-            for d in range(y_dim):
-                gi += (S[tree, jbar_bin, d] - S[tree, j_bin, d]) * grad[pos, d]
-            u = u_min[pos, t]
-            sign_u = np.float32(1.0) if u > np.float32(0.0) else np.float32(-1.0)
-            v = gi * (np.float32(-0.5) * sign_u / (np.float32(1.0) + abs(u)) ** 2)
-            x_grad[pos, a_arr[t, r]] += v
-            x_grad[pos, b_arr[t, r]] -= v
+        for d in range(ED):
+            total = np.float32(0.0)
+            for thr in range(n_threads):
+                total += x_grad_thr[thr, pos, d]
+            x_grad[pos, d] += total
 
-
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _lut_s_replay_kernel(S, trees, j, y_grad, y_dim, CS, N_T, scale):
     """Replay LUT S updates from saved y_grad and cached j indices."""
-    for pos in range(CS):
-        for t in range(N_T):
-            tree = trees[t]
+    for t in prange(N_T):
+        tree = trees[t]
+        for pos in range(CS):
             j_bin = j[pos, t]
             for d in range(y_dim):
                 S[tree, j_bin, d] -= scale * y_grad[pos, d]
 
-
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _attention_s_replay_kernel(S, all_jV, all_jPE, y_grad, shift_qk, pd, CS, N_T, y_dim, scale):
     """Replay attention S updates from saved y_grad and cached j indices."""
-    for pos in range(1, CS):
-        for pos1 in range(pos):
-            for t in range(N_T):
+    for t in prange(N_T):
+        for pos in range(1, CS):
+            for pos1 in range(pos):
                 j_bin = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pos - pos1, t]
                 for d in range(y_dim):
                     S[t, j_bin, d] -= scale * y_grad[pos, d]
-
 
 @njit(parallel=True, cache=True)
 def _softmax_cross_entropy_kernel(output, target_indices, CS, VOCAB):
@@ -1155,7 +1179,7 @@ def _soft_attn_forward_kernel(ScoreS, ValueS, jV, val_j, jPE, y, attn_w, v_vecs,
                 y[pos, d] += w * v_vecs[pos1, d]
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _soft_attn_backward_value_kernel(ValueS, val_j, val_r_min, val_u_min,
                                       attn_w, y_grad, val_grad, x_grad,
                                       val_a_arr, val_b_arr, CS, N_T, ED, lr, skip_s_update):
@@ -1205,7 +1229,7 @@ def _soft_attn_backward_value_kernel(ValueS, val_j, val_r_min, val_u_min,
                     ValueS[t, j_val, d] -= lr * val_grad[pos1, d]
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True)
 def _soft_attn_backward_score_kernel(ScoreS, jV, rV, uV, jPE, rPE, uPE,
                                       attn_w, v_vecs, y_grad, score_grad, x_grad, pos_grad,
                                       score_a_arr, score_b_arr,
