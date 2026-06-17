@@ -186,6 +186,58 @@ class LUTUpdateStats:
                             f.write(f"{name},{table_idx},{updates_per_row},{num_rows}\n")
         return summary_path, hist_path
 
+class NewAttentionHead:
+    __slots__ = ['V', 'Score', 'Value', 'Positional_encoding',
+                 '_v_j', '_v_r_min', '_v_u_min',
+                 'Q', '_q_j', '_q_r_min', '_q_u_min',
+                 'K', '_k_j', '_k_r_min', '_k_u_min',
+                 '_qk_embed',
+                 '_val_j', '_val_r_min', '_val_u_min',
+                 '_pe_j', '_pe_r_min', '_pe_u_min',
+                 '_attn_w', '_v_vecs']
+    def __init__(self, args):
+        N_T = args.n_t
+        CS = args.context_size
+        POSITIONAL_DIM = args.positional_dim
+        ED = args.embedding_dim
+        soft = getattr(args, 'soft_attention', False)
+        self.Positional_encoding = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+        n_pairs = CS * (CS - 1) // 2
+        self._v_j = np.zeros((n_pairs, N_T), dtype=np.int32)
+        self._v_r_min = np.zeros((n_pairs, N_T), dtype=np.int32)
+        self._v_u_min = np.zeros((n_pairs, N_T), dtype=np.float32)
+        self._qk_embed = np.zeros((n_pairs, ED), dtype=np.float32)
+        self._q_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._q_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._q_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        self._k_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._k_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._k_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        self._pe_j = np.zeros((CS, N_T), dtype=np.int32)
+        self._pe_r_min = np.zeros((CS, N_T), dtype=np.int32)
+        self._pe_u_min = np.zeros((CS, N_T), dtype=np.float32)
+        if soft:
+            self.V = None
+            self.Score = LUT(N_T)
+            self.Value = LUT(N_T)
+            self._val_j     = np.zeros((CS, N_T), dtype=np.int32)
+            self._val_r_min = np.zeros((CS, N_T), dtype=np.int32)
+            self._val_u_min = np.zeros((CS, N_T), dtype=np.float32)
+            self._attn_w    = np.zeros((CS, CS),  dtype=np.float32)
+            self._v_vecs    = np.zeros((CS, ED),  dtype=np.float32)
+        else:
+            self.Q = LUT(N_T)
+            self.K = LUT(N_T)
+            self.V = LUT(N_T)
+            self.Score = None
+            self.Value = None
+            self._val_j     = None
+            self._val_r_min = None
+            self._val_u_min = None
+            self._attn_w    = None
+            self._v_vecs    = None
+
+
 
 class AttentionHead:
     __slots__ = ['V', 'Score', 'Value', 'Positional_encoding',
@@ -516,6 +568,7 @@ class Model:
         NUM_HEADS = args.num_heads
         N_T = args.n_t
         CS = args.context_size
+        new_attention = args.new_attention
 
         self.Token_embedder = np.zeros((VOCAB_SIZE, EMBEDDING_DIM), dtype=np.float32)
         self.tokens = np.zeros(CS + 1, dtype=np.int32)
@@ -527,7 +580,10 @@ class Model:
         self._ffn_r_min = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
         self._ffn_u_min = [np.zeros((CS, N_T), dtype=np.float32) for _ in range(NUM_LAYERS)]
 
-        self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
+        if new_attention:
+            self.head = [[NewAttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
+        else:
+            self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
 
         if args.factored_output:
             self.output_head = FactoredOutputHead(args)
@@ -665,10 +721,17 @@ class BatchElement:
         self._ffn_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
 
         # Per-element attention heads (own scratch, shared LUTs and PE)
-        self.head = [[AttentionHead(args) for _ in range(NH)] for _ in range(NL)]
+        if getattr(args, 'new_attention', False):
+            self.head = [[NewAttentionHead(args) for _ in range(NH)] for _ in range(NL)]
+        else:
+            self.head = [[AttentionHead(args) for _ in range(NH)] for _ in range(NL)]
         for l in range(NL):
             for h in range(NH):
-                if getattr(args, 'soft_attention', False):
+                if getattr(args, 'new_attention', False):
+                    _share_lut(self.head[l][h].Q, m.head[l][h].Q)
+                    _share_lut(self.head[l][h].K, m.head[l][h].K)
+                    _share_lut(self.head[l][h].V, m.head[l][h].V)
+                elif getattr(args, 'soft_attention', False):
                     _share_lut(self.head[l][h].Score, m.head[l][h].Score)
                     _share_lut(self.head[l][h].Value, m.head[l][h].Value)
                 else:
@@ -779,6 +842,10 @@ def CONCATENATE_vec(Q, P, PE, args):
     """Vectorized CONCATENATE for arrays of indices."""
     return (Q << args.shift_qk) | (P << args.positional_dim) | PE
 
+def CONCATENATE_QK_PE(QK, PE, args):
+    """Vectorized CONCATENATE for arrays of indices."""
+    return (QK << args.positional_dim) | PE
+
 
 def record_attention_update_rows(update_stats, name, lut, jV, jPE, args):
     CS = args.context_size
@@ -809,6 +876,71 @@ def _attention_forward_kernel(S, all_jV, all_jPE, y, shift_qk, pd, CS, N_T, y_di
                 j = (all_jV[pos, t] << shift_qk) | (all_jV[pos1, t] << pd) | all_jPE[pe_pos, t]
                 acc += S[t, j, d]
         y[pos, d] += acc
+
+@njit(parallel=True, cache=True)
+def _new_attention_forward_kernel(
+    QS, KS, VS,
+    q_j, k_j, pe_j,
+    qk_embed,
+    v_j, v_r_min, v_u_min,
+    y,
+    q_trees, k_trees, v_trees,
+    v_a_arr, v_b_arr, v_bitmasks,
+    pd, CS, N_T, N_C, y_dim
+):
+    """Fused forward for Q/K pair embeddings followed by V+PE LUT lookup."""
+    n_pairs = CS * (CS - 1) // 2
+
+    # Phase 1: pair embedding qk_embed[pair] = Q(tok_i) + K(tok_j).
+    for work in prange(n_pairs * y_dim):
+        pair = work // y_dim
+        d = work - pair * y_dim
+        tok_i = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+        tok_j = pair - (tok_i * (tok_i - 1)) // 2
+
+        acc = np.float32(0.0)
+        for t in range(N_T):
+            acc += QS[q_trees[t], q_j[tok_i, t], d]
+            acc += KS[k_trees[t], k_j[tok_j, t], d]
+        qk_embed[pair, d] = acc
+
+    # Phase 2: cache V row bits and closest split for each pair/tree.
+    for work in prange(n_pairs * N_T):
+        pair = work // N_T
+        t = work - pair * N_T
+        j = np.int32(0)
+        min_abs_u = np.float32(1e38)
+        r_min = np.int32(0)
+        u_min_val = np.float32(0.0)
+
+        for c in range(N_C):
+            u_val = qk_embed[pair, v_a_arr[t, c]] - qk_embed[pair, v_b_arr[t, c]]
+            if u_val > np.float32(0.0):
+                j |= v_bitmasks[c]
+            au = abs(u_val)
+            if au < min_abs_u:
+                min_abs_u = au
+                r_min = np.int32(c)
+                u_min_val = u_val
+
+        v_j[pair, t] = j
+        v_r_min[pair, t] = r_min
+        v_u_min[pair, t] = u_min_val
+
+    # Phase 3: accumulate final V lookup contribution into each output cell.
+    for work in prange((CS - 1) * y_dim):
+        tok_i = work // y_dim + 1
+        d = work - (tok_i - 1) * y_dim
+        acc = np.float32(0.0)
+
+        for tok_j in range(tok_i):
+            pair = tok_i * (tok_i - 1) // 2 + tok_j
+            pe_pos = tok_i - tok_j
+            for t in range(N_T):
+                j = (v_j[pair, t] << pd) | pe_j[pe_pos, t]
+                acc += VS[v_trees[t], j, d]
+
+        y[tok_i, d] += acc
 
 @njit(parallel=True)
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
@@ -1408,7 +1540,11 @@ def build_Model(m, args):
             m.head[l][h].Positional_encoding[:] = random_vector(
                 args.context_size * N_T * POSITIONAL_DIM, 1.0
             ).reshape(args.context_size, N_T, POSITIONAL_DIM)
-            if getattr(args, 'soft_attention', False):
+            if getattr(args, 'new_attention', False):
+                build_LUT(m.head[l][h].Q, N_C, EMBEDDING_DIM, args)
+                build_LUT(m.head[l][h].K, N_C, EMBEDDING_DIM, args)
+                build_LUT(m.head[l][h].V, N_C + POSITIONAL_DIM, EMBEDDING_DIM, args)
+            elif getattr(args, 'soft_attention', False):
                 build_LUT(m.head[l][h].Score, N_C + N_C + POSITIONAL_DIM, 1, args)
                 build_LUT(m.head[l][h].Value, N_C, EMBEDDING_DIM, args)
             else:
@@ -1434,7 +1570,11 @@ def save_model(m, path, args):
         _lut_save(d, f'ffn_{l}', m.FFN[l])
         for h in range(args.num_heads):
             d[f'pe_{l}_{h}'] = m.head[l][h].Positional_encoding
-            if getattr(args, 'soft_attention', False):
+            if getattr(args, 'new_attention', False):
+                _lut_save(d, f'head_{l}_{h}_Q', m.head[l][h].Q)
+                _lut_save(d, f'head_{l}_{h}_K', m.head[l][h].K)
+                _lut_save(d, f'head_{l}_{h}_V', m.head[l][h].V)
+            elif getattr(args, 'soft_attention', False):
                 _lut_save(d, f'head_{l}_{h}_Score', m.head[l][h].Score)
                 _lut_save(d, f'head_{l}_{h}_Value', m.head[l][h].Value)
             else:
@@ -1459,7 +1599,11 @@ def load_model(m, path, args):
         _lut_load(d, f'ffn_{l}', m.FFN[l])
         for h in range(args.num_heads):
             m.head[l][h].Positional_encoding[:] = d[f'pe_{l}_{h}']
-            if getattr(args, 'soft_attention', False):
+            if getattr(args, 'new_attention', False):
+                _lut_load(d, f'head_{l}_{h}_Q', m.head[l][h].Q)
+                _lut_load(d, f'head_{l}_{h}_K', m.head[l][h].K)
+                _lut_load(d, f'head_{l}_{h}_V', m.head[l][h].V)
+            elif getattr(args, 'soft_attention', False):
                 _lut_load(d, f'head_{l}_{h}_Score', m.head[l][h].Score)
                 _lut_load(d, f'head_{l}_{h}_Value', m.head[l][h].Value)
             else:
@@ -1477,6 +1621,52 @@ def load_model(m, path, args):
     d.close()
     print(f"Loaded model weights from {path}")
 
+
+def new_attention_forward(head, x, y, args):
+    CS = args.context_size
+    lutV = head.V
+    lutQ = head.Q
+    lutK = head.K
+    treesV = lutV.trees
+    treesQ = lutQ.trees
+    treesK = lutK.trees
+    y_dim = lutV.y_dim
+
+    cache_index_batch(lutQ, x, head._q_j, head._q_r_min, head._q_u_min)
+    cache_index_batch(lutK, x, head._k_j, head._k_r_min, head._k_u_min)
+    cache_PE_index_batch(head.Positional_encoding, head._pe_j, head._pe_r_min, head._pe_u_min, args)
+
+    if (HAS_NUMBA and lutV.S.dtype == np.float32
+            and lutQ.S.dtype == np.float32
+            and lutK.S.dtype == np.float32):
+        _new_attention_forward_kernel(
+            lutQ.S, lutK.S, lutV.S,
+            head._q_j, head._k_j, head._pe_j,
+            head._qk_embed,
+            head._v_j, head._v_r_min, head._v_u_min,
+            y,
+            treesQ, treesK, treesV,
+            lutV.a_arr, lutV.b_arr, lutV.bitmasks,
+            args.positional_dim, CS, args.n_t, args.n_c, y_dim
+        )
+    else:
+        attention_embed_qk = head._qk_embed
+        for tok_i in range(1, CS):
+            for tok_j in range(tok_i):
+                jQ = head._q_j[tok_i]
+                jK = head._k_j[tok_j]
+                query = _f32(lutQ.S[treesQ, jQ]).sum(axis=0)
+                key = _f32(lutK.S[treesK, jK]).sum(axis=0)
+                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                attention_embed_qk[pair_idx] = query + key
+        cache_index_batch(lutV, attention_embed_qk, head._v_j, head._v_r_min, head._v_u_min)
+
+        for tok_i in range(1, CS):
+            for tok_j in range(tok_i):
+                jPE = head._pe_j[tok_i - tok_j]
+                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                jV = CONCATENATE_QK_PE(head._v_j[pair_idx], jPE, args)
+                y[tok_i, :y_dim] += _f32(lutV.S[treesV, jV]).sum(axis=0)
 
 def attention_forward(head, x, y, args):
     CS = args.context_size
@@ -1814,7 +2004,10 @@ def model_forward(m, args, training=True):
 
         z_pre_attn = m.z.copy() if (dr > 0.0 and training) else None
         for h in range(NUM_HEADS):
-            attention_forward(m.head[l][h], m._x_buf, m.z, args)
+            if getattr(args, 'new_attention', False):
+                new_attention_forward(m.head[l][h], m._x_buf, m.z, args)
+            else:
+                attention_forward(m.head[l][h], m._x_buf, m.z, args)
         if dr > 0.0 and training:
             mask = (np.random.rand(*m.z.shape) >= dr).astype(np.float32) / (1.0 - dr)
             m._drop_attn_mask[l] = mask
@@ -2475,6 +2668,8 @@ def main():
                         help='Whether to run the POS tagging task instead of language modeling')
     parser.add_argument('--pos-cache-dir', type=str, default='.pos_cache',
                         help='Directory for cached POS encodings used by --POS-task')
+    parser.add_argument('--new-attention', action='store_true',
+                        help='Use new attention implementation (default: off)')
     args = parser.parse_args()
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
@@ -2556,6 +2751,7 @@ def main():
     print(f"  wandb_log_interval = {args.wandb_log_interval}")
     print(f"  POS_task          = {args.POS_task}")
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
+    print(f"  new_attention     = {args.new_attention}")
     print("=" * 50)
 
     wandb_run = None
