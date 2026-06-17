@@ -1,0 +1,215 @@
+Ambiguous POS examples
+
+book
+  I read a book.
+    expected: NOUN    predicted: NOUN  OK
+  Book a flight.
+    expected: VERB    predicted: PROPN MISS
+
+can
+  I can swim.
+    expected: AUX     predicted: AUX   OK
+  Open the can.
+    expected: NOUN    predicted: AUX   MISS
+
+like
+  I like it.
+    expected: VERB    predicted: VERB  OK
+  It looks like gold.
+    expected: ADP     predicted: ADP   OK
+
+back
+  My back hurts.
+    expected: NOUN    predicted: NOUN  OK
+  Go back home.
+    expected: ADV     predicted: ADV   OK
+
+light
+  Turn on the light.
+    expected: NOUN    predicted: ADJ   MISS
+  This bag is light.
+    expected: ADJ     predicted: ADJ   OK
+
+well
+  She did well.
+    expected: ADV     predicted: ADV   OK
+  The well is dry.
+    expected: NOUN    predicted: NOUN  OK
+
+round
+  A round table.
+    expected: ADJ     predicted: NOUN  MISS
+  We walked round the lake.
+    expected: ADP     predicted: ADV   MISS
+
+right
+  The right answer.
+    expected: ADJ     predicted: NOUN  MISS
+  Turn right.
+    expected: ADV     predicted: NOUN  MISS
+
+close
+  Close the door.
+    expected: VERB    predicted: ADJ   MISS
+  A close friend.
+    expected: ADJ     predicted: ADJ   OK
+
+that
+  I know that.
+    expected: PRON    predicted: SCONJ MISS
+  I know that he left.
+    expected: SCONJ   predicted: SCONJ OK
+
+work
+  I have a lot of work.
+    expected: NOUN    predicted: NOUN  OK
+  They work hard.
+    expected: VERB    predicted: VERB  OK
+
+run
+  I went for a run.
+    expected: NOUN    predicted: NOUN  OK
+  They run daily.
+    expected: VERB    predicted: VERB  OK
+
+watch
+  My watch broke.
+    expected: NOUN    predicted: NOUN  OK
+  Watch the road.
+    expected: VERB    predicted: PROPN MISS
+
+drink
+  I need a drink.
+    expected: NOUN    predicted: NOUN  OK
+  They drink water.
+    expected: VERB    predicted: VERB  OK
+
+clean
+  The room is clean.
+    expected: ADJ     predicted: ADJ   OK
+  Clean the room.
+    expected: VERB    predicted: PROPN MISS
+
+fast
+  A fast car.
+    expected: ADJ     predicted: ADJ   OK
+  He runs fast.
+    expected: ADV     predicted: ADV   OK
+
+hard
+  A hard problem.
+    expected: ADJ     predicted: ADJ   OK
+  She works hard.
+    expected: ADV     predicted: ADV   OK
+
+left
+  Turn left.
+    expected: ADV     predicted: VERB  MISS
+  The left side.
+    expected: ADJ     predicted: ADJ   OK
+
+past
+  The past matters.
+    expected: NOUN    predicted: NOUN  OK
+  We walked past him.
+    expected: ADP     predicted: ADP   OK
+
+above
+  The text above is useful.
+    expected: ADV     predicted: ADP   MISS
+  The lamp is above the table.
+    expected: ADP     predicted: ADP   OK
+
+inside
+  Come inside.
+    expected: ADV     predicted: ADP   MISS
+  The keys are inside the drawer.
+    expected: ADP     predicted: ADP   OK
+
+near
+  We live near campus.
+    expected: ADP     predicted: ADP   OK
+  The deadline is near.
+    expected: ADJ     predicted: ADP   MISS
+
+only
+  The only problem is time.
+    expected: ADJ     predicted: ADJ   OK
+  I only asked once.
+    expected: ADV     predicted: ADV   OK
+
+early
+  An early train.
+    expected: ADJ     predicted: ADJ   OK
+  We arrived early.
+    expected: ADV     predicted: ADV   OK
+
+daily
+  A daily newspaper.
+    expected: ADJ     predicted: ADJ   OK
+  I exercise daily.
+    expected: ADV     predicted: ADJ   MISS
+
+better
+  A better option.
+    expected: ADJ     predicted: ADJ   OK
+  She sings better now.
+    expected: ADV     predicted: ADJ   MISS
+
+enough
+  We have enough food.
+    expected: DET     predicted: ADJ   MISS
+  That is good enough.
+    expected: ADV     predicted: ADV   OK
+
+all
+  All students passed.
+    expected: DET     predicted: DET   OK
+  They gave it their all.
+    expected: NOUN    predicted: DET   MISS
+
+some
+  Some people left.
+    expected: DET     predicted: DET   OK
+  I bought some.
+    expected: PRON    predicted: DET   MISS
+
+one
+  One person came.
+    expected: NUM     predicted: NUM   OK
+  This is the one.
+    expected: PRON    predicted: NOUN  MISS
+
+mine
+  This is mine.
+    expected: PRON    predicted: PRON  OK
+  They work in a mine.
+    expected: NOUN    predicted: NOUN  OK
+
+second
+  The second answer is right.
+    expected: ADJ/NUM predicted: ADJ   OK
+  I second the proposal.
+    expected: VERB    predicted: ADJ   MISS
+
+last
+  The last page.
+    expected: ADJ     predicted: ADJ   OK
+  It will last forever.
+    expected: VERB    predicted: VERB  OK
+
+present
+  The present situation.
+    expected: ADJ     predicted: ADJ   OK
+  I will present the paper.
+    expected: VERB    predicted: VERB  OK
+
+object
+  I saw the object.
+    expected: NOUN    predicted: NOUN  OK
+  I object to that.
+    expected: VERB    predicted: VERB  OK
+
+Summary: 48/70 correct (68.6%)
+At-least-one-correct words: 33/35 words; sentence accuracy within those words: 48/66 (72.7%)
+Both-correct among at-least-one words: 15/33 words (45.5%)

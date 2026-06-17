@@ -46,6 +46,20 @@ def plot_table_rows(ax, counts, title, use_line=False):
     ax.set_xlim(1, counts.shape[0])
 
 
+def lut_group(name):
+    if name.startswith("ffn_"):
+        return "ffn"
+    if name.startswith("head_"):
+        return "attention"
+    return "other"
+
+
+def sample_table_indices(n_tables, sample_size, rng):
+    if sample_size is None or sample_size < 1 or sample_size >= n_tables:
+        return np.arange(n_tables, dtype=np.int32)
+    return np.sort(rng.choice(n_tables, size=sample_size, replace=False).astype(np.int32))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot LUT row index vs number of updates from raw stats .npz."
@@ -56,7 +70,15 @@ def main():
     parser.add_argument("--line", action="store_true",
                         help="Use a line plot instead of bars")
     parser.add_argument("--overlay-tables", action="store_true",
-                        help="Plot all tables for a LUT on one axis instead of one subplot per table")
+                        help="Plot sampled tables for a LUT on one axis instead of one subplot per table")
+    parser.add_argument("--ffn-tables", type=int, default=3,
+                        help="Random FFN tables to plot per FFN LUT (default: 3; 0 = all)")
+    parser.add_argument("--attention-tables", type=int, default=3,
+                        help="Random attention tables to plot per attention LUT (default: 3; 0 = all)")
+    parser.add_argument("--sample-seed", type=int, default=0,
+                        help="Seed for random table sampling (default: 0)")
+    parser.add_argument("--include-other-luts", action="store_true",
+                        help="Also plot non-FFN/non-attention LUTs, such as output heads")
     parser.add_argument("--show", action="store_true",
                         help="Open interactive plot windows instead of only writing PNG files")
     args = parser.parse_args()
@@ -87,6 +109,10 @@ def main():
               file=sys.stderr)
         return 1
 
+    rng = np.random.default_rng(args.sample_seed)
+    ffn_sample = None if args.ffn_tables == 0 else args.ffn_tables
+    attention_sample = None if args.attention_tables == 0 else args.attention_tables
+
     written = []
     for lut_name in sorted(stats):
         counts = stats[lut_name]
@@ -95,27 +121,41 @@ def main():
                   file=sys.stderr)
             continue
 
+        group = lut_group(lut_name)
+        if group == "other" and not args.include_other_luts:
+            continue
+
         n_tables, n_rows = counts.shape
         rows = np.arange(1, n_rows + 1)
+        if group == "ffn":
+            selected_tables = sample_table_indices(n_tables, ffn_sample, rng)
+        elif group == "attention":
+            selected_tables = sample_table_indices(n_tables, attention_sample, rng)
+        else:
+            selected_tables = np.arange(n_tables, dtype=np.int32)
+
+        if selected_tables.size == 0:
+            continue
 
         if args.overlay_tables:
             fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-            for table_idx in range(n_tables):
+            for table_idx in selected_tables:
                 if args.line:
                     ax.plot(rows, counts[table_idx], linewidth=1.0,
                             label=f"table {table_idx}")
                 else:
                     ax.bar(rows, counts[table_idx], width=1.0, alpha=0.35,
                            label=f"table {table_idx}")
-            ax.set_title(f"{lut_name}: updates per row")
+            ax.set_title(f"{lut_name}: sampled updates per row")
             ax.set_xlabel("row")
             ax.set_ylabel("updates")
             ax.set_xlim(1, n_rows)
             ax.legend(loc="best")
         else:
-            fig, axes = plt.subplots(n_tables, 1, figsize=(12, max(3, 2.5 * n_tables)),
+            fig, axes = plt.subplots(selected_tables.size, 1,
+                                     figsize=(12, max(3, 2.5 * selected_tables.size)),
                                      squeeze=False, sharex=True)
-            for table_idx, ax in enumerate(axes[:, 0]):
+            for table_idx, ax in zip(selected_tables, axes[:, 0]):
                 plot_table_rows(ax, counts[table_idx],
                                 f"{lut_name} table {table_idx}: updates per row",
                                 use_line=args.line)
@@ -124,6 +164,7 @@ def main():
         output_path = out_dir / f"{_safe_filename(lut_name)}.png"
         fig.savefig(output_path, dpi=150)
         written.append(output_path)
+        print(f"{lut_name}: plotted tables {', '.join(str(int(i)) for i in selected_tables)}")
         if args.show:
             plt.show()
         plt.close(fig)
