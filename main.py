@@ -33,6 +33,8 @@ except ImportError:
 
 # Global learning rate (updated each step)
 learning_rate = 0.0
+UNK_TOKEN_ID = 0
+IGNORE_INDEX = -1
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +289,22 @@ class StandardOutputHead:
                     lut.S[trees, j_bins] -= learning_rate * self.output[pos, :lut.y_dim]
 
     def compute_gradients(self, args):
-        if HAS_NUMBA:
-            _softmax_cross_entropy_kernel(self.output, self.tokens[1:args.context_size + 1],
-                                          args.context_size, args.vocab_size_output)
-        else:
-            x = self.output
-            x -= x.max(axis=1, keepdims=True)
-            np.exp(x, out=x)
-            x /= x.sum(axis=1, keepdims=True)
-            x[np.arange(args.context_size), self.tokens[1:args.context_size + 1]] -= 1.0
+        CS = args.context_size
+        targets = self.tokens[:CS] if args.POS_task else self.tokens[1:CS + 1]
+        valid = targets != IGNORE_INDEX
+        if HAS_NUMBA and valid.all():
+            _softmax_cross_entropy_kernel(self.output, targets,
+                                          CS, args.vocab_size_output)
+            return
+
+        x = self.output
+        x -= x.max(axis=1, keepdims=True)
+        np.exp(x, out=x)
+        x /= x.sum(axis=1, keepdims=True)
+        x[~valid] = 0.0
+        if valid.any():
+            rows = np.nonzero(valid)[0]
+            x[rows, targets[valid]] -= 1.0
 
     def sample_token(self, args):
         VOCAB_SIZE = args.vocab_size_output
@@ -303,26 +312,61 @@ class StandardOutputHead:
         return sample(self.output[args.context_size - 1], VOCAB_SIZE)
 
     def training_loss(self, args):
-        """Mean cross-entropy over all context positions from raw logits."""
         CS = args.context_size
         x = self.output[:CS]
-        targets = self.tokens[1:CS + 1]
-        x_max = x.max(axis=1)
-        log_sum_exp = x_max + np.log(np.exp(x - x_max[:, None]).sum(axis=1))
-        return float((log_sum_exp - x[np.arange(CS), targets]).mean())
+        targets = self.tokens[:CS] if args.POS_task else self.tokens[1:CS + 1]
+        valid = targets != IGNORE_INDEX
+        if not valid.any():
+            return 0.0
+        x_valid = x[valid]
+        targets_valid = targets[valid]
+        x_max = x_valid.max(axis=1)
+        log_sum_exp = x_max + np.log(np.exp(x_valid - x_max[:, None]).sum(axis=1))
+        return float((log_sum_exp - x_valid[np.arange(len(targets_valid)), targets_valid]).mean())
 
     def validation_loss(self, args):
+        if args.POS_task:
+            return self.validation_loss_all_positions(args)
         last = args.context_size - 1
+        target = int(self.tokens[args.context_size])
+        if target == IGNORE_INDEX:
+            return None
         softmax(self.output[last], args.vocab_size_output, 1.0)
-        target = self.tokens[args.context_size]
         prob = max(self.output[last][target], 1e-30)
         return -math.log(prob)
 
     def validation_accuracy(self, args):
+        if args.POS_task:
+            return self.validation_accuracy_all_positions(args)
         last = args.context_size - 1
-        pred = int(np.argmax(self.output[last]))
         target = int(self.tokens[args.context_size])
+        if target == IGNORE_INDEX:
+            return None
+        pred = int(np.argmax(self.output[last]))
         return 1.0 if pred == target else 0.0
+
+    def validation_loss_all_positions(self, args):
+        CS = args.context_size
+        targets = self.tokens[:CS]
+        valid = targets != IGNORE_INDEX
+        if not valid.any():
+            return None
+        x = self.output[:CS][valid]
+        targets = targets[valid]
+        x_max = x.max(axis=1)
+        log_sum_exp = x_max + np.log(np.exp(x - x_max[:, None]).sum(axis=1))
+        losses = log_sum_exp - x[np.arange(len(targets)), targets]
+        return float(losses.sum()), int(len(targets))
+
+    def validation_accuracy_all_positions(self, args):
+        CS = args.context_size
+        targets = self.tokens[:CS]
+        valid = targets != IGNORE_INDEX
+        if not valid.any():
+            return None
+        preds = np.argmax(self.output[:CS], axis=1)
+        correct = int((preds[valid] == targets[valid]).sum())
+        return correct, int(valid.sum())
 
 
 class FactoredOutputHead:
@@ -2222,6 +2266,9 @@ def load_snippet(m, data_array, char_start, args, target_array=None):
         target_array = m.tokens
     else:
         target_array = target_array[char_start:char_start + CS + 1]
+    if args.POS_task:
+        target_array = np.array(target_array, copy=True)
+        target_array[m.tokens[:CS + 1] == UNK_TOKEN_ID] = IGNORE_INDEX
     m.output_head.load_targets(target_array, CS)
 
 
@@ -2236,16 +2283,17 @@ def model_pos_response(m, prompt_text, response_length, args,
     sys.stdout.write(prompt_text[:80])
 
     if data_array is not None and start_idx is not None and target_array is not None:
-        max_response = min(response_length, len(target_array) - start_idx - args.context_size)
-        preds = []
-        targets = []
-        for i in range(max_response):
-            load_snippet(m, data_array, start_idx + i, args, target_array)
-            model_forward(m, args, training=False)
-            preds.append(int(np.argmax(m.output_head.output[args.context_size - 1])))
-            targets.append(int(m.output_head.tokens[args.context_size]))
+        max_response = min(response_length, args.context_size, len(target_array) - start_idx)
+        load_snippet(m, data_array, start_idx, args, target_array)
+        model_forward(m, args, training=False)
+        preds = np.argmax(m.output_head.output[:max_response], axis=1).astype(int).tolist()
+        targets = [int(t) for t in m.output_head.tokens[:max_response]]
+        target_labels = [
+            POS_LABELS[t] if 0 <= t < len(POS_LABELS) else "IGN"
+            for t in targets
+        ]
         sys.stdout.write("\nPOS pred:   " + enc.decode_pos(preds))
-        sys.stdout.write("\nPOS target: " + enc.decode_pos(targets))
+        sys.stdout.write("\nPOS target: " + " ".join(target_labels))
         sys.stdout.flush()
         return
 
@@ -2413,6 +2461,8 @@ def main():
                         help='Weights & Biases project name (default: lut)')
     parser.add_argument('--wandb-run-name', type=str, default=None,
                         help='Optional Weights & Biases run name')
+    parser.add_argument('--wandb-group', type=str, default=None,
+                        help='Optional Weights & Biases group name')
     parser.add_argument('--wandb-entity', type=str, default=None,
                         help='Optional Weights & Biases entity/team')
     parser.add_argument('--wandb-tags', nargs='*', default=None,
@@ -2499,6 +2549,7 @@ def main():
     print(f"  wandb             = {args.wandb}")
     print(f"  wandb_project     = {args.wandb_project}")
     print(f"  wandb_run_name    = {args.wandb_run_name}")
+    print(f"  wandb_group       = {args.wandb_group}")
     print(f"  wandb_entity      = {args.wandb_entity}")
     print(f"  wandb_tags        = {args.wandb_tags}")
     print(f"  wandb_mode        = {args.wandb_mode}")
@@ -2523,6 +2574,7 @@ def main():
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
+            group=args.wandb_group,
             entity=args.wandb_entity,
             tags=args.wandb_tags,
             mode=args.wandb_mode,
@@ -2607,14 +2659,30 @@ def main():
 
             validation_loss = 0.0
             validation_accuracy = 0.0
+            validation_count = 0
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args,
                              training.val_pos_data if args.POS_task else None)
                 model_forward(m, args, training=False)
-                validation_accuracy += m.output_head.validation_accuracy(args)
-                validation_loss += m.output_head.validation_loss(args)
-            validation_loss /= args.testing_length
-            validation_accuracy /= args.testing_length
+                sample_accuracy = m.output_head.validation_accuracy(args)
+                sample_loss = m.output_head.validation_loss(args)
+                if sample_loss is not None:
+                    if args.POS_task:
+                        loss_sum, loss_count = sample_loss
+                        correct_count, accuracy_count = sample_accuracy
+                        validation_accuracy += correct_count
+                        validation_loss += loss_sum
+                        validation_count += loss_count
+                    else:
+                        validation_accuracy += sample_accuracy
+                        validation_loss += sample_loss
+                        validation_count += 1
+            if validation_count > 0:
+                validation_loss /= validation_count
+                validation_accuracy /= validation_count
+            else:
+                validation_loss = float('nan')
+                validation_accuracy = float('nan')
 
             perplexity = math.exp(validation_loss)
             last_ppl = perplexity
