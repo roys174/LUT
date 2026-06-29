@@ -50,6 +50,8 @@ def lut_group(name):
     if name.startswith("ffn_"):
         return "ffn"
     if name.startswith("head_"):
+        if name.endswith(("_Q", "_K", "_V", "_Final")):
+            return "new_attention"
         return "attention"
     return "other"
 
@@ -75,6 +77,8 @@ def main():
                         help="Random FFN tables to plot per FFN LUT (default: 3; 0 = all)")
     parser.add_argument("--attention-tables", type=int, default=3,
                         help="Random attention tables to plot per attention LUT (default: 3; 0 = all)")
+    parser.add_argument("--new-attention-tables", type=int, default=3,
+                        help="Random new-attention Q/K/V/Final tables to plot per LUT (default: 3; 0 = all)")
     parser.add_argument("--sample-seed", type=int, default=0,
                         help="Seed for random table sampling (default: 0)")
     parser.add_argument("--include-other-luts", action="store_true",
@@ -112,6 +116,7 @@ def main():
     rng = np.random.default_rng(args.sample_seed)
     ffn_sample = None if args.ffn_tables == 0 else args.ffn_tables
     attention_sample = None if args.attention_tables == 0 else args.attention_tables
+    new_attention_sample = None if args.new_attention_tables == 0 else args.new_attention_tables
 
     written = []
     for lut_name in sorted(stats):
@@ -131,6 +136,8 @@ def main():
             selected_tables = sample_table_indices(n_tables, ffn_sample, rng)
         elif group == "attention":
             selected_tables = sample_table_indices(n_tables, attention_sample, rng)
+        elif group == "new_attention":
+            selected_tables = sample_table_indices(n_tables, new_attention_sample, rng)
         else:
             selected_tables = np.arange(n_tables, dtype=np.int32)
 
