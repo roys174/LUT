@@ -192,6 +192,7 @@ class NewAttentionHead:
                  'Q', '_q_j', '_q_r_min', '_q_u_min',
                  'K', '_k_j', '_k_r_min', '_k_u_min',
                  '_q_embed', '_k_embed', '_v_embed', '_qk_embed',
+                 '_q_grad', '_k_grad', '_v_grad', '_pe_grad',
                  '_qkpe_j', '_qkpe_r_min', '_qkpe_u_min',
                  '_final_v_j', '_final_v_r_min', '_final_v_u_min',
                  '_qkpe_a_arr', '_qkpe_b_arr', '_qkpe_bitmasks',
@@ -215,6 +216,10 @@ class NewAttentionHead:
         self._k_embed = np.zeros((CS, QD), dtype=np.float32)
         self._v_embed = np.zeros((CS, ED), dtype=np.float32)
         self._qk_embed = np.zeros((n_pairs, QD), dtype=np.float32)
+        self._q_grad = np.zeros((CS, QD), dtype=np.float32)
+        self._k_grad = np.zeros((CS, QD), dtype=np.float32)
+        self._v_grad = np.zeros((CS, ED), dtype=np.float32)
+        self._pe_grad = np.zeros((CS, QD), dtype=np.float32)
         self._q_j = np.zeros((CS, Q_N_T), dtype=np.int32)
         self._q_r_min = np.zeros((CS, Q_N_T), dtype=np.int32)
         self._q_u_min = np.zeros((CS, Q_N_T), dtype=np.float32)
@@ -648,6 +653,7 @@ class SparseGradAccumulator:
     """
     __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads',
                  'attn_score_grads', 'attn_val_grads',
+                 'new_attn_q_grads', 'new_attn_k_grads', 'new_attn_v_grads',
                  'ln_attn_dgamma', 'ln_attn_dbeta', 'ln_ffn_dgamma', 'ln_ffn_dbeta']
 
     def __init__(self, args):
@@ -657,18 +663,34 @@ class SparseGradAccumulator:
         NT = args.n_t
         PD = args.positional_dim
         ED = args.embedding_dim
+        QD = getattr(args, 'attn_qk_dim', ED)
         self.ffn_y_grads = [None] * NL      # filled during backward
         self.attn_y_grads = [None] * NL     # filled during backward
-        self.pe_grads = [[np.zeros((CS, NT, PD), dtype=np.float32)
-                          for _ in range(NH)] for _ in range(NL)]
-        if getattr(args, 'soft_attention', False):
-            self.attn_score_grads = [[np.zeros((CS, CS), dtype=np.float32)
+        if getattr(args, 'new_attention', False):
+            self.pe_grads = [[np.zeros((CS, QD), dtype=np.float32)
+                              for _ in range(NH)] for _ in range(NL)]
+            self.new_attn_q_grads = [[np.zeros((CS, QD), dtype=np.float32)
                                       for _ in range(NH)] for _ in range(NL)]
-            self.attn_val_grads   = [[np.zeros((CS, ED), dtype=np.float32)
+            self.new_attn_k_grads = [[np.zeros((CS, QD), dtype=np.float32)
                                       for _ in range(NH)] for _ in range(NL)]
-        else:
+            self.new_attn_v_grads = [[np.zeros((CS, ED), dtype=np.float32)
+                                      for _ in range(NH)] for _ in range(NL)]
             self.attn_score_grads = None
-            self.attn_val_grads   = None
+            self.attn_val_grads = None
+        else:
+            self.pe_grads = [[np.zeros((CS, NT, PD), dtype=np.float32)
+                              for _ in range(NH)] for _ in range(NL)]
+            self.new_attn_q_grads = None
+            self.new_attn_k_grads = None
+            self.new_attn_v_grads = None
+            if getattr(args, 'soft_attention', False):
+                self.attn_score_grads = [[np.zeros((CS, CS), dtype=np.float32)
+                                          for _ in range(NH)] for _ in range(NL)]
+                self.attn_val_grads   = [[np.zeros((CS, ED), dtype=np.float32)
+                                          for _ in range(NH)] for _ in range(NL)]
+            else:
+                self.attn_score_grads = None
+                self.attn_val_grads   = None
         self.ln_attn_dgamma = np.zeros((NL, ED), dtype=np.float32)
         self.ln_attn_dbeta  = np.zeros((NL, ED), dtype=np.float32)
         self.ln_ffn_dgamma  = np.zeros((NL, ED), dtype=np.float32)
@@ -686,6 +708,11 @@ class SparseGradAccumulator:
             for layer in self.attn_val_grads:
                 for g in layer:
                     g[:] = 0
+        if self.new_attn_q_grads is not None:
+            for grads in (self.new_attn_q_grads, self.new_attn_k_grads, self.new_attn_v_grads):
+                for layer in grads:
+                    for g in layer:
+                        g[:] = 0
         for layer in self.pe_grads:
             for g in layer:
                 g[:] = 0
@@ -1008,6 +1035,115 @@ def _new_attention_forward_kernel(
                 acc += FS[final_trees[t], j, d]
 
         y[tok_i, d] += acc
+
+@njit(parallel=True)
+def _new_attention_final_backward_kernel(
+    FS,
+    final_v_j, final_v_r_min, final_v_u_min,
+    qkpe_j, qkpe_r_min, qkpe_u_min,
+    y_grad,
+    q_grad, k_grad, v_grad, pe_grad,
+    final_trees,
+    final_v_a_arr, final_v_b_arr,
+    qkpe_a_arr, qkpe_b_arr,
+    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update
+):
+    """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
+    n_pairs = CS * (CS - 1) // 2
+    n_threads = get_num_threads()
+    q_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
+    k_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
+    v_grad_thr = np.zeros((n_threads, CS, y_dim), dtype=np.float32)
+    pe_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
+
+    # Phase 1: compute embedding-space gradients from fragile final bits.
+    for work in prange(n_pairs * N_T):
+        tid = get_thread_id()
+        pair = work // N_T
+        t = work - pair * N_T
+        tok_i = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+        tok_j = pair - (tok_i * (tok_i - 1)) // 2
+        pe_pos = tok_i - tok_j
+        tree = final_trees[t]
+        j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+
+        r_v = final_v_r_min[tok_j, t]
+        jbar_v = j_bin ^ (1 << (r_v + pd))
+        gi_v = np.float32(0.0)
+        for d in range(y_dim):
+            gi_v += (FS[tree, jbar_v, d] - FS[tree, j_bin, d]) * y_grad[tok_i, d]
+        u_v = final_v_u_min[tok_j, t]
+        sign_v = np.float32(1.0) if u_v > np.float32(0.0) else np.float32(-1.0)
+        delta_v = gi_v * (np.float32(-0.5) * sign_v / (np.float32(1.0) + abs(u_v)) ** 2)
+        a_v = final_v_a_arr[t, r_v]
+        b_v = final_v_b_arr[t, r_v]
+        v_grad_thr[tid, tok_j, a_v] += delta_v
+        v_grad_thr[tid, tok_j, b_v] -= delta_v
+
+        r_qkpe = qkpe_r_min[pair, t]
+        jbar_qkpe = j_bin ^ (1 << r_qkpe)
+        gi_qkpe = np.float32(0.0)
+        for d in range(y_dim):
+            gi_qkpe += (FS[tree, jbar_qkpe, d] - FS[tree, j_bin, d]) * y_grad[tok_i, d]
+        u_qkpe = qkpe_u_min[pair, t]
+        sign_qkpe = np.float32(1.0) if u_qkpe > np.float32(0.0) else np.float32(-1.0)
+        delta_qkpe = gi_qkpe * (np.float32(-0.5) * sign_qkpe / (np.float32(1.0) + abs(u_qkpe)) ** 2)
+        a_qkpe = qkpe_a_arr[t, r_qkpe]
+        b_qkpe = qkpe_b_arr[t, r_qkpe]
+        q_grad_thr[tid, tok_i, a_qkpe] += delta_qkpe
+        q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
+        k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
+        k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
+        pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
+        pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
+
+    # Phase 2: reduce thread-local gradients.
+    for work in prange(CS * q_dim):
+        pos = work // q_dim
+        d = work - pos * q_dim
+        q_total = np.float32(0.0)
+        k_total = np.float32(0.0)
+        pe_total = np.float32(0.0)
+        for thr in range(n_threads):
+            q_total += q_grad_thr[thr, pos, d]
+            k_total += k_grad_thr[thr, pos, d]
+            pe_total += pe_grad_thr[thr, pos, d]
+        q_grad[pos, d] += q_total
+        k_grad[pos, d] += k_total
+        pe_grad[pos, d] += pe_total
+
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
+        total = np.float32(0.0)
+        for thr in range(n_threads):
+            total += v_grad_thr[thr, pos, d]
+        v_grad[pos, d] += total
+
+    # Phase 3: update Final.S after all gradients read the original rows.
+    if not skip_s_update:
+        for t in prange(N_T):
+            tree = final_trees[t]
+            for tok_i in range(1, CS):
+                for tok_j in range(tok_i):
+                    pair = tok_i * (tok_i - 1) // 2 + tok_j
+                    j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+                    for d in range(y_dim):
+                        FS[tree, j_bin, d] -= lr * y_grad[tok_i, d]
+
+@njit(parallel=True, cache=True)
+def _new_attention_final_s_replay_kernel(FS, final_trees, final_v_j, qkpe_j,
+                                         y_grad, pd, CS, N_T, y_dim, scale):
+    """Replay Final.S updates for new attention from cached row halves."""
+    for t in prange(N_T):
+        tree = final_trees[t]
+        for tok_i in range(1, CS):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+                for d in range(y_dim):
+                    FS[tree, j_bin, d] -= scale * y_grad[tok_i, d]
+
 
 @njit(parallel=True)
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
@@ -1859,6 +1995,173 @@ def attention_forward(head, x, y, args):
             y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
+def _lut_backward_python(lut, j, r_min, u_min, grad, x_grad, y_dim, CS, N_T, skip_s_update):
+    """Python fallback for simple LUT backward with optional S update."""
+    global learning_rate
+    ED = x_grad.shape[1]
+    trees = lut.trees
+    for pos in range(CS):
+        for t in range(N_T):
+            tree = trees[t]
+            j_bin = int(j[pos, t])
+            r = int(r_min[pos, t])
+            jbar = j_bin ^ (1 << r)
+            gi = ((_f32(lut.S[tree, jbar, :y_dim]) - _f32(lut.S[tree, j_bin, :y_dim]))
+                  * grad[pos, :y_dim]).sum()
+            u = float(u_min[pos, t])
+            sign_u = 1.0 if u > 0.0 else -1.0
+            v = gi * (-0.5 * sign_u / (1.0 + abs(u)) ** 2)
+            x_grad[pos, lut.a_arr[t, r]] += v
+            x_grad[pos, lut.b_arr[t, r]] -= v
+            if not skip_s_update:
+                lut.S[tree, j_bin, :y_dim] -= learning_rate * grad[pos, :y_dim]
+
+
+def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
+                           pe_grad_out=None, q_grad_out=None, k_grad_out=None,
+                           v_grad_out=None, update_stats=None,
+                           stats_prefix='attention'):
+    global learning_rate
+    CS = args.context_size
+    N_T = args.n_t
+    Q_N_T = args.attn_qk_n_t
+    POSITIONAL_DIM = args.positional_dim
+    QD = args.attn_qk_dim
+    ED = args.embedding_dim
+
+    q_grad = q_grad_out if q_grad_out is not None else head._q_grad
+    k_grad = k_grad_out if k_grad_out is not None else head._k_grad
+    v_grad = v_grad_out if v_grad_out is not None else head._v_grad
+    pe_grad = pe_grad_out if pe_grad_out is not None else head._pe_grad
+    q_grad.fill(0.0)
+    k_grad.fill(0.0)
+    v_grad.fill(0.0)
+    pe_grad.fill(0.0)
+
+    lutQ = head.Q
+    lutK = head.K
+    lutV = head.V
+    lutFinal = head.Final
+    treesFinal = lutFinal.trees
+    y_dim = lutFinal.y_dim
+
+    if update_stats is not None and not skip_s_update:
+        update_stats.record_simple(f'{stats_prefix}_Q', lutQ, head._q_j)
+        update_stats.record_simple(f'{stats_prefix}_K', lutK, head._k_j)
+        update_stats.record_simple(f'{stats_prefix}_V', lutV, head._val_j)
+        for tok_i in range(1, CS):
+            rows = np.zeros((tok_i, N_T), dtype=np.int32)
+            for tok_j in range(tok_i):
+                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                rows[tok_j] = (head._final_v_j[tok_j] << POSITIONAL_DIM) | head._qkpe_j[pair_idx]
+            update_stats.record_rows(f'{stats_prefix}_Final', lutFinal,
+                                     np.broadcast_to(treesFinal, rows.shape), rows)
+
+    if (HAS_NUMBA and lutFinal.S.dtype == np.float32
+            and lutQ.S.dtype == np.float32
+            and lutK.S.dtype == np.float32
+            and lutV.S.dtype == np.float32):
+        _new_attention_final_backward_kernel(
+            lutFinal.S,
+            head._final_v_j, head._final_v_r_min, head._final_v_u_min,
+            head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
+            y_grad,
+            q_grad, k_grad, v_grad, pe_grad,
+            treesFinal,
+            lutFinal.a_arr, lutFinal.b_arr,
+            head._qkpe_a_arr, head._qkpe_b_arr,
+            POSITIONAL_DIM, CS, N_T, y_dim, QD,
+            np.float32(learning_rate), skip_s_update)
+    else:
+        for tok_i in range(1, CS):
+            y_g = y_grad[tok_i, :y_dim]
+            for tok_j in range(tok_i):
+                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                pe_pos = tok_i - tok_j
+                for t in range(N_T):
+                    tree = treesFinal[t]
+                    j_bin = (int(head._final_v_j[tok_j, t]) << POSITIONAL_DIM) | int(head._qkpe_j[pair_idx, t])
+                    S_j = _f32(lutFinal.S[tree, j_bin])
+
+                    r_v = int(head._final_v_r_min[tok_j, t])
+                    jbar_v = j_bin ^ (1 << (r_v + POSITIONAL_DIM))
+                    gi_v = ((_f32(lutFinal.S[tree, jbar_v]) - S_j) * y_g).sum()
+                    u_v = float(head._final_v_u_min[tok_j, t])
+                    sign_v = 1.0 if u_v > 0.0 else -1.0
+                    delta_v = gi_v * (-0.5 * sign_v / (1.0 + abs(u_v)) ** 2)
+                    a_v = int(lutFinal.a_arr[t, r_v])
+                    b_v = int(lutFinal.b_arr[t, r_v])
+                    v_grad[tok_j, a_v] += delta_v
+                    v_grad[tok_j, b_v] -= delta_v
+
+                    r_qkpe = int(head._qkpe_r_min[pair_idx, t])
+                    jbar_qkpe = j_bin ^ (1 << r_qkpe)
+                    gi_qkpe = ((_f32(lutFinal.S[tree, jbar_qkpe]) - S_j) * y_g).sum()
+                    u_qkpe = float(head._qkpe_u_min[pair_idx, t])
+                    sign_qkpe = 1.0 if u_qkpe > 0.0 else -1.0
+                    delta_qkpe = gi_qkpe * (-0.5 * sign_qkpe / (1.0 + abs(u_qkpe)) ** 2)
+                    a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
+                    b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
+                    q_grad[tok_i, a_qkpe] += delta_qkpe
+                    q_grad[tok_i, b_qkpe] -= delta_qkpe
+                    k_grad[tok_j, a_qkpe] += delta_qkpe
+                    k_grad[tok_j, b_qkpe] -= delta_qkpe
+                    pe_grad[pe_pos, a_qkpe] += delta_qkpe
+                    pe_grad[pe_pos, b_qkpe] -= delta_qkpe
+
+        if not skip_s_update:
+            for t in range(N_T):
+                tree = treesFinal[t]
+                for tok_i in range(1, CS):
+                    y_g = y_grad[tok_i, :y_dim]
+                    for tok_j in range(tok_i):
+                        pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                        j_bin = (int(head._final_v_j[tok_j, t]) << POSITIONAL_DIM) | int(head._qkpe_j[pair_idx, t])
+                        lutFinal.S[tree, j_bin] -= learning_rate * y_g
+
+    if pe_grad_out is None:
+        head.Positional_encoding -= learning_rate * pe_grad
+
+    if HAS_NUMBA and lutQ.S.dtype == np.float32:
+        if skip_s_update:
+            _lut_backward_kernel_noupdate(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
+                                          q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
+                                          QD, CS, Q_N_T)
+        else:
+            _lut_backward_kernel(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
+                                 q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
+                                 QD, CS, Q_N_T, np.float32(learning_rate))
+    else:
+        _lut_backward_python(lutQ, head._q_j, head._q_r_min, head._q_u_min,
+                             q_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+
+    if HAS_NUMBA and lutK.S.dtype == np.float32:
+        if skip_s_update:
+            _lut_backward_kernel_noupdate(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
+                                          k_grad, x_grad, lutK.a_arr, lutK.b_arr,
+                                          QD, CS, Q_N_T)
+        else:
+            _lut_backward_kernel(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
+                                 k_grad, x_grad, lutK.a_arr, lutK.b_arr,
+                                 QD, CS, Q_N_T, np.float32(learning_rate))
+    else:
+        _lut_backward_python(lutK, head._k_j, head._k_r_min, head._k_u_min,
+                             k_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+
+    if HAS_NUMBA and lutV.S.dtype == np.float32:
+        if skip_s_update:
+            _lut_backward_kernel_noupdate(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
+                                          v_grad, x_grad, lutV.a_arr, lutV.b_arr,
+                                          ED, CS, N_T)
+        else:
+            _lut_backward_kernel(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
+                                 v_grad, x_grad, lutV.a_arr, lutV.b_arr,
+                                 ED, CS, N_T, np.float32(learning_rate))
+    else:
+        _lut_backward_python(lutV, head._val_j, head._val_r_min, head._val_u_min,
+                             v_grad, x_grad, ED, CS, N_T, skip_s_update)
+
+
 def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None,
                        score_grad_out=None, val_grad_out=None, update_stats=None,
                        stats_prefix='attention'):
@@ -2248,11 +2551,25 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
         x_before_attn = x_grad.copy() if use_ln else None
 
         soft = getattr(args, 'soft_attention', False)
+        new_attn = getattr(args, 'new_attention', False)
         if grad_accum is not None and not soft:
-            # Save y_grad once per layer (shared across heads) for hard attention replay
+            # Save y_grad once per layer (shared across heads) for hard/new attention replay
             grad_accum.attn_y_grads[l] = y_grad.copy()
         for h in range(NUM_HEADS):
-            if grad_accum is not None:
+            if new_attn:
+                if grad_accum is not None:
+                    new_attention_backward(
+                        m.head[l][h], x_grad, y_grad, args,
+                        skip_s_update=True,
+                        pe_grad_out=grad_accum.pe_grads[l][h],
+                        q_grad_out=grad_accum.new_attn_q_grads[l][h],
+                        k_grad_out=grad_accum.new_attn_k_grads[l][h],
+                        v_grad_out=grad_accum.new_attn_v_grads[l][h])
+                else:
+                    new_attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                           update_stats=update_stats,
+                                           stats_prefix=f'head_{l}_{h}')
+            elif grad_accum is not None:
                 attention_backward(m.head[l][h], x_grad, y_grad, args,
                                    skip_s_update=True,
                                    pe_grad_out=grad_accum.pe_grads[l][h],
@@ -2333,6 +2650,60 @@ def _replay_attn_task(S, jV_list, jPE_list, ygrad_list, PE, pe_grad_list,
         PE -= scale * pe_grad
 
 
+def _replay_new_attn_task(head, q_j_list, k_j_list, val_j_list,
+                          final_v_j_list, qkpe_j_list, ygrad_list,
+                          q_grad_list, k_grad_list, v_grad_list,
+                          pe_grad_list, CS, N_T, Q_N_T, scale, use_numba):
+    """Replay new-attention Q/K/V/Final S updates and vector PE updates."""
+    q_lut = head.Q
+    k_lut = head.K
+    v_lut = head.V
+    final_lut = head.Final
+    y_dim = final_lut.y_dim
+
+    for q_j, k_j, val_j, final_v_j, qkpe_j, y_grad, q_grad, k_grad, v_grad in zip(
+            q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list,
+            ygrad_list, q_grad_list, k_grad_list, v_grad_list):
+        if use_numba and q_lut.S.dtype == np.float32:
+            _lut_s_replay_kernel(q_lut.S, q_lut.trees, q_j, q_grad,
+                                 q_lut.y_dim, CS, Q_N_T, scale)
+        else:
+            for pos in range(CS):
+                q_lut.S[q_lut.trees, q_j[pos]] -= scale * q_grad[pos, :q_lut.y_dim]
+
+        if use_numba and k_lut.S.dtype == np.float32:
+            _lut_s_replay_kernel(k_lut.S, k_lut.trees, k_j, k_grad,
+                                 k_lut.y_dim, CS, Q_N_T, scale)
+        else:
+            for pos in range(CS):
+                k_lut.S[k_lut.trees, k_j[pos]] -= scale * k_grad[pos, :k_lut.y_dim]
+
+        if use_numba and v_lut.S.dtype == np.float32:
+            _lut_s_replay_kernel(v_lut.S, v_lut.trees, val_j, v_grad,
+                                 v_lut.y_dim, CS, N_T, scale)
+        else:
+            for pos in range(CS):
+                v_lut.S[v_lut.trees, val_j[pos]] -= scale * v_grad[pos, :v_lut.y_dim]
+
+        if use_numba and final_lut.S.dtype == np.float32:
+            _new_attention_final_s_replay_kernel(final_lut.S, final_lut.trees,
+                                                 final_v_j, qkpe_j, y_grad,
+                                                 head._qkpe_bitmasks.shape[0],
+                                                 CS, N_T, y_dim, scale)
+        else:
+            for t in range(N_T):
+                tree = final_lut.trees[t]
+                for tok_i in range(1, CS):
+                    y_g = y_grad[tok_i, :y_dim]
+                    for tok_j in range(tok_i):
+                        pair = tok_i * (tok_i - 1) // 2 + tok_j
+                        j_bin = (int(final_v_j[tok_j, t]) << head._qkpe_bitmasks.shape[0]) | int(qkpe_j[pair, t])
+                        final_lut.S[tree, j_bin] -= scale * y_g
+
+    for pe_grad in pe_grad_list:
+        head.Positional_encoding -= scale * pe_grad
+
+
 def _replay_output_task(S, trees, j_list, output_list, y_dim, CS, N_T, scale, use_numba):
     """Replay output head S updates for one LUT across all batch elements."""
     for j, output in zip(j_list, output_list):
@@ -2399,10 +2770,40 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
         # Attention: one task per (layer, head)
         for h in range(args.num_heads):
             head = m.head[l][h]
-            jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
-            jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
             pe_grad_list = [be.grad_accum.pe_grads[l][h] for be in batch_elements]
-            if getattr(args, 'soft_attention', False):
+            if getattr(args, 'new_attention', False):
+                q_j_list = [be.head[l][h]._q_j for be in batch_elements]
+                k_j_list = [be.head[l][h]._k_j for be in batch_elements]
+                val_j_list = [be.head[l][h]._val_j for be in batch_elements]
+                final_v_j_list = [be.head[l][h]._final_v_j for be in batch_elements]
+                qkpe_j_list = [be.head[l][h]._qkpe_j for be in batch_elements]
+                ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+                q_grad_list = [be.grad_accum.new_attn_q_grads[l][h] for be in batch_elements]
+                k_grad_list = [be.grad_accum.new_attn_k_grads[l][h] for be in batch_elements]
+                v_grad_list = [be.grad_accum.new_attn_v_grads[l][h] for be in batch_elements]
+                if update_stats is not None:
+                    for q_j, k_j, val_j, final_v_j, qkpe_j in zip(
+                            q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list):
+                        update_stats.record_simple(f'head_{l}_{h}_Q', head.Q, q_j)
+                        update_stats.record_simple(f'head_{l}_{h}_K', head.K, k_j)
+                        update_stats.record_simple(f'head_{l}_{h}_V', head.V, val_j)
+                        for tok_i in range(1, CS):
+                            rows = np.zeros((tok_i, N_T), dtype=np.int32)
+                            for tok_j in range(tok_i):
+                                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                                rows[tok_j] = (final_v_j[tok_j] << args.positional_dim) | qkpe_j[pair]
+                            update_stats.record_rows(f'head_{l}_{h}_Final', head.Final,
+                                                     np.broadcast_to(head.Final.trees, rows.shape), rows)
+                work.append(lambda _head=head, _qj=q_j_list, _kj=k_j_list, _vj=val_j_list,
+                                   _fvj=final_v_j_list, _qkpj=qkpe_j_list, _y=ygrad_list,
+                                   _qg=q_grad_list, _kg=k_grad_list, _vg=v_grad_list,
+                                   _pg=pe_grad_list:
+                            _replay_new_attn_task(_head, _qj, _kj, _vj, _fvj, _qkpj, _y,
+                                                  _qg, _kg, _vg, _pg,
+                                                  CS, N_T, args.attn_qk_n_t, scale, use_numba))
+            elif getattr(args, 'soft_attention', False):
+                jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
+                jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
                 val_j_list      = [be.head[l][h]._val_j             for be in batch_elements]
                 score_grad_list = [be.grad_accum.attn_score_grads[l][h] for be in batch_elements]
                 val_grad_list   = [be.grad_accum.attn_val_grads[l][h]   for be in batch_elements]
@@ -2422,6 +2823,8 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                                                    args.shift_qk, args.positional_dim,
                                                    CS, N_T, scale, use_numba))
             else:
+                jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
+                jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
                 lut_v = head.V
                 ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
                 if update_stats is not None:
