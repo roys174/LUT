@@ -3084,6 +3084,11 @@ def print_model_stats(m, args):
             if getattr(args, 'soft_attention', False):
                 count_array(head.Score.S)
                 count_array(head.Value.S)
+            elif getattr(args, 'new_attention', False):
+                count_array(head.Q.S)
+                count_array(head.K.S)
+                count_array(head.V.S)
+                count_array(head.Final.S)
             else:
                 count_array(head.V.S)
             count_array(head.Positional_encoding)
