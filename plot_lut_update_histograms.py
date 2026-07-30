@@ -1,21 +1,25 @@
-"""Plot row-by-row LUT update counts produced by main.py.
+"""Plot LUT update counts and aggregated j statistics produced by main.py.
 
 Usage:
     python plot_lut_update_histograms.py lut_update_stats.npz
 
-The input must be the raw .npz stats file written by --lut-update-stats-file.
-Each array in that file has shape (n_tables, n_rows), where:
-    X axis = row index, 1..n_rows
-    Y axis = number of updates applied to that row
+The positional input is the raw row-update .npz written by --lut-update-stats-file.
+If a companion <stem>_j_stats.npz exists, this script also plots aggregate j-bin
+usage, component marginals, and qkpe/final_v joint distributions.
 """
 
 import argparse
+import csv
 import os
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+
+
+COMPONENT_ORDER = {"q": 0, "k": 1, "pe": 2, "qkpe": 3, "final_v": 4, "j": 5}
 
 
 def _safe_filename(name):
@@ -34,6 +38,43 @@ def load_stats(path):
         return {name: data[name].copy() for name in data.files}
 
 
+def default_j_stats_path(stats_path):
+    return stats_path.with_name(stats_path.stem + "_j_stats.npz")
+
+
+def load_j_stats(path):
+    j_path = Path(path)
+    if not j_path.exists():
+        return None, {"simple": {}, "components": {}, "joints": {}}
+    if j_path.suffix != ".npz":
+        raise ValueError("j statistics must be loaded from a .npz file")
+
+    parsed = {"simple": {}, "components": defaultdict(dict), "joints": {}}
+    with np.load(j_path) as data:
+        for key in data.files:
+            arr = data[key].copy()
+            if key.startswith("simple__"):
+                parsed["simple"][key[len("simple__"):]] = arr
+            elif key.startswith("component__"):
+                parts = key.split("__")
+                if len(parts) != 3:
+                    print(f"Skipping malformed j-stat key {key!r}", file=sys.stderr)
+                    continue
+                _, lut_name, component = parts
+                parsed["components"][lut_name][component] = arr
+            elif key.startswith("joint__"):
+                parts = key.split("__")
+                if len(parts) != 4:
+                    print(f"Skipping malformed j-stat key {key!r}", file=sys.stderr)
+                    continue
+                _, lut_name, row_component, col_component = parts
+                parsed["joints"][(lut_name, row_component, col_component)] = arr
+            else:
+                print(f"Skipping unknown j-stat key {key!r}", file=sys.stderr)
+    parsed["components"] = dict(parsed["components"])
+    return j_path, parsed
+
+
 def plot_table_rows(ax, counts, title, use_line=False):
     rows = np.arange(1, counts.shape[0] + 1)
     if use_line:
@@ -44,6 +85,19 @@ def plot_table_rows(ax, counts, title, use_line=False):
     ax.set_xlabel("row")
     ax.set_ylabel("updates")
     ax.set_xlim(1, counts.shape[0])
+
+
+def plot_j_distribution(ax, counts, title, use_line=False):
+    bins = np.arange(counts.shape[0])
+    if use_line:
+        ax.plot(bins, counts, linewidth=1.0)
+    else:
+        ax.bar(bins, counts, width=1.0)
+    ax.set_title(title)
+    ax.set_xlabel("j bin")
+    ax.set_ylabel("observations")
+    if counts.shape[0] > 1:
+        ax.set_xlim(-0.5, counts.shape[0] - 0.5)
 
 
 def lut_group(name):
@@ -100,13 +154,332 @@ def sample_table_indices(n_tables, sample_size, rng):
     return np.sort(rng.choice(n_tables, size=sample_size, replace=False).astype(np.int32))
 
 
+def sample_size_for_group(group, ffn_sample, attention_sample, new_attention_sample):
+    if group == "ffn":
+        return ffn_sample
+    if group == "attention":
+        return attention_sample
+    if group == "new_attention":
+        return new_attention_sample
+    return None
+
+
+def selected_tables_for_name(name, n_tables, rng, ffn_sample, attention_sample,
+                             new_attention_sample, include_other):
+    group = lut_group(name)
+    if group == "other" and not include_other:
+        return np.array([], dtype=np.int32)
+    return sample_table_indices(
+        n_tables,
+        sample_size_for_group(group, ffn_sample, attention_sample, new_attention_sample),
+        rng,
+    )
+
+
+def distribution_records(kind, lut_name, component, table_idx, counts, top_n):
+    total = int(counts.sum())
+    if counts.size == 0:
+        return []
+    rows = []
+    order = np.argsort(counts)[::-1][:min(top_n, counts.size)]
+    for rank, bin_idx in enumerate(order, start=1):
+        count = int(counts[bin_idx])
+        if count == 0:
+            break
+        rows.append({
+            "record_type": "top",
+            "kind": kind,
+            "lut": lut_name,
+            "component": component,
+            "table": int(table_idx),
+            "rank": rank,
+            "bin": int(bin_idx),
+            "bin2": "",
+            "count": count,
+            "share": float(count / total) if total else 0.0,
+        })
+    for rank, bin_idx in enumerate(np.flatnonzero(counts == 0)[:top_n], start=1):
+        rows.append({
+            "record_type": "zero",
+            "kind": kind,
+            "lut": lut_name,
+            "component": component,
+            "table": int(table_idx),
+            "rank": rank,
+            "bin": int(bin_idx),
+            "bin2": "",
+            "count": 0,
+            "share": 0.0,
+        })
+    nonzero = np.flatnonzero(counts > 0)
+    if nonzero.size:
+        scarce = nonzero[np.argsort(counts[nonzero])[:top_n]]
+        for rank, bin_idx in enumerate(scarce, start=1):
+            count = int(counts[bin_idx])
+            rows.append({
+                "record_type": "scarce_nonzero",
+                "kind": kind,
+                "lut": lut_name,
+                "component": component,
+                "table": int(table_idx),
+                "rank": rank,
+                "bin": int(bin_idx),
+                "bin2": "",
+                "count": count,
+                "share": float(count / total) if total else 0.0,
+            })
+    return rows
+
+
+def joint_records(lut_name, row_component, col_component, table_idx, counts, top_n):
+    flat = counts.ravel()
+    total = int(flat.sum())
+    if flat.size == 0:
+        return []
+    component = f"{row_component}_x_{col_component}"
+    rows = []
+    order = np.argsort(flat)[::-1][:min(top_n, flat.size)]
+    for rank, flat_idx in enumerate(order, start=1):
+        count = int(flat[flat_idx])
+        if count == 0:
+            break
+        row_idx, col_idx = np.unravel_index(int(flat_idx), counts.shape)
+        rows.append({
+            "record_type": "top",
+            "kind": "joint",
+            "lut": lut_name,
+            "component": component,
+            "table": int(table_idx),
+            "rank": rank,
+            "bin": int(row_idx),
+            "bin2": int(col_idx),
+            "count": count,
+            "share": float(count / total) if total else 0.0,
+        })
+    for rank, flat_idx in enumerate(np.flatnonzero(flat == 0)[:top_n], start=1):
+        row_idx, col_idx = np.unravel_index(int(flat_idx), counts.shape)
+        rows.append({
+            "record_type": "zero",
+            "kind": "joint",
+            "lut": lut_name,
+            "component": component,
+            "table": int(table_idx),
+            "rank": rank,
+            "bin": int(row_idx),
+            "bin2": int(col_idx),
+            "count": 0,
+            "share": 0.0,
+        })
+    return rows
+
+
+def write_j_report(out_dir, j_stats, selected_by_name, top_n):
+    rows = []
+    for lut_name, counts in sorted(j_stats["simple"].items()):
+        for table_idx in selected_by_name.get(lut_name, []):
+            rows.extend(distribution_records(
+                "simple", lut_name, "j", table_idx, counts[table_idx], top_n))
+    for lut_name, components in sorted(j_stats["components"].items()):
+        for component, counts in sorted(components.items(), key=lambda item: COMPONENT_ORDER.get(item[0], 99)):
+            for table_idx in selected_by_name.get(lut_name, []):
+                rows.extend(distribution_records(
+                    "component", lut_name, component, table_idx, counts[table_idx], top_n))
+    for (lut_name, row_component, col_component), counts in sorted(j_stats["joints"].items()):
+        for table_idx in selected_by_name.get(lut_name, []):
+            rows.extend(joint_records(
+                lut_name, row_component, col_component, table_idx, counts[table_idx], top_n))
+
+    if not rows:
+        return None
+    report_path = out_dir / "j_stats_top.csv"
+    with open(report_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "record_type", "kind", "lut", "component", "table", "rank",
+            "bin", "bin2", "count", "share",
+        ])
+        writer.writeheader()
+        writer.writerows(rows)
+    return report_path
+
+
+def plot_row_stats(stats, out_dir, args, plt, rng, filters, samples):
+    layer_filter, head_filter = filters
+    ffn_sample, attention_sample, new_attention_sample = samples
+    written = []
+    for lut_name in sorted(stats):
+        if not lut_passes_filters(lut_name, layer_filter, head_filter,
+                                  args.min_layer, args.max_layer):
+            continue
+        counts = stats[lut_name]
+        if counts.ndim != 2:
+            print(f"Skipping {lut_name}: expected 2D array, got shape {counts.shape}",
+                  file=sys.stderr)
+            continue
+
+        group = lut_group(lut_name)
+        if group == "other" and not args.include_other_luts:
+            continue
+
+        n_tables, n_rows = counts.shape
+        rows = np.arange(1, n_rows + 1)
+        selected_tables = selected_tables_for_name(
+            lut_name, n_tables, rng, ffn_sample, attention_sample,
+            new_attention_sample, args.include_other_luts)
+
+        if selected_tables.size == 0:
+            continue
+
+        if args.overlay_tables:
+            fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+            for table_idx in selected_tables:
+                if args.line:
+                    ax.plot(rows, counts[table_idx], linewidth=1.0,
+                            label=f"table {table_idx}")
+                else:
+                    ax.bar(rows, counts[table_idx], width=1.0, alpha=0.35,
+                           label=f"table {table_idx}")
+            ax.set_title(f"{lut_name}: sampled updates per row")
+            ax.set_xlabel("row")
+            ax.set_ylabel("updates")
+            ax.set_xlim(1, n_rows)
+            ax.legend(loc="best")
+        else:
+            fig, axes = plt.subplots(selected_tables.size, 1,
+                                     figsize=(12, max(3, 2.5 * selected_tables.size)),
+                                     squeeze=False, sharex=True)
+            for table_idx, ax in zip(selected_tables, axes[:, 0]):
+                plot_table_rows(ax, counts[table_idx],
+                                f"{lut_name} table {table_idx}: updates per row",
+                                use_line=args.line)
+
+        fig.tight_layout()
+        output_path = out_dir / f"{_safe_filename(lut_name)}.png"
+        fig.savefig(output_path, dpi=150)
+        written.append(output_path)
+        print(f"{lut_name}: plotted row tables {', '.join(str(int(i)) for i in selected_tables)}")
+        if args.show:
+            plt.show()
+        plt.close(fig)
+    return written
+
+
+def selected_j_tables(j_stats, args, rng, filters, samples):
+    layer_filter, head_filter = filters
+    ffn_sample, attention_sample, new_attention_sample = samples
+    selected = {}
+    names = set(j_stats["simple"])
+    names.update(j_stats["components"])
+    names.update(name for name, _, _ in j_stats["joints"])
+    for lut_name in sorted(names):
+        if not lut_passes_filters(lut_name, layer_filter, head_filter,
+                                  args.min_layer, args.max_layer):
+            continue
+        arr = j_stats["simple"].get(lut_name)
+        if arr is None and lut_name in j_stats["components"]:
+            arr = next(iter(j_stats["components"][lut_name].values()))
+        if arr is None:
+            for (joint_name, _, _), joint in j_stats["joints"].items():
+                if joint_name == lut_name:
+                    arr = joint
+                    break
+        if arr is None:
+            continue
+        tables = selected_tables_for_name(
+            lut_name, arr.shape[0], rng, ffn_sample, attention_sample,
+            new_attention_sample, args.include_other_luts)
+        if tables.size:
+            selected[lut_name] = tables
+    return selected
+
+
+def plot_j_stats(j_stats, out_dir, args, plt, selected_by_name):
+    written = []
+    j_dir = out_dir / "j_stats"
+    j_dir.mkdir(parents=True, exist_ok=True)
+
+    for lut_name, counts in sorted(j_stats["simple"].items()):
+        selected_tables = selected_by_name.get(lut_name, np.array([], dtype=np.int32))
+        if selected_tables.size == 0:
+            continue
+        fig, axes = plt.subplots(selected_tables.size, 1,
+                                 figsize=(12, max(3, 2.5 * selected_tables.size)),
+                                 squeeze=False, sharex=True)
+        for table_idx, ax in zip(selected_tables, axes[:, 0]):
+            plot_j_distribution(ax, counts[table_idx],
+                                f"{lut_name} table {table_idx}: j observations",
+                                use_line=args.line)
+        fig.tight_layout()
+        output_path = j_dir / f"simple_{_safe_filename(lut_name)}.png"
+        fig.savefig(output_path, dpi=150)
+        written.append(output_path)
+        print(f"{lut_name}: plotted simple j tables {', '.join(str(int(i)) for i in selected_tables)}")
+        if args.show:
+            plt.show()
+        plt.close(fig)
+
+    for lut_name, components in sorted(j_stats["components"].items()):
+        selected_tables = selected_by_name.get(lut_name, np.array([], dtype=np.int32))
+        if selected_tables.size == 0:
+            continue
+        ordered = sorted(components.items(), key=lambda item: COMPONENT_ORDER.get(item[0], 99))
+        for table_idx in selected_tables:
+            fig, axes = plt.subplots(len(ordered), 1,
+                                     figsize=(12, max(3, 2.4 * len(ordered))),
+                                     squeeze=False)
+            for (component, counts), ax in zip(ordered, axes[:, 0]):
+                plot_j_distribution(ax, counts[table_idx],
+                                    f"{lut_name} table {table_idx}: {component} j observations",
+                                    use_line=args.line)
+            fig.tight_layout()
+            output_path = j_dir / f"components_{_safe_filename(lut_name)}_table_{int(table_idx)}.png"
+            fig.savefig(output_path, dpi=150)
+            written.append(output_path)
+            if args.show:
+                plt.show()
+            plt.close(fig)
+        print(f"{lut_name}: plotted component j tables {', '.join(str(int(i)) for i in selected_tables)}")
+
+    for (lut_name, row_component, col_component), counts in sorted(j_stats["joints"].items()):
+        selected_tables = selected_by_name.get(lut_name, np.array([], dtype=np.int32))
+        if selected_tables.size == 0:
+            continue
+        for table_idx in selected_tables:
+            table_counts = counts[table_idx]
+            row_marginal = table_counts.sum(axis=1)
+            col_marginal = table_counts.sum(axis=0)
+            fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+            im = axes[0].imshow(table_counts, cmap="viridis", aspect="auto", origin="lower")
+            axes[0].set_title(f"{row_component} x {col_component}")
+            axes[0].set_xlabel(f"{col_component} j bin")
+            axes[0].set_ylabel(f"{row_component} j bin")
+            fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+            plot_j_distribution(axes[1], row_marginal, f"{row_component} marginal", use_line=args.line)
+            plot_j_distribution(axes[2], col_marginal, f"{col_component} marginal", use_line=args.line)
+            fig.suptitle(f"{lut_name} table {table_idx}: joint j observations")
+            fig.tight_layout()
+            output_path = j_dir / f"joint_{_safe_filename(lut_name)}_{row_component}_x_{col_component}_table_{int(table_idx)}.png"
+            fig.savefig(output_path, dpi=150)
+            written.append(output_path)
+            if args.show:
+                plt.show()
+            plt.close(fig)
+        print(f"{lut_name}: plotted joint j tables {', '.join(str(int(i)) for i in selected_tables)}")
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot LUT row index vs number of updates from raw stats .npz."
+        description="Plot LUT row index vs updates, plus aggregate j statistics when present."
     )
     parser.add_argument("stats_npz", help="Path to raw LUT update stats .npz")
     parser.add_argument("--out-dir", default=None,
                         help="Directory for PNG plots (default: <npz stem>_row_plots next to input)")
+    parser.add_argument("--j-stats-npz", default=None,
+                        help="Path to companion j-stats .npz (default: <stats stem>_j_stats.npz)")
+    parser.add_argument("--no-j-stats", action="store_true",
+                        help="Only plot row-update stats; do not load or plot companion j stats")
+    parser.add_argument("--j-top-n", type=int, default=20,
+                        help="Top/zero/scarce j bins to write to j_stats_top.csv (default: 20)")
     parser.add_argument("--line", action="store_true",
                         help="Use a line plot instead of bars")
     parser.add_argument("--overlay-tables", action="store_true",
@@ -147,6 +520,16 @@ def main():
         print(f"No arrays found in {stats_path}", file=sys.stderr)
         return 1
 
+    j_path = None
+    j_stats = {"simple": {}, "components": {}, "joints": {}}
+    if not args.no_j_stats:
+        try:
+            requested_j_path = Path(args.j_stats_npz) if args.j_stats_npz else default_j_stats_path(stats_path)
+            j_path, j_stats = load_j_stats(requested_j_path)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
     os.environ.setdefault("MPLCONFIGDIR", str(out_dir / ".mplconfig"))
     os.environ.setdefault("XDG_CACHE_HOME", str(out_dir / ".cache"))
     try:
@@ -159,77 +542,32 @@ def main():
               file=sys.stderr)
         return 1
 
-    rng = np.random.default_rng(args.sample_seed)
     ffn_sample = None if args.ffn_tables == 0 else args.ffn_tables
     attention_sample = None if args.attention_tables == 0 else args.attention_tables
     new_attention_sample = None if args.new_attention_tables == 0 else args.new_attention_tables
+    samples = (ffn_sample, attention_sample, new_attention_sample)
     try:
         layer_filter = parse_int_list(args.layers, "--layers") if args.layers else None
         head_filter = parse_int_list(args.heads, "--heads") if args.heads else None
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    filters = (layer_filter, head_filter)
 
-    written = []
-    for lut_name in sorted(stats):
-        if not lut_passes_filters(lut_name, layer_filter, head_filter,
-                                  args.min_layer, args.max_layer):
-            continue
-        counts = stats[lut_name]
-        if counts.ndim != 2:
-            print(f"Skipping {lut_name}: expected 2D array, got shape {counts.shape}",
-                  file=sys.stderr)
-            continue
+    row_rng = np.random.default_rng(args.sample_seed)
+    written = plot_row_stats(stats, out_dir, args, plt, row_rng, filters, samples)
 
-        group = lut_group(lut_name)
-        if group == "other" and not args.include_other_luts:
-            continue
-
-        n_tables, n_rows = counts.shape
-        rows = np.arange(1, n_rows + 1)
-        if group == "ffn":
-            selected_tables = sample_table_indices(n_tables, ffn_sample, rng)
-        elif group == "attention":
-            selected_tables = sample_table_indices(n_tables, attention_sample, rng)
-        elif group == "new_attention":
-            selected_tables = sample_table_indices(n_tables, new_attention_sample, rng)
-        else:
-            selected_tables = np.arange(n_tables, dtype=np.int32)
-
-        if selected_tables.size == 0:
-            continue
-
-        if args.overlay_tables:
-            fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-            for table_idx in selected_tables:
-                if args.line:
-                    ax.plot(rows, counts[table_idx], linewidth=1.0,
-                            label=f"table {table_idx}")
-                else:
-                    ax.bar(rows, counts[table_idx], width=1.0, alpha=0.35,
-                           label=f"table {table_idx}")
-            ax.set_title(f"{lut_name}: sampled updates per row")
-            ax.set_xlabel("row")
-            ax.set_ylabel("updates")
-            ax.set_xlim(1, n_rows)
-            ax.legend(loc="best")
-        else:
-            fig, axes = plt.subplots(selected_tables.size, 1,
-                                     figsize=(12, max(3, 2.5 * selected_tables.size)),
-                                     squeeze=False, sharex=True)
-            for table_idx, ax in zip(selected_tables, axes[:, 0]):
-                plot_table_rows(ax, counts[table_idx],
-                                f"{lut_name} table {table_idx}: updates per row",
-                                use_line=args.line)
-
-        fig.tight_layout()
-        output_path = out_dir / f"{_safe_filename(lut_name)}.png"
-        fig.savefig(output_path, dpi=150)
-        written.append(output_path)
-        print(f"{lut_name}: plotted tables {', '.join(str(int(i)) for i in selected_tables)}")
-        if args.show:
-            plt.show()
-        plt.close(fig)
+    if j_path is not None:
+        j_rng = np.random.default_rng(args.sample_seed)
+        selected_by_name = selected_j_tables(j_stats, args, j_rng, filters, samples)
+        report_path = write_j_report(out_dir, j_stats, selected_by_name, args.j_top_n)
+        written.extend(plot_j_stats(j_stats, out_dir, args, plt, selected_by_name))
+        print(f"Loaded j stats from {j_path}")
+        if report_path is not None:
+            written.append(report_path)
+            print(f"Wrote j-stat top/zero/scarce report to {report_path}")
+    elif not args.no_j_stats:
+        print(f"No j stats found at {args.j_stats_npz or default_j_stats_path(stats_path)}")
 
     for path in written:
         print(path)
