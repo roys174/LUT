@@ -22,13 +22,22 @@ def make_full_args(**overrides):
         positional_dim=4, num_layers=2, num_heads=2,
         n_t=8, n_c=4, testing_length=10, max_steps=10,
         validation_interval=100, temperature=0.4,
-        factored_output=False, loss_file='/dev/null',
+        factored_output=False, loss_file='/dev/null', fp16=False,
+        batch_size=1, cpu_cores=1, num_workers=1, numba_threads=1,
+        replay_workers=1, soft_attention=False, layernorm=False,
+        dropout=0.0, POS_task=False, new_attention=False,
+        PE_only=False, qkpe_direct_sign=False,
+        lut_comparison_mode='random', attn_qk_dim=8,
+        attn_qk_n_c=3, attn_qk_n_t=4,
     )
     defaults.update(overrides)
+    defaults.setdefault('vocab_size_input', defaults['vocab_size'])
+    defaults.setdefault('vocab_size_output', defaults['vocab_size'])
     args = SimpleNamespace(**defaults)
     args.shift_qk = args.n_c + args.positional_dim
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
-    args.vocab_hi = (args.vocab_size + 255) // 256
+    args.vocab_hi = (args.vocab_size_output + 255) // 256
+    args.vocab_lo = 256
     return args
 
 

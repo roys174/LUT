@@ -122,6 +122,133 @@ def fill_vector_with_random_integers_different_from_vector2(vector2, N, max_valu
     return vector
 
 
+def neurons_needed_for_comparisons(n_c):
+    if n_c < 1:
+        raise ValueError("n_c must be at least 1")
+    n = 2
+    while n * (n - 1) // 2 < n_c:
+        n += 1
+    return n
+
+
+def build_no_overlap_comparison_groups(n_c, input_dim):
+    neurons_per_table = neurons_needed_for_comparisons(n_c)
+    if input_dim < neurons_per_table:
+        raise ValueError(
+            f"input_dim={input_dim} is too small for n_c={n_c}; "
+            f"need at least {neurons_per_table} neurons")
+
+    groups = []
+    for start in range(0, input_dim, neurons_per_table):
+        group = list(range(start, min(start + neurons_per_table, input_dim)))
+        pad = 0
+        while len(group) < neurons_per_table:
+            group.append(pad % input_dim)
+            pad += 1
+        groups.append(group)
+    return groups
+
+
+def non_overlapping_table_count(input_dim, n_c):
+    return len(build_no_overlap_comparison_groups(n_c, input_dim))
+
+
+def _comparison_pairs_for_group(group, n_c):
+    pairs = []
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            if group[i] == group[j]:
+                continue
+            pairs.append((group[i], group[j]))
+            if len(pairs) == n_c:
+                return pairs
+    raise ValueError(
+        f"group {group} cannot provide {n_c} distinct-neuron comparisons")
+
+
+def _comparison_arrays_from_groups(groups, n_c):
+    a_arr = np.zeros((len(groups), n_c), dtype=np.int32)
+    b_arr = np.zeros((len(groups), n_c), dtype=np.int32)
+    for i, group in enumerate(groups):
+        pairs = _comparison_pairs_for_group(group, n_c)
+        a_arr[i] = [a for a, _ in pairs]
+        b_arr[i] = [b for _, b in pairs]
+    return a_arr, b_arr
+
+
+def build_no_overlap_comparison_arrays(n_c, input_dim, n_t=None):
+    groups = build_no_overlap_comparison_groups(n_c, input_dim)
+    if n_t is not None:
+        groups = [groups[i % len(groups)] for i in range(n_t)]
+    return _comparison_arrays_from_groups(groups, n_c)
+
+
+def build_overlap_comparison_groups(n_t, n_c, input_dim):
+    base_groups = build_no_overlap_comparison_groups(n_c, input_dim)
+    if n_t <= len(base_groups):
+        return base_groups[:n_t]
+    if len(base_groups) < 2:
+        raise ValueError(
+            "overlap mode needs at least two base groups when requesting "
+            "extra overlapping tables")
+
+    neurons_per_table = len(base_groups[0])
+    split = (neurons_per_table + 1) // 2
+    groups = list(base_groups)
+    offset = 0
+    while len(groups) < n_t:
+        left_idx = offset % len(base_groups)
+        right_idx = (left_idx + 1 + offset // len(base_groups)) % len(base_groups)
+        if right_idx == left_idx:
+            right_idx = (right_idx + 1) % len(base_groups)
+        groups.append(base_groups[left_idx][:split] + base_groups[right_idx][split:])
+        offset += 1
+    return groups
+
+
+def build_overlap_comparison_arrays(n_t, n_c, input_dim):
+    return _comparison_arrays_from_groups(
+        build_overlap_comparison_groups(n_t, n_c, input_dim), n_c)
+
+
+def build_comparison_arrays(mode, requested_n_t, n_c, input_dim):
+    if mode == 'no-overlap':
+        return build_no_overlap_comparison_arrays(n_c, input_dim)
+    if mode == 'overlap':
+        return build_overlap_comparison_arrays(requested_n_t, n_c, input_dim)
+    if mode == 'random':
+        a_arr = np.zeros((requested_n_t, n_c), dtype=np.int32)
+        b_arr = np.zeros((requested_n_t, n_c), dtype=np.int32)
+        for i in range(requested_n_t):
+            a_arr[i] = fill_vector_with_random_integers(n_c, input_dim)
+            b_arr[i] = fill_vector_with_random_integers_different_from_vector2(
+                a_arr[i], n_c, input_dim)
+        return a_arr, b_arr
+    raise ValueError(f"unknown LUT comparison mode {mode!r}")
+
+
+def configure_lut_comparison_mode(args, parser):
+    if args.n_c < 1:
+        parser.error('--n-c must be at least 1')
+    if args.attn_qk_n_c < 1:
+        parser.error('--attn_qk_n_c must be at least 1')
+
+    if args.lut_comparison_mode == 'no-overlap':
+        try:
+            args.n_t = non_overlapping_table_count(args.embedding_dim, args.n_c)
+            args.attn_qk_n_t = non_overlapping_table_count(
+                args.embedding_dim, args.attn_qk_n_c)
+        except ValueError as exc:
+            parser.error(f"--lut-comparison-mode no-overlap: {exc}")
+    elif args.lut_comparison_mode == 'overlap':
+        try:
+            build_overlap_comparison_groups(args.n_t, args.n_c, args.embedding_dim)
+            build_overlap_comparison_groups(
+                args.attn_qk_n_t, args.attn_qk_n_c, args.embedding_dim)
+        except ValueError as exc:
+            parser.error(f"--lut-comparison-mode overlap: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -1092,22 +1219,22 @@ class BatchElement:
 # ---------------------------------------------------------------------------
 
 def build_LUT_custom(lut, total_n_c, y_dim, args, n_t=None, n_c=None, input_dim=None):
-    N_T = args.n_t if n_t is None else n_t
+    requested_n_t = args.n_t if n_t is None else n_t
     N_C = args.n_c if n_c is None else n_c
     INPUT_DIM = args.embedding_dim if input_dim is None else input_dim
+    mode = getattr(args, 'lut_comparison_mode', 'random')
     s_dtype = np.float16 if getattr(args, 'fp16', False) else np.float32
 
+    a_arr, b_arr = build_comparison_arrays(mode, requested_n_t, N_C, INPUT_DIM)
+
+    N_T = a_arr.shape[0]
     lut.y_dim = y_dim
     lut.trees = np.arange(N_T, dtype=np.int32)
     num_bins = 1 << total_n_c
     lut.S = np.zeros((N_T, num_bins, y_dim), dtype=s_dtype)
-    lut.a_arr = np.zeros((N_T, N_C), dtype=np.int32)
-    lut.b_arr = np.zeros((N_T, N_C), dtype=np.int32)
+    lut.a_arr = a_arr
+    lut.b_arr = b_arr
     lut.bitmasks = (1 << np.arange(N_C)).astype(np.int32)
-    for i in range(N_T):
-        lut.a_arr[i] = fill_vector_with_random_integers(N_C, INPUT_DIM)
-        lut.b_arr[i] = fill_vector_with_random_integers_different_from_vector2(
-            lut.a_arr[i], N_C, INPUT_DIM)
 
 
 def build_LUT(lut, total_n_c, y_dim, args):
@@ -2137,11 +2264,14 @@ def build_Model(m, args):
                                  n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM)
                 build_LUT_custom(head.Final, N_C + POSITIONAL_DIM, EMBEDDING_DIM, args,
                                  n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM)
-                for t in range(N_T):
-                    head._qkpe_a_arr[t] = fill_vector_with_random_integers(
-                        POSITIONAL_DIM, args.attn_qk_dim)
-                    head._qkpe_b_arr[t] = fill_vector_with_random_integers_different_from_vector2(
-                        head._qkpe_a_arr[t], POSITIONAL_DIM, args.attn_qk_dim)
+                qkpe_a, qkpe_b = build_comparison_arrays(
+                    getattr(args, 'lut_comparison_mode', 'random'), N_T,
+                    POSITIONAL_DIM, args.attn_qk_dim)
+                if qkpe_a.shape[0] != N_T:
+                    qkpe_a, qkpe_b = build_no_overlap_comparison_arrays(
+                        POSITIONAL_DIM, args.attn_qk_dim, n_t=N_T)
+                head._qkpe_a_arr[:] = qkpe_a
+                head._qkpe_b_arr[:] = qkpe_b
             else:
                 m.head[l][h].Positional_encoding[:] = random_vector(
                     args.context_size * N_T * POSITIONAL_DIM, 1.0
@@ -3569,6 +3699,9 @@ def main():
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--n-t', type=int, default=16)
     parser.add_argument('--n-c', type=int, default=6)
+    parser.add_argument('--lut-comparison-mode', choices=['random', 'no-overlap', 'overlap'],
+                        default='random',
+                        help='How LUT a/b comparison indices are assigned (default: random)')
     parser.add_argument('--attn_qk_dim', type=int, default=8)
     parser.add_argument('--attn_qk_n_c', type=int, default=3)
     parser.add_argument('--attn_qk_n_t', type=int, default=4)
@@ -3642,6 +3775,7 @@ def main():
         parser.error('--qkpe-direct-sign requires --positional-dim <= --attn_qk_dim')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
+    configure_lut_comparison_mode(args, parser)
 
     # Seed RNGs before anything else
     if args.seed is not None:
@@ -3687,6 +3821,7 @@ def main():
     print(f"  num_heads         = {args.num_heads}")
     print(f"  n_t               = {args.n_t}")
     print(f"  n_c               = {args.n_c}")
+    print(f"  lut_comparison_mode = {args.lut_comparison_mode}")
     print(f"  attn_qk_dim       = {args.attn_qk_dim}")
     print(f"  attn_qk_n_c       = {args.attn_qk_n_c}")
     print(f"  attn_qk_n_t       = {args.attn_qk_n_t}")

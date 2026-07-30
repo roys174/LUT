@@ -8,6 +8,8 @@ from main import (
     LUT, Model, BatchElement, build_LUT, build_Model, CONCATENATE_vec, _f32,
     apply_averaged_gradients, model_backward, model_forward,
     new_attention_backward, new_attention_forward,
+    build_no_overlap_comparison_arrays, build_overlap_comparison_arrays,
+    configure_lut_comparison_mode,
     fill_vector_with_random_integers,
     fill_vector_with_random_integers_different_from_vector2,
 )
@@ -239,9 +241,11 @@ def orig_concatenated_LUT_backward(S_list, y_dim, anchors_list, cacheQ, cacheK, 
 # Helper: create matched old/new format data from same random seed
 # ---------------------------------------------------------------------------
 
-def make_args(n_t=8, n_c=4, embedding_dim=16, positional_dim=4):
+def make_args(n_t=8, n_c=4, embedding_dim=16, positional_dim=4,
+              lut_comparison_mode='random'):
     return SimpleNamespace(n_t=n_t, n_c=n_c, embedding_dim=embedding_dim,
                            positional_dim=positional_dim,
+                           lut_comparison_mode=lut_comparison_mode,
                            pe_bitmasks=(1 << np.arange(positional_dim)).astype(np.int32),
                            shift_qk=n_c + positional_dim)
 
@@ -294,6 +298,107 @@ def make_matched_lut_and_old_data(args, total_n_c=None, y_dim=8, seed=42):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+class ParserStub:
+    def error(self, message):
+        raise ValueError(message)
+
+
+class TestLUTComparisonModes:
+    def test_no_overlap_dim64_nc6_uses_16_four_neuron_tables(self):
+        a_arr, b_arr = build_no_overlap_comparison_arrays(6, 64)
+
+        assert a_arr.shape == (16, 6)
+        assert b_arr.shape == (16, 6)
+        np.testing.assert_array_equal(a_arr[0], np.array([0, 0, 0, 1, 1, 2], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[0], np.array([1, 2, 3, 2, 3, 3], dtype=np.int32))
+        np.testing.assert_array_equal(a_arr[-1], np.array([60, 60, 60, 61, 61, 62], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[-1], np.array([61, 62, 63, 62, 63, 63], dtype=np.int32))
+
+    def test_no_overlap_pads_final_group_when_dim_is_not_divisible(self):
+        a_arr, b_arr = build_no_overlap_comparison_arrays(6, 10)
+
+        assert a_arr.shape == (3, 6)
+        np.testing.assert_array_equal(a_arr[-1], np.array([8, 8, 8, 9, 9, 0], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[-1], np.array([9, 0, 1, 0, 1, 1], dtype=np.int32))
+
+    def test_overlap_keeps_requested_n_t_and_adds_pairwise_half_tables(self):
+        a_arr, b_arr = build_overlap_comparison_arrays(18, 6, 64)
+
+        assert a_arr.shape == (18, 6)
+        np.testing.assert_array_equal(a_arr[0], np.array([0, 0, 0, 1, 1, 2], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[0], np.array([1, 2, 3, 2, 3, 3], dtype=np.int32))
+        np.testing.assert_array_equal(a_arr[16], np.array([0, 0, 0, 1, 1, 6], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[16], np.array([1, 6, 7, 6, 7, 7], dtype=np.int32))
+        np.testing.assert_array_equal(a_arr[17], np.array([4, 4, 4, 5, 5, 10], dtype=np.int32))
+        np.testing.assert_array_equal(b_arr[17], np.array([5, 10, 11, 10, 11, 11], dtype=np.int32))
+
+    def test_random_mode_remains_seed_compatible(self):
+        import random as py_random
+
+        args = make_args(n_t=3, n_c=4, embedding_dim=16, lut_comparison_mode='random')
+        py_random.seed(7)
+        lut = LUT(args.n_t)
+        build_LUT(lut, args.n_c, 2, args)
+
+        py_random.seed(7)
+        expected_a = np.zeros((args.n_t, args.n_c), dtype=np.int32)
+        expected_b = np.zeros((args.n_t, args.n_c), dtype=np.int32)
+        for i in range(args.n_t):
+            expected_a[i] = fill_vector_with_random_integers(args.n_c, args.embedding_dim)
+            expected_b[i] = fill_vector_with_random_integers_different_from_vector2(
+                expected_a[i], args.n_c, args.embedding_dim)
+
+        np.testing.assert_array_equal(lut.a_arr, expected_a)
+        np.testing.assert_array_equal(lut.b_arr, expected_b)
+
+    def test_build_model_shapes_use_effective_no_overlap_table_counts(self):
+        args = SimpleNamespace(
+            vocab_size_input=8,
+            vocab_size_output=5,
+            context_size=3,
+            embedding_dim=10,
+            positional_dim=2,
+            num_layers=1,
+            num_heads=1,
+            n_t=99,
+            n_c=6,
+            lut_comparison_mode='no-overlap',
+            attn_qk_dim=4,
+            attn_qk_n_c=3,
+            attn_qk_n_t=99,
+            factored_output=False,
+            fp16=False,
+            batch_size=1,
+            cpu_cores=1,
+            num_workers=1,
+            numba_threads=1,
+            replay_workers=1,
+            soft_attention=False,
+            layernorm=False,
+            dropout=0.0,
+            POS_task=False,
+            new_attention=True,
+            PE_only=False,
+            qkpe_direct_sign=False,
+        )
+        args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+        args.shift_qk = args.n_c + args.positional_dim
+        configure_lut_comparison_mode(args, ParserStub())
+
+        model = Model(args)
+        build_Model(model, args)
+        head = model.head[0][0]
+
+        assert args.n_t == 3
+        assert args.attn_qk_n_t == 4
+        assert model.FFN[0].S.shape[0] == args.n_t
+        assert head.V.S.shape[0] == args.n_t
+        assert head.Final.S.shape[0] == args.n_t
+        assert head.Q.S.shape[0] == args.attn_qk_n_t
+        assert head.K.S.shape[0] == args.attn_qk_n_t
+        assert head._qkpe_a_arr.shape[0] == args.n_t
+
 
 class TestCacheIndex:
     def test_cache_index(self):

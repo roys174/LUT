@@ -14,6 +14,7 @@ from main import (
     UNK_TOKEN_ID,
     Model,
     build_Model,
+    configure_lut_comparison_mode,
     load_model,
     model_forward,
 )
@@ -91,6 +92,11 @@ def training_arg_parser():
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--n-t", type=int, default=16)
     parser.add_argument("--n-c", type=int, default=6)
+    parser.add_argument("--lut-comparison-mode", choices=["random", "no-overlap", "overlap"],
+                        default="random")
+    parser.add_argument("--attn_qk_dim", type=int, default=8)
+    parser.add_argument("--attn_qk_n_c", type=int, default=3)
+    parser.add_argument("--attn_qk_n_t", type=int, default=4)
     parser.add_argument("--testing-length", type=int, default=10000)
     parser.add_argument("--max-steps", type=int, default=100000000)
     parser.add_argument("--validation-interval", type=int, default=10000)
@@ -120,6 +126,9 @@ def training_arg_parser():
     parser.add_argument("--wandb-log-interval", type=int, default=100)
     parser.add_argument("--POS-task", "--pos-task", dest="POS_task", action="store_true")
     parser.add_argument("--pos-cache-dir", default=".pos_cache")
+    parser.add_argument("--new-attention", action="store_true")
+    parser.add_argument("--PE-only", dest="PE_only", action="store_true")
+    parser.add_argument("--qkpe-direct-sign", action="store_true")
     return parser
 
 
@@ -140,9 +149,11 @@ def load_training_args(run_dir):
 
     command_line = read_command_from_config(config_path)
     command_argv = argv_after_main(command_line)
-    parsed, unknown = training_arg_parser().parse_known_args(command_argv)
+    parser = training_arg_parser()
+    parsed, unknown = parser.parse_known_args(command_argv)
     if unknown:
         print(f"Warning: ignored unrecognized training flags: {' '.join(unknown)}", file=sys.stderr)
+    configure_lut_comparison_mode(parsed, parser)
 
     if not parsed.POS_task:
         raise ValueError("The saved LUT command is not a POS-task run.")
