@@ -56,6 +56,44 @@ def lut_group(name):
     return "other"
 
 
+def lut_position(name):
+    ffn_match = re.match(r"^ffn_(\d+)$", name)
+    if ffn_match:
+        return int(ffn_match.group(1)), None
+    head_match = re.match(r"^head_(\d+)_(\d+)(?:_|$)", name)
+    if head_match:
+        return int(head_match.group(1)), int(head_match.group(2))
+    return None, None
+
+
+def parse_int_list(text, flag_name):
+    values = set()
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError as exc:
+            raise ValueError(f"Bad {flag_name} value {text!r}; expected comma-separated integers") from exc
+    return values
+
+
+def lut_passes_filters(name, layers, heads, min_layer, max_layer):
+    layer, head = lut_position(name)
+    if layer is None:
+        return True
+    if layers is not None and layer not in layers:
+        return False
+    if min_layer is not None and layer < min_layer:
+        return False
+    if max_layer is not None and layer > max_layer:
+        return False
+    if head is not None and heads is not None and head not in heads:
+        return False
+    return True
+
+
 def sample_table_indices(n_tables, sample_size, rng):
     if sample_size is None or sample_size < 1 or sample_size >= n_tables:
         return np.arange(n_tables, dtype=np.int32)
@@ -83,6 +121,14 @@ def main():
                         help="Seed for random table sampling (default: 0)")
     parser.add_argument("--include-other-luts", action="store_true",
                         help="Also plot non-FFN/non-attention LUTs, such as output heads")
+    parser.add_argument("--layers", default=None,
+                        help="Only plot these layer indices, comma-separated, e.g. 2,3")
+    parser.add_argument("--heads", default=None,
+                        help="Only plot these attention head indices, comma-separated, e.g. 0,2")
+    parser.add_argument("--min-layer", type=int, default=None,
+                        help="Only plot LUTs from this layer index or later")
+    parser.add_argument("--max-layer", type=int, default=None,
+                        help="Only plot LUTs up to this layer index")
     parser.add_argument("--show", action="store_true",
                         help="Open interactive plot windows instead of only writing PNG files")
     args = parser.parse_args()
@@ -117,9 +163,18 @@ def main():
     ffn_sample = None if args.ffn_tables == 0 else args.ffn_tables
     attention_sample = None if args.attention_tables == 0 else args.attention_tables
     new_attention_sample = None if args.new_attention_tables == 0 else args.new_attention_tables
+    try:
+        layer_filter = parse_int_list(args.layers, "--layers") if args.layers else None
+        head_filter = parse_int_list(args.heads, "--heads") if args.heads else None
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     written = []
     for lut_name in sorted(stats):
+        if not lut_passes_filters(lut_name, layer_filter, head_filter,
+                                  args.min_layer, args.max_layer):
+            continue
         counts = stats[lut_name]
         if counts.ndim != 2:
             print(f"Skipping {lut_name}: expected 2D array, got shape {counts.shape}",

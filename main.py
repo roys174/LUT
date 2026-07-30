@@ -1036,6 +1036,105 @@ def _new_attention_forward_kernel(
 
         y[tok_i, d] += acc
 
+
+@njit(parallel=True, cache=True)
+def _new_attention_pe_only_forward_kernel(
+    VS, FS,
+    val_j,
+    q_embed, k_embed, v_embed,
+    qkpe_j, qkpe_r_min, qkpe_u_min,
+    final_v_j, final_v_r_min, final_v_u_min,
+    y,
+    PE,
+    v_trees, final_trees,
+    final_v_a_arr, final_v_b_arr, final_v_bitmasks,
+    qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
+    pd, CS, N_T, N_C, QD, y_dim
+):
+    """Fused PE-only forward: PE(i-j) and V(x_j) into Final LUT."""
+    n_pairs = CS * (CS - 1) // 2
+
+    # Keep Q/K scratch explicitly zero so callers can assert the ablation.
+    for work in prange(CS * QD):
+        pos = work // QD
+        d = work - pos * QD
+        q_embed[pos, d] = np.float32(0.0)
+        k_embed[pos, d] = np.float32(0.0)
+
+    # Token-side V embeddings.
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
+        v_acc = np.float32(0.0)
+        for t in range(N_T):
+            v_acc += VS[v_trees[t], val_j[pos, t], d]
+        v_embed[pos, d] = v_acc
+
+    # Final value-side row bits from V(x_j).
+    for work in prange(CS * N_T):
+        pos = work // N_T
+        t = work - pos * N_T
+        j = np.int32(0)
+        min_abs_u = np.float32(1e38)
+        r_min = np.int32(0)
+        u_min_val = np.float32(0.0)
+
+        for c in range(N_C):
+            u_val = v_embed[pos, final_v_a_arr[t, c]] - v_embed[pos, final_v_b_arr[t, c]]
+            if u_val > np.float32(0.0):
+                j |= final_v_bitmasks[c]
+            au = abs(u_val)
+            if au < min_abs_u:
+                min_abs_u = au
+                r_min = np.int32(c)
+                u_min_val = u_val
+
+        final_v_j[pos, t] = j
+        final_v_r_min[pos, t] = r_min
+        final_v_u_min[pos, t] = u_min_val
+
+    # Final qkpe-side row bits from PE(i-j) only.
+    for work in prange(n_pairs * N_T):
+        pair = work // N_T
+        t = work - pair * N_T
+        tok_i = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+        tok_j = pair - (tok_i * (tok_i - 1)) // 2
+        pe_pos = tok_i - tok_j
+        j = np.int32(0)
+        min_abs_u = np.float32(1e38)
+        r_min = np.int32(0)
+        u_min_val = np.float32(0.0)
+
+        for c in range(pd):
+            a = qkpe_a_arr[t, c]
+            b = qkpe_b_arr[t, c]
+            u_val = PE[pe_pos, a] - PE[pe_pos, b]
+            if u_val > np.float32(0.0):
+                j |= qkpe_bitmasks[c]
+            au = abs(u_val)
+            if au < min_abs_u:
+                min_abs_u = au
+                r_min = np.int32(c)
+                u_min_val = u_val
+
+        qkpe_j[pair, t] = j
+        qkpe_r_min[pair, t] = r_min
+        qkpe_u_min[pair, t] = u_min_val
+
+    # Accumulate final LUT output into each y cell.
+    for work in prange((CS - 1) * y_dim):
+        tok_i = work // y_dim + 1
+        d = work - (tok_i - 1) * y_dim
+        acc = np.float32(0.0)
+
+        for tok_j in range(tok_i):
+            pair = tok_i * (tok_i - 1) // 2 + tok_j
+            for t in range(N_T):
+                j = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+                acc += FS[final_trees[t], j, d]
+
+        y[tok_i, d] += acc
+
 @njit(parallel=True)
 def _new_attention_final_backward_kernel(
     FS,
@@ -1046,7 +1145,7 @@ def _new_attention_final_backward_kernel(
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
-    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update
+    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
     n_pairs = CS * (CS - 1) // 2
@@ -1090,10 +1189,11 @@ def _new_attention_final_backward_kernel(
         delta_qkpe = gi_qkpe * (np.float32(-0.5) * sign_qkpe / (np.float32(1.0) + abs(u_qkpe)) ** 2)
         a_qkpe = qkpe_a_arr[t, r_qkpe]
         b_qkpe = qkpe_b_arr[t, r_qkpe]
-        q_grad_thr[tid, tok_i, a_qkpe] += delta_qkpe
-        q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
-        k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
-        k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
+        if not pe_only:
+            q_grad_thr[tid, tok_i, a_qkpe] += delta_qkpe
+            q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
+            k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
+            k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
         pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
         pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
 
@@ -1861,34 +1961,57 @@ def new_attention_forward(head, x, y, args):
     y_dim = lutFinal.y_dim
     q_dim = args.attn_qk_dim
     n_pairs = CS * (CS - 1) // 2
+    pe_only = getattr(args, 'PE_only', False)
 
-    cache_index_batch(lutQ, x, head._q_j, head._q_r_min, head._q_u_min)
-    cache_index_batch(lutK, x, head._k_j, head._k_r_min, head._k_u_min)
+    if not pe_only:
+        cache_index_batch(lutQ, x, head._q_j, head._q_r_min, head._q_u_min)
+        cache_index_batch(lutK, x, head._k_j, head._k_r_min, head._k_u_min)
     cache_index_batch(lutV, x, head._val_j, head._val_r_min, head._val_u_min)
 
     if (HAS_NUMBA and lutFinal.S.dtype == np.float32
             and lutQ.S.dtype == np.float32
             and lutK.S.dtype == np.float32
             and lutV.S.dtype == np.float32):
-        _new_attention_forward_kernel(
-            lutQ.S, lutK.S, lutV.S, lutFinal.S,
-            head._q_j, head._k_j, head._val_j,
-            head._q_embed, head._k_embed, head._v_embed,
-            head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
-            head._final_v_j, head._final_v_r_min, head._final_v_u_min,
-            y,
-            head.Positional_encoding,
-            treesQ, treesK, treesV, treesFinal,
-            lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
-            head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
-            args.positional_dim, CS, args.n_t, args.n_c,
-            args.attn_qk_n_t, q_dim, y_dim
-        )
+        if pe_only:
+            _new_attention_pe_only_forward_kernel(
+                lutV.S, lutFinal.S,
+                head._val_j,
+                head._q_embed, head._k_embed, head._v_embed,
+                head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
+                head._final_v_j, head._final_v_r_min, head._final_v_u_min,
+                y,
+                head.Positional_encoding,
+                treesV, treesFinal,
+                lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
+                head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
+                args.positional_dim, CS, args.n_t, args.n_c, q_dim, y_dim
+            )
+        else:
+            _new_attention_forward_kernel(
+                lutQ.S, lutK.S, lutV.S, lutFinal.S,
+                head._q_j, head._k_j, head._val_j,
+                head._q_embed, head._k_embed, head._v_embed,
+                head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
+                head._final_v_j, head._final_v_r_min, head._final_v_u_min,
+                y,
+                head.Positional_encoding,
+                treesQ, treesK, treesV, treesFinal,
+                lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
+                head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
+                args.positional_dim, CS, args.n_t, args.n_c,
+                args.attn_qk_n_t, q_dim, y_dim
+            )
     else:
-        for pos in range(CS):
-            head._q_embed[pos] = _f32(lutQ.S[treesQ, head._q_j[pos]]).sum(axis=0)
-            head._k_embed[pos] = _f32(lutK.S[treesK, head._k_j[pos]]).sum(axis=0)
-            head._v_embed[pos] = _f32(lutV.S[treesV, head._val_j[pos]]).sum(axis=0)
+        if pe_only:
+            head._q_embed.fill(0.0)
+            head._k_embed.fill(0.0)
+            for pos in range(CS):
+                head._v_embed[pos] = _f32(lutV.S[treesV, head._val_j[pos]]).sum(axis=0)
+        else:
+            for pos in range(CS):
+                head._q_embed[pos] = _f32(lutQ.S[treesQ, head._q_j[pos]]).sum(axis=0)
+                head._k_embed[pos] = _f32(lutK.S[treesK, head._k_j[pos]]).sum(axis=0)
+                head._v_embed[pos] = _f32(lutV.S[treesV, head._val_j[pos]]).sum(axis=0)
 
         cache_index_batch(lutFinal, head._v_embed,
                           head._final_v_j, head._final_v_r_min, head._final_v_u_min)
@@ -1905,10 +2028,14 @@ def new_attention_forward(head, x, y, args):
                 for c in range(args.positional_dim):
                     a = head._qkpe_a_arr[t, c]
                     b = head._qkpe_b_arr[t, c]
-                    ua = (head._q_embed[tok_i, a] + head._k_embed[tok_j, a]
-                          + head.Positional_encoding[pe_pos, a])
-                    ub = (head._q_embed[tok_i, b] + head._k_embed[tok_j, b]
-                          + head.Positional_encoding[pe_pos, b])
+                    if pe_only:
+                        ua = head.Positional_encoding[pe_pos, a]
+                        ub = head.Positional_encoding[pe_pos, b]
+                    else:
+                        ua = (head._q_embed[tok_i, a] + head._k_embed[tok_j, a]
+                              + head.Positional_encoding[pe_pos, a])
+                        ub = (head._q_embed[tok_i, b] + head._k_embed[tok_j, b]
+                              + head.Positional_encoding[pe_pos, b])
                     u_val = ua - ub
                     if u_val > np.float32(0.0):
                         j |= head._qkpe_bitmasks[c]
@@ -2028,6 +2155,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     POSITIONAL_DIM = args.positional_dim
     QD = args.attn_qk_dim
     ED = args.embedding_dim
+    pe_only = getattr(args, 'PE_only', False)
 
     q_grad = q_grad_out if q_grad_out is not None else head._q_grad
     k_grad = k_grad_out if k_grad_out is not None else head._k_grad
@@ -2046,8 +2174,9 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     y_dim = lutFinal.y_dim
 
     if update_stats is not None and not skip_s_update:
-        update_stats.record_simple(f'{stats_prefix}_Q', lutQ, head._q_j)
-        update_stats.record_simple(f'{stats_prefix}_K', lutK, head._k_j)
+        if not pe_only:
+            update_stats.record_simple(f'{stats_prefix}_Q', lutQ, head._q_j)
+            update_stats.record_simple(f'{stats_prefix}_K', lutK, head._k_j)
         update_stats.record_simple(f'{stats_prefix}_V', lutV, head._val_j)
         for tok_i in range(1, CS):
             rows = np.zeros((tok_i, N_T), dtype=np.int32)
@@ -2071,7 +2200,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
             POSITIONAL_DIM, CS, N_T, y_dim, QD,
-            np.float32(learning_rate), skip_s_update)
+            np.float32(learning_rate), skip_s_update, pe_only)
     else:
         for tok_i in range(1, CS):
             y_g = y_grad[tok_i, :y_dim]
@@ -2102,10 +2231,11 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                     delta_qkpe = gi_qkpe * (-0.5 * sign_qkpe / (1.0 + abs(u_qkpe)) ** 2)
                     a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
                     b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
-                    q_grad[tok_i, a_qkpe] += delta_qkpe
-                    q_grad[tok_i, b_qkpe] -= delta_qkpe
-                    k_grad[tok_j, a_qkpe] += delta_qkpe
-                    k_grad[tok_j, b_qkpe] -= delta_qkpe
+                    if not pe_only:
+                        q_grad[tok_i, a_qkpe] += delta_qkpe
+                        q_grad[tok_i, b_qkpe] -= delta_qkpe
+                        k_grad[tok_j, a_qkpe] += delta_qkpe
+                        k_grad[tok_j, b_qkpe] -= delta_qkpe
                     pe_grad[pe_pos, a_qkpe] += delta_qkpe
                     pe_grad[pe_pos, b_qkpe] -= delta_qkpe
 
@@ -2122,31 +2252,32 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     if pe_grad_out is None:
         head.Positional_encoding -= learning_rate * pe_grad
 
-    if HAS_NUMBA and lutQ.S.dtype == np.float32:
-        if skip_s_update:
-            _lut_backward_kernel_noupdate(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
-                                          q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
-                                          QD, CS, Q_N_T)
+    if not pe_only:
+        if HAS_NUMBA and lutQ.S.dtype == np.float32:
+            if skip_s_update:
+                _lut_backward_kernel_noupdate(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
+                                              q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
+                                              QD, CS, Q_N_T)
+            else:
+                _lut_backward_kernel(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
+                                     q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
+                                     QD, CS, Q_N_T, np.float32(learning_rate))
         else:
-            _lut_backward_kernel(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
-                                 q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
-                                 QD, CS, Q_N_T, np.float32(learning_rate))
-    else:
-        _lut_backward_python(lutQ, head._q_j, head._q_r_min, head._q_u_min,
-                             q_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+            _lut_backward_python(lutQ, head._q_j, head._q_r_min, head._q_u_min,
+                                 q_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
 
-    if HAS_NUMBA and lutK.S.dtype == np.float32:
-        if skip_s_update:
-            _lut_backward_kernel_noupdate(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
-                                          k_grad, x_grad, lutK.a_arr, lutK.b_arr,
-                                          QD, CS, Q_N_T)
+        if HAS_NUMBA and lutK.S.dtype == np.float32:
+            if skip_s_update:
+                _lut_backward_kernel_noupdate(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
+                                              k_grad, x_grad, lutK.a_arr, lutK.b_arr,
+                                              QD, CS, Q_N_T)
+            else:
+                _lut_backward_kernel(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
+                                     k_grad, x_grad, lutK.a_arr, lutK.b_arr,
+                                     QD, CS, Q_N_T, np.float32(learning_rate))
         else:
-            _lut_backward_kernel(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
-                                 k_grad, x_grad, lutK.a_arr, lutK.b_arr,
-                                 QD, CS, Q_N_T, np.float32(learning_rate))
-    else:
-        _lut_backward_python(lutK, head._k_j, head._k_r_min, head._k_u_min,
-                             k_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+            _lut_backward_python(lutK, head._k_j, head._k_r_min, head._k_u_min,
+                                 k_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
 
     if HAS_NUMBA and lutV.S.dtype == np.float32:
         if skip_s_update:
@@ -2653,7 +2784,8 @@ def _replay_attn_task(S, jV_list, jPE_list, ygrad_list, PE, pe_grad_list,
 def _replay_new_attn_task(head, q_j_list, k_j_list, val_j_list,
                           final_v_j_list, qkpe_j_list, ygrad_list,
                           q_grad_list, k_grad_list, v_grad_list,
-                          pe_grad_list, CS, N_T, Q_N_T, scale, use_numba):
+                          pe_grad_list, CS, N_T, Q_N_T, scale, use_numba,
+                          pe_only=False):
     """Replay new-attention Q/K/V/Final S updates and vector PE updates."""
     q_lut = head.Q
     k_lut = head.K
@@ -2664,19 +2796,20 @@ def _replay_new_attn_task(head, q_j_list, k_j_list, val_j_list,
     for q_j, k_j, val_j, final_v_j, qkpe_j, y_grad, q_grad, k_grad, v_grad in zip(
             q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list,
             ygrad_list, q_grad_list, k_grad_list, v_grad_list):
-        if use_numba and q_lut.S.dtype == np.float32:
-            _lut_s_replay_kernel(q_lut.S, q_lut.trees, q_j, q_grad,
-                                 q_lut.y_dim, CS, Q_N_T, scale)
-        else:
-            for pos in range(CS):
-                q_lut.S[q_lut.trees, q_j[pos]] -= scale * q_grad[pos, :q_lut.y_dim]
+        if not pe_only:
+            if use_numba and q_lut.S.dtype == np.float32:
+                _lut_s_replay_kernel(q_lut.S, q_lut.trees, q_j, q_grad,
+                                     q_lut.y_dim, CS, Q_N_T, scale)
+            else:
+                for pos in range(CS):
+                    q_lut.S[q_lut.trees, q_j[pos]] -= scale * q_grad[pos, :q_lut.y_dim]
 
-        if use_numba and k_lut.S.dtype == np.float32:
-            _lut_s_replay_kernel(k_lut.S, k_lut.trees, k_j, k_grad,
-                                 k_lut.y_dim, CS, Q_N_T, scale)
-        else:
-            for pos in range(CS):
-                k_lut.S[k_lut.trees, k_j[pos]] -= scale * k_grad[pos, :k_lut.y_dim]
+            if use_numba and k_lut.S.dtype == np.float32:
+                _lut_s_replay_kernel(k_lut.S, k_lut.trees, k_j, k_grad,
+                                     k_lut.y_dim, CS, Q_N_T, scale)
+            else:
+                for pos in range(CS):
+                    k_lut.S[k_lut.trees, k_j[pos]] -= scale * k_grad[pos, :k_lut.y_dim]
 
         if use_numba and v_lut.S.dtype == np.float32:
             _lut_s_replay_kernel(v_lut.S, v_lut.trees, val_j, v_grad,
@@ -2784,8 +2917,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                 if update_stats is not None:
                     for q_j, k_j, val_j, final_v_j, qkpe_j in zip(
                             q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list):
-                        update_stats.record_simple(f'head_{l}_{h}_Q', head.Q, q_j)
-                        update_stats.record_simple(f'head_{l}_{h}_K', head.K, k_j)
+                        if not getattr(args, 'PE_only', False):
+                            update_stats.record_simple(f'head_{l}_{h}_Q', head.Q, q_j)
+                            update_stats.record_simple(f'head_{l}_{h}_K', head.K, k_j)
                         update_stats.record_simple(f'head_{l}_{h}_V', head.V, val_j)
                         for tok_i in range(1, CS):
                             rows = np.zeros((tok_i, N_T), dtype=np.int32)
@@ -2800,7 +2934,8 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                                    _pg=pe_grad_list:
                             _replay_new_attn_task(_head, _qj, _kj, _vj, _fvj, _qkpj, _y,
                                                   _qg, _kg, _vg, _pg,
-                                                  CS, N_T, args.attn_qk_n_t, scale, use_numba))
+                                                  CS, N_T, args.attn_qk_n_t, scale, use_numba,
+                                                  getattr(args, 'PE_only', False)))
             elif getattr(args, 'soft_attention', False):
                 jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
                 jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
@@ -3204,7 +3339,11 @@ def main():
                         help='Directory for cached POS encodings used by --POS-task')
     parser.add_argument('--new-attention', action='store_true',
                         help='Use new attention implementation (default: off)')
+    parser.add_argument('--PE-only', dest='PE_only', action='store_true',
+                        help='With --new-attention, zero Q/K embeddings and train PE+V+Final only')
     args = parser.parse_args()
+    if args.PE_only and not args.new_attention:
+        parser.error('--PE-only requires --new-attention')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
 
@@ -3289,6 +3428,7 @@ def main():
     print(f"  POS_task          = {args.POS_task}")
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print(f"  new_attention     = {args.new_attention}")
+    print(f"  PE_only           = {args.PE_only}")
     print("=" * 50)
 
     wandb_run = None

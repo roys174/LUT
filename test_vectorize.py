@@ -5,7 +5,9 @@ import pytest
 from types import SimpleNamespace
 
 from main import (
-    LUT, build_LUT, CONCATENATE_vec, _f32,
+    LUT, Model, BatchElement, build_LUT, build_Model, CONCATENATE_vec, _f32,
+    apply_averaged_gradients, model_backward, model_forward,
+    new_attention_backward, new_attention_forward,
     fill_vector_with_random_integers,
     fill_vector_with_random_integers_different_from_vector2,
 )
@@ -459,3 +461,134 @@ class TestConcatenatedLUTBackward:
         # Check S was updated identically
         for i in range(args.n_t):
             np.testing.assert_allclose(lut.S[i].ravel(), S_list[i], atol=1e-6)
+
+
+
+def randomize_lut_values(lut):
+    lut.S[:] = np.random.randn(*lut.S.shape).astype(np.float32)
+
+
+def randomize_pe_only_attention_values(model):
+    head = model.head[0][0]
+    randomize_lut_values(head.Q)
+    randomize_lut_values(head.K)
+    randomize_lut_values(head.V)
+    randomize_lut_values(head.Final)
+    return head
+
+
+def make_pe_only_model_args(batch_size=1):
+    args = SimpleNamespace(
+        vocab_size_input=8,
+        vocab_size_output=5,
+        context_size=4,
+        embedding_dim=4,
+        positional_dim=2,
+        num_layers=1,
+        num_heads=1,
+        n_t=2,
+        n_c=2,
+        attn_qk_dim=2,
+        attn_qk_n_c=2,
+        attn_qk_n_t=2,
+        factored_output=False,
+        fp16=False,
+        batch_size=batch_size,
+        cpu_cores=1,
+        num_workers=1,
+        numba_threads=1,
+        replay_workers=1,
+        soft_attention=False,
+        layernorm=False,
+        dropout=0.0,
+        POS_task=False,
+        new_attention=True,
+        PE_only=True,
+    )
+    args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+    args.shift_qk = args.n_c + args.positional_dim
+    return args
+
+
+class TestPEOnlyNewAttention:
+    def test_forward_ignores_qk_and_uses_pe(self):
+        args = make_pe_only_model_args()
+        np.random.seed(123)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y_base = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y_base, args)
+        np.testing.assert_array_equal(head._q_embed, np.zeros_like(head._q_embed))
+        np.testing.assert_array_equal(head._k_embed, np.zeros_like(head._k_embed))
+
+        head.Q.S += np.random.randn(*head.Q.S.shape).astype(np.float32) * 100.0
+        head.K.S += np.random.randn(*head.K.S.shape).astype(np.float32) * 100.0
+        y_after_qk = np.zeros_like(y_base)
+        new_attention_forward(head, x, y_after_qk, args)
+        np.testing.assert_allclose(y_after_qk, y_base, atol=1e-6)
+
+        head.Positional_encoding[:] = 0.0
+        y_pe_zero = np.zeros_like(y_base)
+        new_attention_forward(head, x, y_pe_zero, args)
+        head.Positional_encoding[:, 0] = 10.0
+        head.Positional_encoding[:, 1] = -10.0
+        y_pe_changed = np.zeros_like(y_base)
+        new_attention_forward(head, x, y_pe_changed, args)
+        assert not np.allclose(y_pe_changed, y_pe_zero)
+
+    def test_backward_does_not_update_qk(self):
+        args = make_pe_only_model_args()
+        np.random.seed(456)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        q_before = head.Q.S.copy()
+        k_before = head.K.S.copy()
+        final_before = head.Final.S.copy()
+        pe_before = head.Positional_encoding.copy()
+        x_grad = np.zeros_like(x)
+        y_grad = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        main_module.learning_rate = 0.05
+        new_attention_backward(head, x_grad, y_grad, args)
+
+        np.testing.assert_array_equal(head.Q.S, q_before)
+        np.testing.assert_array_equal(head.K.S, k_before)
+        assert np.any(head.Final.S != final_before)
+        assert np.any(head.Positional_encoding != pe_before)
+
+    def test_batch_replay_does_not_update_qk(self):
+        args = make_pe_only_model_args(batch_size=2)
+        np.random.seed(789)
+        model = Model(args)
+        build_Model(model, args)
+        randomize_pe_only_attention_values(model)
+        randomize_lut_values(model.output_head.unembedder)
+        batch_elements = [BatchElement(model, args) for _ in range(args.batch_size)]
+
+        for i, be in enumerate(batch_elements):
+            be.z[:] = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+            be.tokens[:] = np.arange(args.context_size + 1, dtype=np.int32) % args.vocab_size_input
+            model_forward(be, args, training=True)
+            be.output_head.output[:] = (i + 1) * np.ones_like(be.output_head.output, dtype=np.float32)
+            model_backward(be, args, grad_accum=be.grad_accum)
+
+        head = model.head[0][0]
+        q_before = head.Q.S.copy()
+        k_before = head.K.S.copy()
+        final_before = head.Final.S.copy()
+        pe_before = head.Positional_encoding.copy()
+
+        apply_averaged_gradients(model, batch_elements, 0.05, args)
+
+        np.testing.assert_array_equal(head.Q.S, q_before)
+        np.testing.assert_array_equal(head.K.S, k_before)
+        assert np.any(head.Final.S != final_before)
+        assert np.any(head.Positional_encoding != pe_before)
