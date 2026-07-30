@@ -11,6 +11,7 @@ import math
 import os
 import random
 import sys
+from pathlib import Path
 import numpy as np
 import tiktoken
 from word_tokenizer import POS_LABELS, WordTokenizer
@@ -409,6 +410,59 @@ class LUTUpdateStats:
                 self._write_joint_top(
                     f, name, row_component, col_component, self.j_joint_counts[key])
         return summary_path, hist_path, j_stats_path, j_summary_path, j_top_path
+
+
+def parse_lut_update_snapshot_steps(text):
+    steps = set()
+    for part in (text or "").split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            step = int(part)
+        except ValueError as exc:
+            raise ValueError(
+                f"Bad --lut-update-stats-snapshot-steps value {text!r}; "
+                "expected comma-separated positive integers") from exc
+        if step < 1:
+            raise ValueError(
+                f"Bad --lut-update-stats-snapshot-steps value {text!r}; "
+                "steps must be 1-based positive integers")
+        steps.add(step)
+    return steps
+
+
+def lut_update_snapshot_path(path, step):
+    base = Path(path)
+    suffix = base.suffix or '.npz'
+    if suffix == '.npz':
+        return str(base.with_name(f"{base.stem}_step_{step}{suffix}"))
+    return str(base.with_name(f"{base.name}_step_{step}{suffix}"))
+
+
+def save_lut_update_stats(update_stats, base_path, step=None):
+    summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(base_path)
+    saved = {
+        'stats_path': base_path,
+        'summary_path': summary_path,
+        'hist_path': hist_path,
+        'j_stats_path': j_stats_path,
+        'j_summary_path': j_summary_path,
+        'j_top_path': j_top_path,
+    }
+    if step is not None:
+        snapshot_path = lut_update_snapshot_path(base_path, step)
+        snapshot_summary, snapshot_hist, snapshot_j_stats, snapshot_j_summary, snapshot_j_top = update_stats.save(snapshot_path)
+        saved.update({
+            'snapshot_path': snapshot_path,
+            'snapshot_summary_path': snapshot_summary,
+            'snapshot_hist_path': snapshot_hist,
+            'snapshot_j_stats_path': snapshot_j_stats,
+            'snapshot_j_summary_path': snapshot_j_summary,
+            'snapshot_j_top_path': snapshot_j_top,
+        })
+    return saved
+
 
 class NewAttentionHead:
     __slots__ = ['V', 'Final', 'Score', 'Value', 'Positional_encoding',
@@ -3523,6 +3577,8 @@ def main():
                         help='Path to load model weights (.npz) before training begins')
     parser.add_argument('--lut-update-stats-file', type=str, default=None,
                         help='Optional .npz path for per-LUT table-row update counts')
+    parser.add_argument('--lut-update-stats-snapshot-steps', type=str, default=None,
+                        help='Comma-separated 1-based training steps at which to save step-tagged LUT update stats snapshots')
     parser.add_argument('--wandb', action='store_true',
                         help='Log training and validation metrics to Weights & Biases')
     parser.add_argument('--wandb-project', type=str, default='lut',
@@ -3676,6 +3732,12 @@ def main():
         load_model(m, args.load_model, args)
     print_model_stats(m, args)
     update_stats = LUTUpdateStats() if args.lut_update_stats_file is not None else None
+    try:
+        lut_update_snapshot_steps = parse_lut_update_snapshot_steps(
+            args.lut_update_stats_snapshot_steps)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
 
     batch_size = args.batch_size
     if batch_size > 1:
@@ -3733,6 +3795,15 @@ def main():
                 "train/learning_rate": learning_rate,
             })
 
+        current_step = t + 1
+        if update_stats is not None and current_step in lut_update_snapshot_steps:
+            saved_stats = save_lut_update_stats(
+                update_stats, args.lut_update_stats_file, current_step)
+            tqdm.write(
+                f"Saved LUT update stats snapshot step {current_step} to "
+                f"{saved_stats['snapshot_path']}; base stats refreshed at "
+                f"{saved_stats['stats_path']}")
+
         if t % args.validation_interval == 0:
             pbar.set_description("Validating")
 
@@ -3775,10 +3846,12 @@ def main():
                 save_model(m, args.save_model, args)
                 tqdm.write(f"Saved model to {args.save_model}.npz")
             if update_stats is not None:
-                summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(args.lut_update_stats_file)
+                saved_stats = save_lut_update_stats(update_stats, args.lut_update_stats_file)
                 tqdm.write(
-                    f"Saved LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}; "
-                    f"j stats to {j_stats_path}, {j_summary_path}, and {j_top_path}")
+                    f"Saved LUT update stats to {saved_stats['stats_path']}, "
+                    f"{saved_stats['summary_path']}, and {saved_stats['hist_path']}; "
+                    f"j stats to {saved_stats['j_stats_path']}, "
+                    f"{saved_stats['j_summary_path']}, and {saved_stats['j_top_path']}")
 
             # Print validation result and sample generation
             tqdm.write(
@@ -3825,10 +3898,12 @@ def main():
         save_model(m, args.save_model, args)
         print(f"Saved final model to {args.save_model}.npz")
     if update_stats is not None:
-        summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(args.lut_update_stats_file)
+        saved_stats = save_lut_update_stats(update_stats, args.lut_update_stats_file)
         print(
-            f"Saved final LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}; "
-            f"j stats to {j_stats_path}, {j_summary_path}, and {j_top_path}")
+            f"Saved final LUT update stats to {saved_stats['stats_path']}, "
+            f"{saved_stats['summary_path']}, and {saved_stats['hist_path']}; "
+            f"j stats to {saved_stats['j_stats_path']}, "
+            f"{saved_stats['j_summary_path']}, and {saved_stats['j_top_path']}")
 
     if pool is not None:
         pool.close()

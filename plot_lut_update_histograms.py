@@ -10,6 +10,7 @@ usage, component marginals, and qkpe/final_v joint distributions.
 
 import argparse
 import csv
+import math
 import os
 import re
 import sys
@@ -467,15 +468,177 @@ def plot_j_stats(j_stats, out_dir, args, plt, selected_by_name):
     return written
 
 
+STEP_RE = re.compile(r"^(?P<stem>.+)_step_(?P<step>\d+)\.npz$")
+
+
+def snapshot_step(path):
+    match = STEP_RE.match(Path(path).name)
+    return int(match.group("step")) if match else None
+
+
+def snapshot_label(path):
+    step = snapshot_step(path)
+    return f"step_{step}" if step is not None else Path(path).stem
+
+
+def snapshot_sort_key(path):
+    step = snapshot_step(path)
+    return (step is None, step if step is not None else 10**18, Path(path).name)
+
+
+def discover_stats_inputs(input_path, out_dir_arg):
+    path = Path(input_path)
+    if path.is_dir():
+        out_dir = Path(out_dir_arg) if out_dir_arg else path
+        run_dir = path.parent
+        snapshots = sorted(run_dir.glob("lut_update_stats_step_*.npz"), key=snapshot_sort_key)
+        stats_files = [p for p in snapshots if not p.name.endswith("_j_stats.npz")]
+        if not stats_files:
+            base = run_dir / "lut_update_stats.npz"
+            if base.exists():
+                stats_files = [base]
+        if not stats_files:
+            raise FileNotFoundError(f"No lut_update_stats*.npz files found next to {path}")
+        return stats_files, out_dir, True
+
+    stats_path = path
+    out_dir = Path(out_dir_arg) if out_dir_arg else stats_path.with_suffix("").parent / (stats_path.stem + "_row_plots")
+    return [stats_path], out_dir, False
+
+
+def selected_tables_for_stats(stats, args, rng, filters, samples):
+    layer_filter, head_filter = filters
+    ffn_sample, attention_sample, new_attention_sample = samples
+    selected = {}
+    for lut_name in sorted(stats):
+        if not lut_passes_filters(lut_name, layer_filter, head_filter,
+                                  args.min_layer, args.max_layer):
+            continue
+        counts = stats[lut_name]
+        if counts.ndim != 2:
+            continue
+        tables = selected_tables_for_name(
+            lut_name, counts.shape[0], rng, ffn_sample, attention_sample,
+            new_attention_sample, args.include_other_luts)
+        if tables.size:
+            selected[lut_name] = tables
+    return selected
+
+
+def coverage_rows_for_stats(stats, step_label, args, rng, filters, samples):
+    rows = []
+    selected = selected_tables_for_stats(stats, args, rng, filters, samples)
+    for lut_name, tables in selected.items():
+        counts = stats[lut_name]
+        group = lut_group(lut_name)
+        for table_idx in tables:
+            row_counts = counts[int(table_idx)]
+            n_rows = int(row_counts.size)
+            nonzero_rows = int(np.count_nonzero(row_counts))
+            rows.append({
+                "step_label": step_label,
+                "step": snapshot_step_from_label(step_label),
+                "lut": lut_name,
+                "group": group,
+                "table": int(table_idx),
+                "n_rows": n_rows,
+                "nonzero_rows": nonzero_rows,
+                "nonzero_pct": 100.0 * nonzero_rows / n_rows if n_rows else 0.0,
+                "total_updates": int(row_counts.sum()),
+            })
+    return rows
+
+
+def snapshot_step_from_label(label):
+    if label.startswith("step_"):
+        try:
+            return int(label.split("_", 1)[1])
+        except ValueError:
+            return ""
+    return ""
+
+
+def write_coverage_timeline(out_dir, coverage_rows):
+    if not coverage_rows:
+        return None
+    path = out_dir / "nonzero_pct_timeline.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "step_label", "step", "lut", "group", "table", "n_rows",
+            "nonzero_rows", "nonzero_pct", "total_updates",
+        ])
+        writer.writeheader()
+        writer.writerows(coverage_rows)
+    return path
+
+
+def plot_coverage_timeline(out_dir, coverage_rows, plt):
+    if not coverage_rows:
+        return []
+    written = []
+    labels = []
+    for row in coverage_rows:
+        if row["step_label"] not in labels:
+            labels.append(row["step_label"])
+    x = np.arange(len(labels))
+
+    groups = sorted({row["group"] for row in coverage_rows})
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for group in groups:
+        y = []
+        for label in labels:
+            values = [row["nonzero_pct"] for row in coverage_rows
+                      if row["step_label"] == label and row["group"] == group]
+            y.append(float(np.mean(values)) if values else math.nan)
+        ax.plot(x, y, marker="o", label=group)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("mean non-zero update rows (% of table)")
+    ax.set_title("Non-zero update coverage over saved snapshots")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    path = out_dir / "nonzero_pct_over_steps_by_group.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    written.append(path)
+
+    lut_names = sorted({row["lut"] for row in coverage_rows})
+    fig, ax = plt.subplots(figsize=(max(10, 0.35 * len(lut_names)), 5.5))
+    for lut_name in lut_names:
+        y = []
+        for label in labels:
+            values = [row["nonzero_pct"] for row in coverage_rows
+                      if row["step_label"] == label and row["lut"] == lut_name]
+            y.append(float(np.mean(values)) if values else math.nan)
+        ax.plot(x, y, marker="o", linewidth=1.0, label=lut_name)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("mean non-zero update rows (% of sampled tables)")
+    ax.set_title("Non-zero update coverage over saved snapshots by LUT")
+    ax.grid(axis="y", alpha=0.25)
+    if len(lut_names) <= 18:
+        ax.legend(loc="best", fontsize=8)
+    else:
+        ax.text(0.99, 0.02, f"{len(lut_names)} LUTs; see CSV for labels",
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
+    fig.tight_layout()
+    path = out_dir / "nonzero_pct_over_steps_by_lut.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    written.append(path)
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot LUT row index vs updates, plus aggregate j statistics when present."
     )
-    parser.add_argument("stats_npz", help="Path to raw LUT update stats .npz")
+    parser.add_argument("stats_npz", help="Path to raw LUT update stats .npz, or a lut_update_plots directory to discover snapshots")
     parser.add_argument("--out-dir", default=None,
-                        help="Directory for PNG plots (default: <npz stem>_row_plots next to input)")
+                        help="Directory for PNG plots (default: <npz stem>_row_plots, or the input plot directory)")
     parser.add_argument("--j-stats-npz", default=None,
-                        help="Path to companion j-stats .npz (default: <stats stem>_j_stats.npz)")
+                        help="Path to companion j-stats .npz for single-file mode (default: <stats stem>_j_stats.npz)")
     parser.add_argument("--no-j-stats", action="store_true",
                         help="Only plot row-update stats; do not load or plot companion j stats")
     parser.add_argument("--j-top-n", type=int, default=20,
@@ -506,29 +669,12 @@ def main():
                         help="Open interactive plot windows instead of only writing PNG files")
     args = parser.parse_args()
 
-    stats_path = Path(args.stats_npz)
-    out_dir = Path(args.out_dir) if args.out_dir else stats_path.with_suffix("").parent / (stats_path.stem + "_row_plots")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        stats = load_stats(stats_path)
-    except ValueError as exc:
+        stats_paths, out_dir, discovered_from_plot_dir = discover_stats_inputs(args.stats_npz, args.out_dir)
+    except OSError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-
-    if not stats:
-        print(f"No arrays found in {stats_path}", file=sys.stderr)
-        return 1
-
-    j_path = None
-    j_stats = {"simple": {}, "components": {}, "joints": {}}
-    if not args.no_j_stats:
-        try:
-            requested_j_path = Path(args.j_stats_npz) if args.j_stats_npz else default_j_stats_path(stats_path)
-            j_path, j_stats = load_j_stats(requested_j_path)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("MPLCONFIGDIR", str(out_dir / ".mplconfig"))
     os.environ.setdefault("XDG_CACHE_HOME", str(out_dir / ".cache"))
@@ -554,22 +700,55 @@ def main():
         return 1
     filters = (layer_filter, head_filter)
 
-    row_rng = np.random.default_rng(args.sample_seed)
-    written = plot_row_stats(stats, out_dir, args, plt, row_rng, filters, samples)
+    all_written = []
+    coverage_rows = []
+    for stats_path in stats_paths:
+        try:
+            stats = load_stats(stats_path)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if not stats:
+            print(f"No arrays found in {stats_path}", file=sys.stderr)
+            return 1
 
-    if j_path is not None:
-        j_rng = np.random.default_rng(args.sample_seed)
-        selected_by_name = selected_j_tables(j_stats, args, j_rng, filters, samples)
-        report_path = write_j_report(out_dir, j_stats, selected_by_name, args.j_top_n)
-        written.extend(plot_j_stats(j_stats, out_dir, args, plt, selected_by_name))
-        print(f"Loaded j stats from {j_path}")
-        if report_path is not None:
-            written.append(report_path)
-            print(f"Wrote j-stat top/zero/scarce report to {report_path}")
-    elif not args.no_j_stats:
-        print(f"No j stats found at {args.j_stats_npz or default_j_stats_path(stats_path)}")
+        label = snapshot_label(stats_path)
+        step_out_dir = out_dir / label if len(stats_paths) > 1 else out_dir
+        step_out_dir.mkdir(parents=True, exist_ok=True)
 
-    for path in written:
+        row_rng = np.random.default_rng(args.sample_seed)
+        all_written.extend(plot_row_stats(stats, step_out_dir, args, plt, row_rng, filters, samples))
+        timeline_rng = np.random.default_rng(args.sample_seed)
+        coverage_rows.extend(coverage_rows_for_stats(stats, label, args, timeline_rng, filters, samples))
+
+        j_path = None
+        j_stats = {"simple": {}, "components": {}, "joints": {}}
+        if not args.no_j_stats:
+            try:
+                requested_j_path = Path(args.j_stats_npz) if args.j_stats_npz and len(stats_paths) == 1 else default_j_stats_path(stats_path)
+                j_path, j_stats = load_j_stats(requested_j_path)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        if j_path is not None:
+            j_rng = np.random.default_rng(args.sample_seed)
+            selected_by_name = selected_j_tables(j_stats, args, j_rng, filters, samples)
+            report_path = write_j_report(step_out_dir, j_stats, selected_by_name, args.j_top_n)
+            all_written.extend(plot_j_stats(j_stats, step_out_dir, args, plt, selected_by_name))
+            print(f"Loaded j stats from {j_path}")
+            if report_path is not None:
+                all_written.append(report_path)
+                print(f"Wrote j-stat top/zero/scarce report to {report_path}")
+        elif not args.no_j_stats:
+            print(f"No j stats found at {args.j_stats_npz or default_j_stats_path(stats_path)}")
+
+    if len(stats_paths) > 1:
+        timeline_csv = write_coverage_timeline(out_dir, coverage_rows)
+        if timeline_csv is not None:
+            all_written.append(timeline_csv)
+        all_written.extend(plot_coverage_timeline(out_dir, coverage_rows, plt))
+
+    for path in all_written:
         print(path)
     return 0
 
