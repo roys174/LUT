@@ -137,31 +137,222 @@ class LUT:
 
 
 class LUTUpdateStats:
-    """Counts how often each LUT table row receives an S update."""
+    """Counts row and j-bin usage for LUT S updates."""
     def __init__(self):
         self.counts = {}
+        self.j_counts = {}
+        self.j_component_counts = {}
+        self.j_joint_counts = {}
 
     def ensure(self, name, lut):
         if name not in self.counts:
             self.counts[name] = np.zeros(lut.S.shape[:2], dtype=np.uint64)
 
+    def ensure_j(self, name, n_tables, n_bins):
+        if name not in self.j_counts:
+            self.j_counts[name] = np.zeros((n_tables, n_bins), dtype=np.uint64)
+
+    def ensure_j_component(self, name, component, n_tables, n_bins):
+        key = (name, component)
+        if key not in self.j_component_counts:
+            self.j_component_counts[key] = np.zeros((n_tables, n_bins), dtype=np.uint64)
+
+    def ensure_j_joint(self, name, row_component, col_component,
+                       n_tables, n_row_bins, n_col_bins):
+        key = (name, row_component, col_component)
+        if key not in self.j_joint_counts:
+            self.j_joint_counts[key] = np.zeros(
+                (n_tables, n_row_bins, n_col_bins), dtype=np.uint64)
+
+    @staticmethod
+    def _add_2d_counts(counts, tables, values):
+        flat = (np.asarray(tables, dtype=np.int64) * counts.shape[1]
+                + np.asarray(values, dtype=np.int64)).ravel()
+        if flat.size:
+            counts.ravel()[:] += np.bincount(flat, minlength=counts.size).astype(np.uint64)
+
     def record_rows(self, name, lut, trees, rows):
         self.ensure(name, lut)
-        counts = self.counts[name]
-        flat = (np.asarray(trees, dtype=np.int64) * counts.shape[1]
-                + np.asarray(rows, dtype=np.int64)).ravel()
+        self._add_2d_counts(self.counts[name], trees, rows)
+
+    def record_j_values(self, name, n_tables, n_bins, tables, j_values):
+        self.ensure_j(name, n_tables, n_bins)
+        self._add_2d_counts(self.j_counts[name], tables, j_values)
+
+    def record_j_component(self, name, component, n_tables, n_bins, tables, j_values):
+        self.ensure_j_component(name, component, n_tables, n_bins)
+        self._add_2d_counts(self.j_component_counts[(name, component)], tables, j_values)
+
+    def record_j_joint(self, name, row_component, col_component,
+                       n_tables, n_row_bins, n_col_bins,
+                       tables, row_values, col_values):
+        self.ensure_j_joint(name, row_component, col_component,
+                            n_tables, n_row_bins, n_col_bins)
+        counts = self.j_joint_counts[(name, row_component, col_component)]
+        flat = (
+            np.asarray(tables, dtype=np.int64) * n_row_bins * n_col_bins
+            + np.asarray(row_values, dtype=np.int64) * n_col_bins
+            + np.asarray(col_values, dtype=np.int64)
+        ).ravel()
         if flat.size:
             counts.ravel()[:] += np.bincount(flat, minlength=counts.size).astype(np.uint64)
 
     def record_simple(self, name, lut, j):
         trees = np.broadcast_to(lut.trees, j.shape)
         self.record_rows(name, lut, trees, j)
+        self.record_j_values(name, lut.S.shape[0], lut.S.shape[1], trees, j)
+
+    def record_attention_rows(self, name, lut, jV, jPE, args):
+        CS = args.context_size
+        n_tables = lut.S.shape[0]
+        trees = np.asarray(lut.trees, dtype=np.int32)
+        qk_bins = 1 << args.n_c
+        pe_bins = 1 << args.positional_dim
+        for pos in range(1, CS):
+            jQ = jV[pos]
+            jK = jV[:pos]
+            pe_idx = pos - np.arange(pos)
+            jPE_slice = jPE[pe_idx]
+            j_bins = (jQ << args.shift_qk) | (jK << args.positional_dim) | jPE_slice
+            tree_rows = np.broadcast_to(trees, j_bins.shape)
+            self.record_rows(name, lut, tree_rows, j_bins)
+            self.record_j_component(
+                name, "q", n_tables, qk_bins, tree_rows,
+                np.broadcast_to(jQ, j_bins.shape))
+            self.record_j_component(name, "k", n_tables, qk_bins, tree_rows, jK)
+            self.record_j_component(name, "pe", n_tables, pe_bins, tree_rows, jPE_slice)
+
+    def record_new_attention_final(self, name, lut, final_v_j, qkpe_j, args):
+        CS = args.context_size
+        N_T = args.n_t
+        pd = args.positional_dim
+        n_tables = lut.S.shape[0]
+        final_v_bins = 1 << args.n_c
+        qkpe_bins = 1 << pd
+        trees = np.asarray(lut.trees, dtype=np.int32)
+        for tok_i in range(1, CS):
+            rows = np.zeros((tok_i, N_T), dtype=np.int32)
+            qkpe_rows = np.zeros((tok_i, N_T), dtype=np.int32)
+            final_v_rows = np.zeros((tok_i, N_T), dtype=np.int32)
+            for tok_j in range(tok_i):
+                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
+                qkpe_rows[tok_j] = qkpe_j[pair_idx]
+                final_v_rows[tok_j] = final_v_j[tok_j]
+                rows[tok_j] = (final_v_rows[tok_j] << pd) | qkpe_rows[tok_j]
+            tree_rows = np.broadcast_to(trees, rows.shape)
+            self.record_rows(name, lut, tree_rows, rows)
+            self.record_j_component(
+                name, "qkpe", n_tables, qkpe_bins, tree_rows, qkpe_rows)
+            self.record_j_component(
+                name, "final_v", n_tables, final_v_bins, tree_rows, final_v_rows)
+            self.record_j_joint(
+                name, "qkpe", "final_v", n_tables, qkpe_bins, final_v_bins,
+                tree_rows, qkpe_rows, final_v_rows)
+
+    @staticmethod
+    def j_stats_path(path):
+        return path[:-4] + "_j_stats.npz" if path.endswith(".npz") else path + "_j_stats.npz"
+
+    @staticmethod
+    def _write_distribution_summary(f, kind, name, component, counts):
+        for table_idx in range(counts.shape[0]):
+            table_counts = counts[table_idx]
+            total = int(table_counts.sum())
+            max_bin = int(np.argmax(table_counts)) if table_counts.size else -1
+            f.write(
+                f"{kind},{name},{component},{table_idx},{total},"
+                f"{int(np.count_nonzero(table_counts))},{table_counts.size},"
+                f"{float(table_counts.mean()):.6f},"
+                f"{float(table_counts.var()):.6f},"
+                f"{int(table_counts.max()) if table_counts.size else 0},{max_bin}\n"
+            )
+
+    @staticmethod
+    def _write_distribution_top(f, kind, name, component, counts, top_n=20):
+        for table_idx in range(counts.shape[0]):
+            table_counts = counts[table_idx]
+            total = int(table_counts.sum())
+            if table_counts.size == 0:
+                continue
+            order = np.argsort(table_counts)[::-1][:min(top_n, table_counts.size)]
+            for rank, bin_idx in enumerate(order, start=1):
+                count = int(table_counts[bin_idx])
+                if count == 0:
+                    break
+                share = float(count / total) if total else 0.0
+                f.write(
+                    f"top,{kind},{name},{component},{table_idx},{rank},"
+                    f"{int(bin_idx)},,{count},{share:.8f}\n"
+                )
+            zero_bins = np.flatnonzero(table_counts == 0)[:top_n]
+            for rank, bin_idx in enumerate(zero_bins, start=1):
+                f.write(
+                    f"zero,{kind},{name},{component},{table_idx},{rank},"
+                    f"{int(bin_idx)},,0,0.00000000\n"
+                )
+            scarce_bins = np.flatnonzero(table_counts > 0)
+            if scarce_bins.size:
+                scarce_order = scarce_bins[np.argsort(table_counts[scarce_bins])[:top_n]]
+                for rank, bin_idx in enumerate(scarce_order, start=1):
+                    count = int(table_counts[bin_idx])
+                    share = float(count / total) if total else 0.0
+                    f.write(
+                        f"scarce_nonzero,{kind},{name},{component},{table_idx},{rank},"
+                        f"{int(bin_idx)},,{count},{share:.8f}\n"
+                    )
+
+    @staticmethod
+    def _write_joint_summary(f, name, row_component, col_component, counts):
+        for table_idx in range(counts.shape[0]):
+            table_counts = counts[table_idx]
+            flat = table_counts.ravel()
+            total = int(flat.sum())
+            max_flat = int(np.argmax(flat)) if flat.size else 0
+            max_row, max_col = np.unravel_index(max_flat, table_counts.shape)
+            f.write(
+                f"joint,{name},{row_component}_x_{col_component},{table_idx},{total},"
+                f"{int(np.count_nonzero(flat))},{flat.size},"
+                f"{float(flat.mean()):.6f},"
+                f"{float(flat.var()):.6f},"
+                f"{int(flat.max()) if flat.size else 0},{int(max_row)}:{int(max_col)}\n"
+            )
+
+    @staticmethod
+    def _write_joint_top(f, name, row_component, col_component, counts, top_n=20):
+        component = f"{row_component}_x_{col_component}"
+        for table_idx in range(counts.shape[0]):
+            table_counts = counts[table_idx]
+            flat = table_counts.ravel()
+            total = int(flat.sum())
+            if flat.size == 0:
+                continue
+            order = np.argsort(flat)[::-1][:min(top_n, flat.size)]
+            for rank, flat_idx in enumerate(order, start=1):
+                count = int(flat[flat_idx])
+                if count == 0:
+                    break
+                row_idx, col_idx = np.unravel_index(int(flat_idx), table_counts.shape)
+                share = float(count / total) if total else 0.0
+                f.write(
+                    f"top,joint,{name},{component},{table_idx},{rank},"
+                    f"{int(row_idx)},{int(col_idx)},{count},{share:.8f}\n"
+                )
+            zero_flat = np.flatnonzero(flat == 0)[:top_n]
+            for rank, flat_idx in enumerate(zero_flat, start=1):
+                row_idx, col_idx = np.unravel_index(int(flat_idx), table_counts.shape)
+                f.write(
+                    f"zero,joint,{name},{component},{table_idx},{rank},"
+                    f"{int(row_idx)},{int(col_idx)},0,0.00000000\n"
+                )
 
     def save(self, path):
         arrays = {name: counts for name, counts in self.counts.items()}
         np.savez_compressed(path, **arrays)
         summary_path = path[:-4] + "_summary.csv" if path.endswith(".npz") else path + "_summary.csv"
         hist_path = path[:-4] + "_histogram.csv" if path.endswith(".npz") else path + "_histogram.csv"
+        j_stats_path = self.j_stats_path(path)
+        j_summary_path = path[:-4] + "_j_stats_summary.csv" if path.endswith(".npz") else path + "_j_stats_summary.csv"
+        j_top_path = path[:-4] + "_j_stats_top.csv" if path.endswith(".npz") else path + "_j_stats_top.csv"
         with open(summary_path, "w") as f:
             f.write("lut,table,total_updates,updated_rows,total_rows,mean_updates_per_row,var_updates_per_row,max_updates_on_row\n")
             for name in sorted(self.counts):
@@ -184,7 +375,40 @@ class LUTUpdateStats:
                         num_rows = int(hist[updates_per_row])
                         if num_rows:
                             f.write(f"{name},{table_idx},{updates_per_row},{num_rows}\n")
-        return summary_path, hist_path
+
+        j_arrays = {}
+        for name, counts in self.j_counts.items():
+            j_arrays[f"simple__{name}"] = counts
+        for (name, component), counts in self.j_component_counts.items():
+            j_arrays[f"component__{name}__{component}"] = counts
+        for (name, row_component, col_component), counts in self.j_joint_counts.items():
+            j_arrays[f"joint__{name}__{row_component}__{col_component}"] = counts
+        np.savez_compressed(j_stats_path, **j_arrays)
+        with open(j_summary_path, "w") as f:
+            f.write("kind,lut,component,table,total_observations,observed_bins,total_bins,mean_count_per_bin,var_count_per_bin,max_count,max_bin\n")
+            for name in sorted(self.j_counts):
+                self._write_distribution_summary(f, "simple", name, "j", self.j_counts[name])
+            for key in sorted(self.j_component_counts):
+                name, component = key
+                self._write_distribution_summary(
+                    f, "component", name, component, self.j_component_counts[key])
+            for key in sorted(self.j_joint_counts):
+                name, row_component, col_component = key
+                self._write_joint_summary(
+                    f, name, row_component, col_component, self.j_joint_counts[key])
+        with open(j_top_path, "w") as f:
+            f.write("record_type,kind,lut,component,table,rank,bin,bin2,count,share\n")
+            for name in sorted(self.j_counts):
+                self._write_distribution_top(f, "simple", name, "j", self.j_counts[name])
+            for key in sorted(self.j_component_counts):
+                name, component = key
+                self._write_distribution_top(
+                    f, "component", name, component, self.j_component_counts[key])
+            for key in sorted(self.j_joint_counts):
+                name, row_component, col_component = key
+                self._write_joint_top(
+                    f, name, row_component, col_component, self.j_joint_counts[key])
+        return summary_path, hist_path, j_stats_path, j_summary_path, j_top_path
 
 class NewAttentionHead:
     __slots__ = ['V', 'Final', 'Score', 'Value', 'Positional_encoding',
@@ -902,15 +1126,7 @@ def CONCATENATE_QK_PE(QK, PE, args):
 
 
 def record_attention_update_rows(update_stats, name, lut, jV, jPE, args):
-    CS = args.context_size
-    N_T = args.n_t
-    trees = np.arange(N_T, dtype=np.int32)
-    for pos in range(1, CS):
-        jQ = jV[pos]
-        jK = jV[:pos]
-        pe_idx = pos - np.arange(pos)
-        j_bins = (jQ << args.shift_qk) | (jK << args.positional_dim) | jPE[pe_idx]
-        update_stats.record_rows(name, lut, np.broadcast_to(trees, j_bins.shape), j_bins)
+    update_stats.record_attention_rows(name, lut, jV, jPE, args)
 
 
 # ---------------------------------------------------------------------------
@@ -2178,13 +2394,8 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             update_stats.record_simple(f'{stats_prefix}_Q', lutQ, head._q_j)
             update_stats.record_simple(f'{stats_prefix}_K', lutK, head._k_j)
         update_stats.record_simple(f'{stats_prefix}_V', lutV, head._val_j)
-        for tok_i in range(1, CS):
-            rows = np.zeros((tok_i, N_T), dtype=np.int32)
-            for tok_j in range(tok_i):
-                pair_idx = tok_i * (tok_i - 1) // 2 + tok_j
-                rows[tok_j] = (head._final_v_j[tok_j] << POSITIONAL_DIM) | head._qkpe_j[pair_idx]
-            update_stats.record_rows(f'{stats_prefix}_Final', lutFinal,
-                                     np.broadcast_to(treesFinal, rows.shape), rows)
+        update_stats.record_new_attention_final(
+            f'{stats_prefix}_Final', lutFinal, head._final_v_j, head._qkpe_j, args)
 
     if (HAS_NUMBA and lutFinal.S.dtype == np.float32
             and lutQ.S.dtype == np.float32
@@ -2921,13 +3132,8 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                             update_stats.record_simple(f'head_{l}_{h}_Q', head.Q, q_j)
                             update_stats.record_simple(f'head_{l}_{h}_K', head.K, k_j)
                         update_stats.record_simple(f'head_{l}_{h}_V', head.V, val_j)
-                        for tok_i in range(1, CS):
-                            rows = np.zeros((tok_i, N_T), dtype=np.int32)
-                            for tok_j in range(tok_i):
-                                pair = tok_i * (tok_i - 1) // 2 + tok_j
-                                rows[tok_j] = (final_v_j[tok_j] << args.positional_dim) | qkpe_j[pair]
-                            update_stats.record_rows(f'head_{l}_{h}_Final', head.Final,
-                                                     np.broadcast_to(head.Final.trees, rows.shape), rows)
+                        update_stats.record_new_attention_final(
+                            f'head_{l}_{h}_Final', head.Final, final_v_j, qkpe_j, args)
                 work.append(lambda _head=head, _qj=q_j_list, _kj=k_j_list, _vj=val_j_list,
                                    _fvj=final_v_j_list, _qkpj=qkpe_j_list, _y=ygrad_list,
                                    _qg=q_grad_list, _kg=k_grad_list, _vg=v_grad_list,
@@ -3569,8 +3775,10 @@ def main():
                 save_model(m, args.save_model, args)
                 tqdm.write(f"Saved model to {args.save_model}.npz")
             if update_stats is not None:
-                summary_path, hist_path = update_stats.save(args.lut_update_stats_file)
-                tqdm.write(f"Saved LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}")
+                summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(args.lut_update_stats_file)
+                tqdm.write(
+                    f"Saved LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}; "
+                    f"j stats to {j_stats_path}, {j_summary_path}, and {j_top_path}")
 
             # Print validation result and sample generation
             tqdm.write(
@@ -3617,8 +3825,10 @@ def main():
         save_model(m, args.save_model, args)
         print(f"Saved final model to {args.save_model}.npz")
     if update_stats is not None:
-        summary_path, hist_path = update_stats.save(args.lut_update_stats_file)
-        print(f"Saved final LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}")
+        summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(args.lut_update_stats_file)
+        print(
+            f"Saved final LUT update stats to {args.lut_update_stats_file}, {summary_path}, and {hist_path}; "
+            f"j stats to {j_stats_path}, {j_summary_path}, and {j_top_path}")
 
     if pool is not None:
         pool.close()
