@@ -1213,7 +1213,7 @@ def _new_attention_forward_kernel(
     q_trees, k_trees, v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, Q_N_T, QD, y_dim
+    pd, CS, N_T, N_C, Q_N_T, QD, y_dim, qkpe_direct_sign
 ):
     """Fused forward for Q(x_i)+K(x_j)+PE and V(x_j) into Final LUT."""
     n_pairs = CS * (CS - 1) // 2
@@ -1275,11 +1275,14 @@ def _new_attention_forward_kernel(
         u_min_val = np.float32(0.0)
 
         for c in range(pd):
-            a = qkpe_a_arr[t, c]
-            b = qkpe_b_arr[t, c]
-            ua = q_embed[tok_i, a] + k_embed[tok_j, a] + PE[pe_pos, a]
-            ub = q_embed[tok_i, b] + k_embed[tok_j, b] + PE[pe_pos, b]
-            u_val = ua - ub
+            if qkpe_direct_sign:
+                u_val = q_embed[tok_i, c] + k_embed[tok_j, c] + PE[pe_pos, c]
+            else:
+                a = qkpe_a_arr[t, c]
+                b = qkpe_b_arr[t, c]
+                ua = q_embed[tok_i, a] + k_embed[tok_j, a] + PE[pe_pos, a]
+                ub = q_embed[tok_i, b] + k_embed[tok_j, b] + PE[pe_pos, b]
+                u_val = ua - ub
             if u_val > np.float32(0.0):
                 j |= qkpe_bitmasks[c]
             au = abs(u_val)
@@ -1319,7 +1322,7 @@ def _new_attention_pe_only_forward_kernel(
     v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, QD, y_dim
+    pd, CS, N_T, N_C, QD, y_dim, qkpe_direct_sign
 ):
     """Fused PE-only forward: PE(i-j) and V(x_j) into Final LUT."""
     n_pairs = CS * (CS - 1) // 2
@@ -1376,9 +1379,12 @@ def _new_attention_pe_only_forward_kernel(
         u_min_val = np.float32(0.0)
 
         for c in range(pd):
-            a = qkpe_a_arr[t, c]
-            b = qkpe_b_arr[t, c]
-            u_val = PE[pe_pos, a] - PE[pe_pos, b]
+            if qkpe_direct_sign:
+                u_val = PE[pe_pos, c]
+            else:
+                a = qkpe_a_arr[t, c]
+                b = qkpe_b_arr[t, c]
+                u_val = PE[pe_pos, a] - PE[pe_pos, b]
             if u_val > np.float32(0.0):
                 j |= qkpe_bitmasks[c]
             au = abs(u_val)
@@ -1415,7 +1421,7 @@ def _new_attention_final_backward_kernel(
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
-    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only
+    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
     n_pairs = CS * (CS - 1) // 2
@@ -1457,15 +1463,21 @@ def _new_attention_final_backward_kernel(
         u_qkpe = qkpe_u_min[pair, t]
         sign_qkpe = np.float32(1.0) if u_qkpe > np.float32(0.0) else np.float32(-1.0)
         delta_qkpe = gi_qkpe * (np.float32(-0.5) * sign_qkpe / (np.float32(1.0) + abs(u_qkpe)) ** 2)
-        a_qkpe = qkpe_a_arr[t, r_qkpe]
-        b_qkpe = qkpe_b_arr[t, r_qkpe]
-        if not pe_only:
-            q_grad_thr[tid, tok_i, a_qkpe] += delta_qkpe
-            q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
-            k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
-            k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
-        pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
-        pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
+        if qkpe_direct_sign:
+            if not pe_only:
+                q_grad_thr[tid, tok_i, r_qkpe] += delta_qkpe
+                k_grad_thr[tid, tok_j, r_qkpe] += delta_qkpe
+            pe_grad_thr[tid, pe_pos, r_qkpe] += delta_qkpe
+        else:
+            a_qkpe = qkpe_a_arr[t, r_qkpe]
+            b_qkpe = qkpe_b_arr[t, r_qkpe]
+            if not pe_only:
+                q_grad_thr[tid, tok_i, a_qkpe] += delta_qkpe
+                q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
+                k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
+                k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
+            pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
+            pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
 
     # Phase 2: reduce thread-local gradients.
     for work in prange(CS * q_dim):
@@ -2232,6 +2244,7 @@ def new_attention_forward(head, x, y, args):
     q_dim = args.attn_qk_dim
     n_pairs = CS * (CS - 1) // 2
     pe_only = getattr(args, 'PE_only', False)
+    qkpe_direct_sign = getattr(args, 'qkpe_direct_sign', False)
 
     if not pe_only:
         cache_index_batch(lutQ, x, head._q_j, head._q_r_min, head._q_u_min)
@@ -2254,7 +2267,8 @@ def new_attention_forward(head, x, y, args):
                 treesV, treesFinal,
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
-                args.positional_dim, CS, args.n_t, args.n_c, q_dim, y_dim
+                args.positional_dim, CS, args.n_t, args.n_c, q_dim, y_dim,
+                qkpe_direct_sign
             )
         else:
             _new_attention_forward_kernel(
@@ -2269,7 +2283,7 @@ def new_attention_forward(head, x, y, args):
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
                 args.positional_dim, CS, args.n_t, args.n_c,
-                args.attn_qk_n_t, q_dim, y_dim
+                args.attn_qk_n_t, q_dim, y_dim, qkpe_direct_sign
             )
     else:
         if pe_only:
@@ -2296,17 +2310,24 @@ def new_attention_forward(head, x, y, args):
                 r_min = np.int32(0)
                 u_min_val = np.float32(0.0)
                 for c in range(args.positional_dim):
-                    a = head._qkpe_a_arr[t, c]
-                    b = head._qkpe_b_arr[t, c]
-                    if pe_only:
-                        ua = head.Positional_encoding[pe_pos, a]
-                        ub = head.Positional_encoding[pe_pos, b]
+                    if qkpe_direct_sign:
+                        if pe_only:
+                            u_val = head.Positional_encoding[pe_pos, c]
+                        else:
+                            u_val = (head._q_embed[tok_i, c] + head._k_embed[tok_j, c]
+                                     + head.Positional_encoding[pe_pos, c])
                     else:
-                        ua = (head._q_embed[tok_i, a] + head._k_embed[tok_j, a]
-                              + head.Positional_encoding[pe_pos, a])
-                        ub = (head._q_embed[tok_i, b] + head._k_embed[tok_j, b]
-                              + head.Positional_encoding[pe_pos, b])
-                    u_val = ua - ub
+                        a = head._qkpe_a_arr[t, c]
+                        b = head._qkpe_b_arr[t, c]
+                        if pe_only:
+                            ua = head.Positional_encoding[pe_pos, a]
+                            ub = head.Positional_encoding[pe_pos, b]
+                        else:
+                            ua = (head._q_embed[tok_i, a] + head._k_embed[tok_j, a]
+                                  + head.Positional_encoding[pe_pos, a])
+                            ub = (head._q_embed[tok_i, b] + head._k_embed[tok_j, b]
+                                  + head.Positional_encoding[pe_pos, b])
+                        u_val = ua - ub
                     if u_val > np.float32(0.0):
                         j |= head._qkpe_bitmasks[c]
                     au = abs(u_val)
@@ -2426,6 +2447,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     QD = args.attn_qk_dim
     ED = args.embedding_dim
     pe_only = getattr(args, 'PE_only', False)
+    qkpe_direct_sign = getattr(args, 'qkpe_direct_sign', False)
 
     q_grad = q_grad_out if q_grad_out is not None else head._q_grad
     k_grad = k_grad_out if k_grad_out is not None else head._k_grad
@@ -2465,7 +2487,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
             POSITIONAL_DIM, CS, N_T, y_dim, QD,
-            np.float32(learning_rate), skip_s_update, pe_only)
+            np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign)
     else:
         for tok_i in range(1, CS):
             y_g = y_grad[tok_i, :y_dim]
@@ -2494,15 +2516,21 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                     u_qkpe = float(head._qkpe_u_min[pair_idx, t])
                     sign_qkpe = 1.0 if u_qkpe > 0.0 else -1.0
                     delta_qkpe = gi_qkpe * (-0.5 * sign_qkpe / (1.0 + abs(u_qkpe)) ** 2)
-                    a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
-                    b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
-                    if not pe_only:
-                        q_grad[tok_i, a_qkpe] += delta_qkpe
-                        q_grad[tok_i, b_qkpe] -= delta_qkpe
-                        k_grad[tok_j, a_qkpe] += delta_qkpe
-                        k_grad[tok_j, b_qkpe] -= delta_qkpe
-                    pe_grad[pe_pos, a_qkpe] += delta_qkpe
-                    pe_grad[pe_pos, b_qkpe] -= delta_qkpe
+                    if qkpe_direct_sign:
+                        if not pe_only:
+                            q_grad[tok_i, r_qkpe] += delta_qkpe
+                            k_grad[tok_j, r_qkpe] += delta_qkpe
+                        pe_grad[pe_pos, r_qkpe] += delta_qkpe
+                    else:
+                        a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
+                        b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
+                        if not pe_only:
+                            q_grad[tok_i, a_qkpe] += delta_qkpe
+                            q_grad[tok_i, b_qkpe] -= delta_qkpe
+                            k_grad[tok_j, a_qkpe] += delta_qkpe
+                            k_grad[tok_j, b_qkpe] -= delta_qkpe
+                        pe_grad[pe_pos, a_qkpe] += delta_qkpe
+                        pe_grad[pe_pos, b_qkpe] -= delta_qkpe
 
         if not skip_s_update:
             for t in range(N_T):
@@ -3603,9 +3631,15 @@ def main():
                         help='Use new attention implementation (default: off)')
     parser.add_argument('--PE-only', dest='PE_only', action='store_true',
                         help='With --new-attention, zero Q/K embeddings and train PE+V+Final only')
+    parser.add_argument('--qkpe-direct-sign', action='store_true',
+                        help='With --new-attention, build qkpe bins from qkpe[c] > 0 instead of qkpe[a] > qkpe[b]')
     args = parser.parse_args()
     if args.PE_only and not args.new_attention:
         parser.error('--PE-only requires --new-attention')
+    if args.qkpe_direct_sign and not args.new_attention:
+        parser.error('--qkpe-direct-sign requires --new-attention')
+    if args.qkpe_direct_sign and args.positional_dim > args.attn_qk_dim:
+        parser.error('--qkpe-direct-sign requires --positional-dim <= --attn_qk_dim')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
 
@@ -3691,6 +3725,7 @@ def main():
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print(f"  new_attention     = {args.new_attention}")
     print(f"  PE_only           = {args.PE_only}")
+    print(f"  qkpe_direct_sign  = {args.qkpe_direct_sign}")
     print("=" * 50)
 
     wandb_run = None

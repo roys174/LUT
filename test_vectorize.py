@@ -504,6 +504,7 @@ def make_pe_only_model_args(batch_size=1):
         POS_task=False,
         new_attention=True,
         PE_only=True,
+        qkpe_direct_sign=False,
     )
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
     args.shift_qk = args.n_c + args.positional_dim
@@ -592,3 +593,145 @@ class TestPEOnlyNewAttention:
         np.testing.assert_array_equal(head.K.S, k_before)
         assert np.any(head.Final.S != final_before)
         assert np.any(head.Positional_encoding != pe_before)
+
+
+
+def make_qkpe_direct_model_args(pe_only=False):
+    args = SimpleNamespace(
+        vocab_size_input=8,
+        vocab_size_output=5,
+        context_size=3,
+        embedding_dim=3,
+        positional_dim=2,
+        num_layers=1,
+        num_heads=1,
+        n_t=1,
+        n_c=1,
+        attn_qk_dim=3,
+        attn_qk_n_c=1,
+        attn_qk_n_t=1,
+        factored_output=False,
+        fp16=False,
+        batch_size=1,
+        cpu_cores=1,
+        num_workers=1,
+        numba_threads=1,
+        replay_workers=1,
+        soft_attention=False,
+        layernorm=False,
+        dropout=0.0,
+        POS_task=False,
+        new_attention=True,
+        PE_only=pe_only,
+        qkpe_direct_sign=True,
+    )
+    args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+    args.shift_qk = args.n_c + args.positional_dim
+    return args
+
+
+def expected_direct_qkpe_j(head, args, pe_only=False):
+    expected = np.zeros_like(head._qkpe_j)
+    for tok_i in range(1, args.context_size):
+        for tok_j in range(tok_i):
+            pair = tok_i * (tok_i - 1) // 2 + tok_j
+            pe_pos = tok_i - tok_j
+            if pe_only:
+                u = head.Positional_encoding[pe_pos, :args.positional_dim]
+            else:
+                u = (head._q_embed[tok_i, :args.positional_dim]
+                     + head._k_embed[tok_j, :args.positional_dim]
+                     + head.Positional_encoding[pe_pos, :args.positional_dim])
+            j = int(((u > 0).astype(np.int32) * args.pe_bitmasks).sum())
+            expected[pair, :] = j
+    return expected
+
+
+class TestQKPEDirectSign:
+    def test_forward_bins_use_qkpe_coordinate_signs_and_ignore_anchor_pairs(self):
+        args = make_qkpe_direct_model_args(pe_only=False)
+        np.random.seed(321)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        head.Positional_encoding[:] = np.array([
+            [0.0, 0.0, 0.0],
+            [0.25, -0.75, 0.5],
+            [-0.5, 0.5, -0.25],
+        ], dtype=np.float32)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+        expected = expected_direct_qkpe_j(head, args, pe_only=False)
+        np.testing.assert_array_equal(head._qkpe_j, expected)
+
+        head._qkpe_a_arr[:] = 2
+        head._qkpe_b_arr[:] = 1
+        y_after_anchor_change = np.zeros_like(y)
+        new_attention_forward(head, x, y_after_anchor_change, args)
+        np.testing.assert_array_equal(head._qkpe_j, expected)
+
+    def test_pe_only_forward_bins_use_pe_coordinate_signs(self):
+        args = make_qkpe_direct_model_args(pe_only=True)
+        np.random.seed(654)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        head.Positional_encoding[:] = np.array([
+            [0.0, 0.0, 0.0],
+            [0.5, -0.5, 1.0],
+            [-0.25, 0.75, -1.0],
+        ], dtype=np.float32)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+        np.testing.assert_array_equal(head._q_embed, np.zeros_like(head._q_embed))
+        np.testing.assert_array_equal(head._k_embed, np.zeros_like(head._k_embed))
+        np.testing.assert_array_equal(
+            head._qkpe_j, expected_direct_qkpe_j(head, args, pe_only=True))
+
+    def test_backward_direct_scatter_uses_fragile_coordinate_not_anchor_pair(self):
+        args = make_qkpe_direct_model_args(pe_only=False)
+        np.random.seed(987)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        pair = 0
+        tree = 0
+        r_qkpe = 1
+        head._qkpe_r_min[pair, tree] = r_qkpe
+        head._qkpe_u_min[pair, tree] = 0.5
+        head._qkpe_a_arr[tree, r_qkpe] = 2
+        head._qkpe_b_arr[tree, r_qkpe] = 0
+
+        j_bin = (int(head._final_v_j[0, tree]) << args.positional_dim) | int(head._qkpe_j[pair, tree])
+        jbar_qkpe = j_bin ^ (1 << r_qkpe)
+        head.Final.S[:] = 0.0
+        head.Final.S[head.Final.trees[tree], jbar_qkpe, :] = 1.0
+
+        q_grad = np.zeros((args.context_size, args.attn_qk_dim), dtype=np.float32)
+        k_grad = np.zeros_like(q_grad)
+        v_grad = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        pe_grad = np.zeros_like(q_grad)
+        x_grad = np.zeros_like(x)
+        y_grad = np.zeros_like(y)
+        y_grad[1, :] = 1.0
+
+        main_module.learning_rate = 0.0
+        new_attention_backward(
+            head, x_grad, y_grad, args, skip_s_update=True,
+            q_grad_out=q_grad, k_grad_out=k_grad,
+            v_grad_out=v_grad, pe_grad_out=pe_grad)
+
+        assert q_grad[1, r_qkpe] != 0.0
+        assert k_grad[0, r_qkpe] != 0.0
+        assert pe_grad[1, r_qkpe] != 0.0
+        np.testing.assert_array_equal(q_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
+        np.testing.assert_array_equal(k_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
+        np.testing.assert_array_equal(pe_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))

@@ -488,7 +488,7 @@ def snapshot_sort_key(path):
 
 def discover_stats_inputs(input_path, out_dir_arg):
     path = Path(input_path)
-    if path.is_dir():
+    if path.is_dir() or (not path.exists() and path.suffix == ""):
         out_dir = Path(out_dir_arg) if out_dir_arg else path
         run_dir = path.parent
         snapshots = sorted(run_dir.glob("lut_update_stats_step_*.npz"), key=snapshot_sort_key)
