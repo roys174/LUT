@@ -1649,7 +1649,8 @@ def _new_attention_final_backward_kernel(
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
-    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign
+    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
+    freeze_pe
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
     n_pairs = CS * (CS - 1) // 2
@@ -1695,7 +1696,8 @@ def _new_attention_final_backward_kernel(
             if not pe_only:
                 q_grad_thr[tid, tok_i, r_qkpe] += delta_qkpe
                 k_grad_thr[tid, tok_j, r_qkpe] += delta_qkpe
-            pe_grad_thr[tid, pe_pos, r_qkpe] += delta_qkpe
+            if not freeze_pe:
+                pe_grad_thr[tid, pe_pos, r_qkpe] += delta_qkpe
         else:
             a_qkpe = qkpe_a_arr[t, r_qkpe]
             b_qkpe = qkpe_b_arr[t, r_qkpe]
@@ -1704,8 +1706,9 @@ def _new_attention_final_backward_kernel(
                 q_grad_thr[tid, tok_i, b_qkpe] -= delta_qkpe
                 k_grad_thr[tid, tok_j, a_qkpe] += delta_qkpe
                 k_grad_thr[tid, tok_j, b_qkpe] -= delta_qkpe
-            pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
-            pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
+            if not freeze_pe:
+                pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
+                pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
 
     # Phase 2: reduce thread-local gradients.
     for work in prange(CS * q_dim):
@@ -1758,7 +1761,7 @@ def _new_attention_final_s_replay_kernel(FS, final_trees, final_v_j, qkpe_j,
 @njit(parallel=True)
 def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                 y_grad, x_grad, pos_grad, a_arr, b_arr,
-                                shift_qk, pd, CS, N_T, y_dim, lr):
+                                shift_qk, pd, CS, N_T, y_dim, lr, freeze_pe):
     """Fused attention backward with parallel gradient computation.
 
     Three-phase approach:
@@ -1819,7 +1822,7 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
         x_grad_thr[tid, target_pos, idx_b] -= v
 
         abs_uPE = abs(all_uPE[pe_pos, t])
-        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+        if not freeze_pe and abs_uPE < abs_uQ and abs_uPE < abs_uK:
             rPE = all_rPE[pe_pos, t]
             jbarPE = j_bin ^ (1 << rPE)
             giPE = np.float32(0.0)
@@ -1858,7 +1861,7 @@ def _attention_backward_kernel(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_
 @njit(parallel=True)
 def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                                          y_grad, x_grad, pos_grad, a_arr, b_arr,
-                                         shift_qk, pd, CS, N_T, y_dim):
+                                         shift_qk, pd, CS, N_T, y_dim, freeze_pe):
     """Like _attention_backward_kernel but without Phase 3 (no S update)."""
     ED = x_grad.shape[1]
     n_threads = get_num_threads()
@@ -1912,7 +1915,7 @@ def _attention_backward_kernel_noupdate(S, all_jV, all_rV, all_uV, all_jPE, all_
         x_grad_thr[tid, target_pos, idx_b] -= v
 
         abs_uPE = abs(all_uPE[pe_pos, t])
-        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+        if not freeze_pe and abs_uPE < abs_uQ and abs_uPE < abs_uK:
             rPE = all_rPE[pe_pos, t]
             jbarPE = j_bin ^ (1 << rPE)
             giPE = np.float32(0.0)
@@ -2222,7 +2225,7 @@ def _soft_attn_backward_value_kernel(ValueS, val_j, val_r_min, val_u_min,
 def _soft_attn_backward_score_kernel(ScoreS, jV, rV, uV, jPE, rPE, uPE,
                                       attn_w, v_vecs, y_grad, score_grad, x_grad, pos_grad,
                                       score_a_arr, score_b_arr,
-                                      shift_qk, pd, CS, N_T, ED, lr, skip_s_update):
+                                      shift_qk, pd, CS, N_T, ED, lr, skip_s_update, freeze_pe):
     """Soft attention score backward: score_grad, STE x_grad + pe_grad, optional Score.S update."""
     n_threads = get_num_threads()
     x_grad_thr = np.zeros((n_threads, CS, ED), dtype=np.float32)
@@ -2273,7 +2276,7 @@ def _soft_attn_backward_score_kernel(ScoreS, jV, rV, uV, jPE, rPE, uPE,
                     x_grad_thr[tid, pos1, idx_a] += v
                     x_grad_thr[tid, pos1, idx_b] -= v
                 # PE branch
-                if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                if not freeze_pe and abs_uPE < abs_uQ and abs_uPE < abs_uK:
                     rPE_t = rPE[pe_pos, t]
                     jbarPE = j_bin ^ (1 << rPE_t)
                     giPE = (ScoreS[t, jbarPE, 0] - ScoreS[t, j_bin, 0]) * sg
@@ -2335,6 +2338,11 @@ def _soft_attn_value_s_replay_kernel(ValueS, val_j, val_grad, CS, N_T, ED, scale
 # Model operations
 # ---------------------------------------------------------------------------
 
+def initialize_positional_encoding(shape, args):
+    """Initialize PE values. Frozen PE uses this single hook for future modes."""
+    return random_vector(int(np.prod(shape)), 1.0).reshape(shape)
+
+
 def build_Model(m, args):
     VOCAB_SIZE_INPUT = args.vocab_size_input
     EMBEDDING_DIM = args.embedding_dim
@@ -2342,19 +2350,33 @@ def build_Model(m, args):
     NUM_HEADS = args.num_heads
     N_C = args.n_c
     POSITIONAL_DIM = args.positional_dim
+    freeze_pe = getattr(args, 'freeze_PE', False)
+    new_attention = getattr(args, 'new_attention', False)
     
     N_T = args.n_t
 
     m.Token_embedder[:] = random_vector(VOCAB_SIZE_INPUT * EMBEDDING_DIM, 1.0).reshape(VOCAB_SIZE_INPUT, EMBEDDING_DIM)
 
+    frozen_new_pe = None
+    frozen_table_pe = None
+    if freeze_pe:
+        if new_attention:
+            frozen_new_pe = initialize_positional_encoding(
+                (args.context_size, args.attn_qk_dim), args)
+        else:
+            frozen_table_pe = initialize_positional_encoding(
+                (args.context_size, POSITIONAL_DIM), args)
+
     for l in range(NUM_LAYERS):
         build_LUT(m.FFN[l], N_C, EMBEDDING_DIM, args)
         for h in range(NUM_HEADS):
-            if getattr(args, 'new_attention', False):
+            if new_attention:
                 head = m.head[l][h]
-                head.Positional_encoding[:] = random_vector(
-                    args.context_size * args.attn_qk_dim, 1.0
-                ).reshape(args.context_size, args.attn_qk_dim)
+                if freeze_pe:
+                    head.Positional_encoding[:] = frozen_new_pe
+                else:
+                    head.Positional_encoding[:] = initialize_positional_encoding(
+                        (args.context_size, args.attn_qk_dim), args)
                 build_LUT_custom(head.Q, args.attn_qk_n_c, args.attn_qk_dim, args,
                                  n_t=args.attn_qk_n_t, n_c=args.attn_qk_n_c,
                                  input_dim=EMBEDDING_DIM)
@@ -2374,9 +2396,11 @@ def build_Model(m, args):
                 head._qkpe_a_arr[:] = qkpe_a
                 head._qkpe_b_arr[:] = qkpe_b
             else:
-                m.head[l][h].Positional_encoding[:] = random_vector(
-                    args.context_size * N_T * POSITIONAL_DIM, 1.0
-                ).reshape(args.context_size, N_T, POSITIONAL_DIM)
+                if freeze_pe:
+                    m.head[l][h].Positional_encoding[:] = frozen_table_pe[:, np.newaxis, :]
+                else:
+                    m.head[l][h].Positional_encoding[:] = initialize_positional_encoding(
+                        (args.context_size, N_T, POSITIONAL_DIM), args)
                 if getattr(args, 'soft_attention', False):
                     build_LUT(m.head[l][h].Score, N_C + N_C + POSITIONAL_DIM, 1, args)
                     build_LUT(m.head[l][h].Value, N_C, EMBEDDING_DIM, args)
@@ -2678,6 +2702,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     QD = args.attn_qk_dim
     ED = args.embedding_dim
     pe_only = getattr(args, 'PE_only', False)
+    freeze_pe = getattr(args, 'freeze_PE', False)
     qkpe_direct_sign = getattr(args, 'qkpe_direct_sign', False)
 
     q_grad = q_grad_out if q_grad_out is not None else head._q_grad
@@ -2720,7 +2745,8 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
             POSITIONAL_DIM, CS, N_T, y_dim, QD,
-            np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign)
+            np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign,
+            freeze_pe)
     else:
         for tok_i in range(1, CS):
             y_g = y_grad[tok_i, :y_dim]
@@ -2753,7 +2779,8 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                         if not pe_only:
                             q_grad[tok_i, r_qkpe] += delta_qkpe
                             k_grad[tok_j, r_qkpe] += delta_qkpe
-                        pe_grad[pe_pos, r_qkpe] += delta_qkpe
+                        if not freeze_pe:
+                            pe_grad[pe_pos, r_qkpe] += delta_qkpe
                     else:
                         a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
                         b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
@@ -2762,8 +2789,9 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                             q_grad[tok_i, b_qkpe] -= delta_qkpe
                             k_grad[tok_j, a_qkpe] += delta_qkpe
                             k_grad[tok_j, b_qkpe] -= delta_qkpe
-                        pe_grad[pe_pos, a_qkpe] += delta_qkpe
-                        pe_grad[pe_pos, b_qkpe] -= delta_qkpe
+                        if not freeze_pe:
+                            pe_grad[pe_pos, a_qkpe] += delta_qkpe
+                            pe_grad[pe_pos, b_qkpe] -= delta_qkpe
 
         if not skip_s_update:
             for t in range(N_T):
@@ -2775,7 +2803,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                         j_bin = (int(head._final_v_j[tok_j, t]) << POSITIONAL_DIM) | int(head._qkpe_j[pair_idx, t])
                         lutFinal.S[tree, j_bin] -= learning_rate * y_g
 
-    if pe_grad_out is None:
+    if pe_grad_out is None and not freeze_pe:
         head.Positional_encoding -= learning_rate * pe_grad
 
     if update_stats is not None and not skip_s_update:
@@ -2832,6 +2860,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
     CS = args.context_size
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
+    freeze_pe = getattr(args, 'freeze_PE', False)
 
     if getattr(args, 'soft_attention', False):
         shift_qk = args.shift_qk
@@ -2860,14 +2889,15 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
                 head._pe_j, head._pe_r_min, head._pe_u_min,
                 head._attn_w, head._v_vecs, y_grad, score_grad, x_grad, pos_grad,
                 score_lut.a_arr, score_lut.b_arr,
-                shift_qk, pd, CS, N_T, ED, np.float32(learning_rate), skip_s_update)
+                shift_qk, pd, CS, N_T, ED, np.float32(learning_rate), skip_s_update,
+                freeze_pe)
 
             if update_stats is not None and not skip_s_update:
                 update_stats.record_simple_coords(f'{stats_prefix}_Value', val_lut, val_grad)
                 update_stats.record_attention_scalar_coords(
                     f'{stats_prefix}_Score', score_lut, score_grad, args)
 
-            if pe_grad_out is None:
+            if pe_grad_out is None and not freeze_pe:
                 head.Positional_encoding -= learning_rate * pos_grad
         else:
             val_trees = val_lut.trees
@@ -2942,7 +2972,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
                             x_grad[pos1, score_lut.a_arr[t, r]] += v
                             x_grad[pos1, score_lut.b_arr[t, r]] -= v
 
-                        if abs_uPE < abs_uQ and abs_uPE < abs_uK:
+                        if not freeze_pe and abs_uPE < abs_uQ and abs_uPE < abs_uK:
                             rPE = int(head._pe_r_min[pe_pos, t])
                             jbarPE = j_bin ^ (1 << rPE)
                             giPE = (float(score_lut.S[t, jbarPE, 0]) - float(score_lut.S[t, j_bin, 0])) * sg
@@ -2964,7 +2994,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
 
             if pe_grad_out is not None:
                 pe_grad_out += pos_grad
-            else:
+            elif not freeze_pe:
                 head.Positional_encoding -= learning_rate * pos_grad
         return
 
@@ -2993,7 +3023,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
                                                 y_grad, x_grad, pos_grad,
                                                 lut.a_arr, lut.b_arr,
                                                 args.shift_qk, POSITIONAL_DIM,
-                                                CS, N_T, y_dim)
+                                                CS, N_T, y_dim, freeze_pe)
         else:
             _attention_backward_kernel(lut.S, all_jV, all_rV, all_uV,
                                         all_jPE, all_rPE, all_uPE,
@@ -3001,7 +3031,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
                                         lut.a_arr, lut.b_arr,
                                         args.shift_qk, POSITIONAL_DIM,
                                         CS, N_T, y_dim,
-                                        np.float32(learning_rate))
+                                        np.float32(learning_rate), freeze_pe)
     else:
         ED = x_grad.shape[1]
         flat_size = x_grad.size
@@ -3065,6 +3095,8 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
 
             abs_uPE = abs_all_uPE[pe_idx]
             pe_mask = (abs_uPE < abs_uQ) & (abs_uPE < abs_uK)
+            if freeze_pe:
+                pe_mask = np.zeros_like(pe_mask, dtype=bool)
             if pe_mask.any():
                 jbarPE_bins = j_bins ^ (1 << rPE)
                 S_jbarPE = _f32(lut.S[trees, jbarPE_bins])
@@ -3084,7 +3116,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
 
     if pe_grad_out is not None:
         pe_grad_out += pos_grad
-    else:
+    elif not freeze_pe:
         head.Positional_encoding -= learning_rate * pos_grad
 
 
@@ -3303,7 +3335,8 @@ def _replay_ffn_task(S, trees, j_list, ygrad_list, y_dim, CS, N_T, scale, use_nu
 
 
 def _replay_attn_task(S, jV_list, jPE_list, ygrad_list, PE, pe_grad_list,
-                      shift_qk, pd, CS, N_T, y_dim, scale, use_numba):
+                      shift_qk, pd, CS, N_T, y_dim, scale, use_numba,
+                      freeze_pe=False):
     """Replay attention S + PE updates for one head across all batch elements."""
     for jV, jPE, y_grad in zip(jV_list, jPE_list, ygrad_list):
         if use_numba and S.dtype == np.float32:
@@ -3321,15 +3354,16 @@ def _replay_attn_task(S, jV_list, jPE_list, ygrad_list, PE, pe_grad_list,
                 j_bins = (jQ << shift_qk) | (jK << pd) | jPE_slice
                 trees_b = trees_b_full[:pos]
                 np.subtract.at(S, (trees_b.ravel(), j_bins.ravel()), scale * y_g)
-    for pe_grad in pe_grad_list:
-        PE -= scale * pe_grad
+    if not freeze_pe:
+        for pe_grad in pe_grad_list:
+            PE -= scale * pe_grad
 
 
 def _replay_new_attn_task(head, q_j_list, k_j_list, val_j_list,
                           final_v_j_list, qkpe_j_list, ygrad_list,
                           q_grad_list, k_grad_list, v_grad_list,
                           pe_grad_list, CS, N_T, Q_N_T, scale, use_numba,
-                          pe_only=False):
+                          pe_only=False, freeze_pe=False):
     """Replay new-attention Q/K/V/Final S updates and vector PE updates."""
     q_lut = head.Q
     k_lut = head.K
@@ -3377,8 +3411,9 @@ def _replay_new_attn_task(head, q_j_list, k_j_list, val_j_list,
                         j_bin = (int(final_v_j[tok_j, t]) << head._qkpe_bitmasks.shape[0]) | int(qkpe_j[pair, t])
                         final_lut.S[tree, j_bin] -= scale * y_g
 
-    for pe_grad in pe_grad_list:
-        head.Positional_encoding -= scale * pe_grad
+    if not freeze_pe:
+        for pe_grad in pe_grad_list:
+            head.Positional_encoding -= scale * pe_grad
 
 
 def _replay_output_task(S, trees, j_list, output_list, y_dim, CS, N_T, scale, use_numba):
@@ -3393,7 +3428,8 @@ def _replay_output_task(S, trees, j_list, output_list, y_dim, CS, N_T, scale, us
 
 def _replay_soft_attn_task(ScoreS, ValueS, score_trees, val_trees,
                             jV_list, jPE_list, val_j_list, score_grad_list, val_grad_list,
-                            PE, pe_grad_list, shift_qk, pd, CS, N_T, scale, use_numba=False):
+                            PE, pe_grad_list, shift_qk, pd, CS, N_T, scale, use_numba=False,
+                            freeze_pe=False):
     """Replay soft attention Score + Value + PE updates across all batch elements."""
     ED = ValueS.shape[2]
     if use_numba:
@@ -3413,8 +3449,9 @@ def _replay_soft_attn_task(ScoreS, ValueS, score_trees, val_trees,
                     for t in range(N_T):
                         j_bin = (int(jV[pos, t]) << shift_qk) | (int(jV[pos1, t]) << pd) | int(jPE[pe_pos, t])
                         ScoreS[t, j_bin, 0] -= scale * scalar_sg
-    for pe_grad in pe_grad_list:
-        PE -= scale * pe_grad
+    if not freeze_pe:
+        for pe_grad in pe_grad_list:
+            PE -= scale * pe_grad
 
 
 def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stats=None):
@@ -3428,6 +3465,7 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
     CS = args.context_size
     N_T = args.n_t
     use_numba = HAS_NUMBA
+    freeze_pe = getattr(args, 'freeze_PE', False)
 
     # Build work items for all independent S tables
     work = []
@@ -3481,7 +3519,8 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                             _replay_new_attn_task(_head, _qj, _kj, _vj, _fvj, _qkpj, _y,
                                                   _qg, _kg, _vg, _pg,
                                                   CS, N_T, args.attn_qk_n_t, scale, use_numba,
-                                                  getattr(args, 'PE_only', False)))
+                                                  getattr(args, 'PE_only', False),
+                                                  freeze_pe))
             elif getattr(args, 'soft_attention', False):
                 jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
                 jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
@@ -3506,7 +3545,7 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                                                    _jV, _jPE, _vj, _sg, _vg,
                                                    _PE, _pg,
                                                    args.shift_qk, args.positional_dim,
-                                                   CS, N_T, scale, use_numba))
+                                                   CS, N_T, scale, use_numba, freeze_pe))
             else:
                 jV_list  = [be.head[l][h]._v_j  for be in batch_elements]
                 jPE_list = [be.head[l][h]._pe_j for be in batch_elements]
@@ -3522,7 +3561,7 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                                    _pg=pe_grad_list, _yd=lut_v.y_dim:
                             _replay_attn_task(_S, _jV, _jPE, _y, _PE, _pg,
                                               args.shift_qk, args.positional_dim,
-                                              CS, N_T, _yd, scale, use_numba))
+                                              CS, N_T, _yd, scale, use_numba, freeze_pe))
 
     # Output head: one task per LUT
     if args.factored_output:
@@ -3899,6 +3938,8 @@ def main():
                         help='Use new attention implementation (default: off)')
     parser.add_argument('--PE-only', dest='PE_only', action='store_true',
                         help='With --new-attention, zero Q/K embeddings and train PE+V+Final only')
+    parser.add_argument('--freeze-PE', dest='freeze_PE', action='store_true',
+                        help='Treat positional encodings as frozen constants after initialization/load')
     parser.add_argument('--qkpe-direct-sign', action='store_true',
                         help='With --new-attention, build qkpe bins from qkpe[c] > 0 instead of qkpe[a] > qkpe[b]')
     args = parser.parse_args()
@@ -3995,6 +4036,7 @@ def main():
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print(f"  new_attention     = {args.new_attention}")
     print(f"  PE_only           = {args.PE_only}")
+    print(f"  freeze_PE         = {args.freeze_PE}")
     print(f"  qkpe_direct_sign  = {args.qkpe_direct_sign}")
     print("=" * 50)
 

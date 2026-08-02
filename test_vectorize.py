@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 from main import (
     LUT, Model, BatchElement, build_LUT, build_Model, CONCATENATE_vec, _f32,
-    apply_averaged_gradients, model_backward, model_forward,
+    apply_averaged_gradients, attention_backward, attention_forward,
+    model_backward, model_forward,
     new_attention_backward, new_attention_forward,
     build_no_overlap_comparison_arrays, build_overlap_comparison_arrays,
     configure_lut_comparison_mode,
@@ -245,6 +246,7 @@ def make_args(n_t=8, n_c=4, embedding_dim=16, positional_dim=4,
               lut_comparison_mode='random'):
     return SimpleNamespace(n_t=n_t, n_c=n_c, embedding_dim=embedding_dim,
                            positional_dim=positional_dim,
+                           freeze_PE=False,
                            lut_comparison_mode=lut_comparison_mode,
                            pe_bitmasks=(1 << np.arange(positional_dim)).astype(np.int32),
                            shift_qk=n_c + positional_dim)
@@ -380,6 +382,7 @@ class TestLUTComparisonModes:
             POS_task=False,
             new_attention=True,
             PE_only=False,
+            freeze_PE=False,
             qkpe_direct_sign=False,
         )
         args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
@@ -582,7 +585,7 @@ def randomize_pe_only_attention_values(model):
     return head
 
 
-def make_pe_only_model_args(batch_size=1):
+def make_pe_only_model_args(batch_size=1, freeze_PE=False):
     args = SimpleNamespace(
         vocab_size_input=8,
         vocab_size_output=5,
@@ -609,6 +612,7 @@ def make_pe_only_model_args(batch_size=1):
         POS_task=False,
         new_attention=True,
         PE_only=True,
+        freeze_PE=freeze_PE,
         qkpe_direct_sign=False,
     )
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
@@ -670,6 +674,29 @@ class TestPEOnlyNewAttention:
         assert np.any(head.Final.S != final_before)
         assert np.any(head.Positional_encoding != pe_before)
 
+    def test_freeze_pe_keeps_pe_grad_zero_and_updates_final(self):
+        args = make_pe_only_model_args(freeze_PE=True)
+        np.random.seed(457)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        final_before = head.Final.S.copy()
+        pe_before = head.Positional_encoding.copy()
+        x_grad = np.zeros_like(x)
+        y_grad = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        pe_grad = np.zeros_like(head._pe_grad)
+
+        main_module.learning_rate = 0.05
+        new_attention_backward(head, x_grad, y_grad, args, pe_grad_out=pe_grad)
+
+        assert np.any(head.Final.S != final_before)
+        np.testing.assert_array_equal(head.Positional_encoding, pe_before)
+        np.testing.assert_array_equal(pe_grad, np.zeros_like(pe_grad))
+
     def test_batch_replay_does_not_update_qk(self):
         args = make_pe_only_model_args(batch_size=2)
         np.random.seed(789)
@@ -699,6 +726,174 @@ class TestPEOnlyNewAttention:
         assert np.any(head.Final.S != final_before)
         assert np.any(head.Positional_encoding != pe_before)
 
+    def test_freeze_pe_batch_replay_keeps_pe_fixed(self):
+        args = make_pe_only_model_args(batch_size=2, freeze_PE=True)
+        np.random.seed(790)
+        model = Model(args)
+        build_Model(model, args)
+        randomize_pe_only_attention_values(model)
+        randomize_lut_values(model.output_head.unembedder)
+        batch_elements = [BatchElement(model, args) for _ in range(args.batch_size)]
+
+        for i, be in enumerate(batch_elements):
+            be.z[:] = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+            be.tokens[:] = np.arange(args.context_size + 1, dtype=np.int32) % args.vocab_size_input
+            model_forward(be, args, training=True)
+            be.output_head.output[:] = (i + 1) * np.ones_like(be.output_head.output, dtype=np.float32)
+            model_backward(be, args, grad_accum=be.grad_accum)
+
+        head = model.head[0][0]
+        final_before = head.Final.S.copy()
+        pe_before = head.Positional_encoding.copy()
+
+        apply_averaged_gradients(model, batch_elements, 0.05, args)
+
+        assert np.any(head.Final.S != final_before)
+        np.testing.assert_array_equal(head.Positional_encoding, pe_before)
+
+
+
+def make_attention_freeze_model_args(soft_attention=False):
+    args = SimpleNamespace(
+        vocab_size_input=8,
+        vocab_size_output=5,
+        context_size=4,
+        embedding_dim=4,
+        positional_dim=2,
+        num_layers=1,
+        num_heads=1,
+        n_t=2,
+        n_c=2,
+        attn_qk_dim=2,
+        attn_qk_n_c=2,
+        attn_qk_n_t=2,
+        factored_output=False,
+        fp16=False,
+        batch_size=1,
+        cpu_cores=1,
+        num_workers=1,
+        numba_threads=1,
+        replay_workers=1,
+        soft_attention=soft_attention,
+        layernorm=False,
+        dropout=0.0,
+        POS_task=False,
+        new_attention=False,
+        PE_only=False,
+        freeze_PE=True,
+        qkpe_direct_sign=False,
+    )
+    args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+    args.shift_qk = args.n_c + args.positional_dim
+    return args
+
+
+class TestFreezePEAttention:
+    def run_frozen_attention_backward(self, soft_attention):
+        args = make_attention_freeze_model_args(soft_attention=soft_attention)
+        np.random.seed(901 + int(soft_attention))
+        model = Model(args)
+        build_Model(model, args)
+        head = model.head[0][0]
+        if soft_attention:
+            randomize_lut_values(head.Score)
+            randomize_lut_values(head.Value)
+        else:
+            randomize_lut_values(head.V)
+
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        attention_forward(head, x, y, args)
+        pe_before = head.Positional_encoding.copy()
+        x_grad = np.zeros_like(x)
+        y_grad = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        main_module.learning_rate = 0.05
+        attention_backward(head, x_grad, y_grad, args)
+
+        np.testing.assert_array_equal(head.Positional_encoding, pe_before)
+
+    def test_hard_attention_freeze_pe_keeps_pe_fixed(self):
+        self.run_frozen_attention_backward(soft_attention=False)
+
+    def test_soft_attention_freeze_pe_keeps_pe_fixed(self):
+        self.run_frozen_attention_backward(soft_attention=True)
+
+
+
+def make_frozen_pe_init_args(new_attention=False, soft_attention=False):
+    args = SimpleNamespace(
+        vocab_size_input=8,
+        vocab_size_output=5,
+        context_size=4,
+        embedding_dim=4,
+        positional_dim=2,
+        num_layers=2,
+        num_heads=2,
+        n_t=3,
+        n_c=2,
+        attn_qk_dim=3,
+        attn_qk_n_c=2,
+        attn_qk_n_t=2,
+        factored_output=False,
+        fp16=False,
+        batch_size=1,
+        cpu_cores=1,
+        num_workers=1,
+        numba_threads=1,
+        replay_workers=1,
+        soft_attention=soft_attention,
+        layernorm=False,
+        dropout=0.0,
+        POS_task=False,
+        new_attention=new_attention,
+        PE_only=False,
+        freeze_PE=True,
+        qkpe_direct_sign=False,
+    )
+    args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+    args.shift_qk = args.n_c + args.positional_dim
+    return args
+
+
+class TestFreezePEInitialization:
+    def assert_all_old_attention_pe_shared(self, model, args):
+        template = model.head[0][0].Positional_encoding[:, 0, :]
+        assert np.any(template != 0.0)
+        for l in range(args.num_layers):
+            for h in range(args.num_heads):
+                pe = model.head[l][h].Positional_encoding
+                for t in range(args.n_t):
+                    np.testing.assert_array_equal(pe[:, t, :], template)
+
+    def test_hard_attention_freeze_pe_shares_random_template_across_tables_heads_layers(self):
+        args = make_frozen_pe_init_args(new_attention=False, soft_attention=False)
+        np.random.seed(1201)
+        model = Model(args)
+        build_Model(model, args)
+
+        self.assert_all_old_attention_pe_shared(model, args)
+
+    def test_soft_attention_freeze_pe_shares_random_template_across_tables_heads_layers(self):
+        args = make_frozen_pe_init_args(new_attention=False, soft_attention=True)
+        np.random.seed(1202)
+        model = Model(args)
+        build_Model(model, args)
+
+        self.assert_all_old_attention_pe_shared(model, args)
+
+    def test_new_attention_freeze_pe_shares_random_template_across_heads_layers(self):
+        args = make_frozen_pe_init_args(new_attention=True, soft_attention=False)
+        np.random.seed(1203)
+        model = Model(args)
+        build_Model(model, args)
+
+        template = model.head[0][0].Positional_encoding
+        assert np.any(template != 0.0)
+        for l in range(args.num_layers):
+            for h in range(args.num_heads):
+                np.testing.assert_array_equal(
+                    model.head[l][h].Positional_encoding, template)
 
 
 def make_qkpe_direct_model_args(pe_only=False):
@@ -728,6 +923,7 @@ def make_qkpe_direct_model_args(pe_only=False):
         POS_task=False,
         new_attention=True,
         PE_only=pe_only,
+        freeze_PE=False,
         qkpe_direct_sign=True,
     )
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
