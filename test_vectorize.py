@@ -9,6 +9,7 @@ from main import (
     apply_averaged_gradients, attention_backward, attention_forward,
     model_backward, model_forward,
     new_attention_backward, new_attention_forward,
+    initialize_positional_encoding,
     build_no_overlap_comparison_arrays, build_overlap_comparison_arrays,
     configure_lut_comparison_mode,
     fill_vector_with_random_integers,
@@ -614,6 +615,7 @@ def make_pe_only_model_args(batch_size=1, freeze_PE=False):
         PE_only=True,
         freeze_PE=freeze_PE,
         qkpe_direct_sign=False,
+        PE_init_scale=1.0,
     )
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
     args.shift_qk = args.n_c + args.positional_dim
@@ -850,6 +852,7 @@ def make_frozen_pe_init_args(new_attention=False, soft_attention=False):
         PE_only=False,
         freeze_PE=True,
         qkpe_direct_sign=False,
+        PE_init_scale=1.0,
     )
     args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
     args.shift_qk = args.n_c + args.positional_dim
@@ -865,6 +868,25 @@ class TestFreezePEInitialization:
                 pe = model.head[l][h].Positional_encoding
                 for t in range(args.n_t):
                     np.testing.assert_array_equal(pe[:, t, :], template)
+
+
+    def test_initializer_uses_binary_row_signs_and_scaled_random_magnitudes(self):
+        args = SimpleNamespace(positional_dim=5, PE_init_scale=0.58)
+        np.random.seed(1301)
+        pe = initialize_positional_encoding((32, 5), args)
+
+        assert pe.shape == (32, 5)
+        assert np.all(np.abs(pe) <= np.float32(args.PE_init_scale))
+        assert np.all(np.abs(pe) >= 0.0)
+
+        expected_signs = np.array([
+            [-1, -1, -1, -1, -1],
+            [-1, -1, -1, -1,  1],
+            [-1, -1, -1,  1, -1],
+            [ 1,  1,  1,  1,  1],
+        ], dtype=np.float32)
+        observed_signs = np.sign(pe[[0, 1, 2, 31]])
+        np.testing.assert_array_equal(observed_signs, expected_signs)
 
     def test_hard_attention_freeze_pe_shares_random_template_across_tables_heads_layers(self):
         args = make_frozen_pe_init_args(new_attention=False, soft_attention=False)

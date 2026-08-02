@@ -2339,8 +2339,22 @@ def _soft_attn_value_s_replay_kernel(ValueS, val_j, val_grad, CS, N_T, ED, scale
 # ---------------------------------------------------------------------------
 
 def initialize_positional_encoding(shape, args):
-    """Initialize PE values. Frozen PE uses this single hook for future modes."""
-    return random_vector(int(np.prod(shape)), 1.0).reshape(shape)
+    """Initialize frozen PE with binary row signs and random magnitudes."""
+    scale = np.float32(getattr(args, 'PE_init_scale', 1.0))
+    pe = (scale * np.random.rand(*shape)).astype(np.float32)
+
+    signed_dims = min(int(getattr(args, 'positional_dim', shape[-1])), shape[-1])
+    if signed_dims > 0:
+        row_bins = (np.arange(shape[0], dtype=np.int64) % (1 << signed_dims))
+        bit_positions = (signed_dims - 1 - np.arange(signed_dims, dtype=np.int64))
+        signs = np.where(
+            ((row_bins[:, np.newaxis] >> bit_positions[np.newaxis, :]) & 1) != 0,
+            np.float32(1.0),
+            np.float32(-1.0),
+        ).astype(np.float32)
+        sign_shape = (shape[0],) + (1,) * (len(shape) - 2) + (signed_dims,)
+        pe[..., :signed_dims] *= signs.reshape(sign_shape)
+    return pe
 
 
 def build_Model(m, args):
@@ -2375,8 +2389,9 @@ def build_Model(m, args):
                 if freeze_pe:
                     head.Positional_encoding[:] = frozen_new_pe
                 else:
-                    head.Positional_encoding[:] = initialize_positional_encoding(
-                        (args.context_size, args.attn_qk_dim), args)
+                    head.Positional_encoding[:] = random_vector(
+                        args.context_size * args.attn_qk_dim, 1.0
+                    ).reshape(args.context_size, args.attn_qk_dim)
                 build_LUT_custom(head.Q, args.attn_qk_n_c, args.attn_qk_dim, args,
                                  n_t=args.attn_qk_n_t, n_c=args.attn_qk_n_c,
                                  input_dim=EMBEDDING_DIM)
@@ -2399,8 +2414,9 @@ def build_Model(m, args):
                 if freeze_pe:
                     m.head[l][h].Positional_encoding[:] = frozen_table_pe[:, np.newaxis, :]
                 else:
-                    m.head[l][h].Positional_encoding[:] = initialize_positional_encoding(
-                        (args.context_size, N_T, POSITIONAL_DIM), args)
+                    m.head[l][h].Positional_encoding[:] = random_vector(
+                        args.context_size * N_T * POSITIONAL_DIM, 1.0
+                    ).reshape(args.context_size, N_T, POSITIONAL_DIM)
                 if getattr(args, 'soft_attention', False):
                     build_LUT(m.head[l][h].Score, N_C + N_C + POSITIONAL_DIM, 1, args)
                     build_LUT(m.head[l][h].Value, N_C, EMBEDDING_DIM, args)
@@ -3940,6 +3956,8 @@ def main():
                         help='With --new-attention, zero Q/K embeddings and train PE+V+Final only')
     parser.add_argument('--freeze-PE', dest='freeze_PE', action='store_true',
                         help='Treat positional encodings as frozen constants after initialization/load')
+    parser.add_argument('--PE-init-scale', dest='PE_init_scale', type=float, default=1.0,
+                        help='Scale for frozen PE random magnitudes sampled from [0, scale]')
     parser.add_argument('--qkpe-direct-sign', action='store_true',
                         help='With --new-attention, build qkpe bins from qkpe[c] > 0 instead of qkpe[a] > qkpe[b]')
     args = parser.parse_args()
@@ -3949,6 +3967,8 @@ def main():
         parser.error('--qkpe-direct-sign requires --new-attention')
     if args.qkpe_direct_sign and args.positional_dim > args.attn_qk_dim:
         parser.error('--qkpe-direct-sign requires --positional-dim <= --attn_qk_dim')
+    if args.PE_init_scale < 0.0:
+        parser.error('--PE-init-scale must be non-negative')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
     configure_lut_comparison_mode(args, parser)
@@ -4037,6 +4057,7 @@ def main():
     print(f"  new_attention     = {args.new_attention}")
     print(f"  PE_only           = {args.PE_only}")
     print(f"  freeze_PE         = {args.freeze_PE}")
+    print(f"  PE_init_scale     = {args.PE_init_scale}")
     print(f"  qkpe_direct_sign  = {args.qkpe_direct_sign}")
     print("=" * 50)
 
