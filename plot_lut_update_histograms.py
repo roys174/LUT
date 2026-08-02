@@ -43,6 +43,20 @@ def default_j_stats_path(stats_path):
     return stats_path.with_name(stats_path.stem + "_j_stats.npz")
 
 
+def default_coord_stats_path(stats_path):
+    return stats_path.with_name(stats_path.stem + "_coord_stats.npz")
+
+
+def load_coord_stats(path):
+    coord_path = Path(path)
+    if not coord_path.exists():
+        return None, {}
+    if coord_path.suffix != ".npz":
+        raise ValueError("coordinate statistics must be loaded from a .npz file")
+    with np.load(coord_path) as data:
+        return coord_path, {name: data[name].copy() for name in data.files}
+
+
 def load_j_stats(path):
     j_path = Path(path)
     if not j_path.exists():
@@ -492,7 +506,7 @@ def discover_stats_inputs(input_path, out_dir_arg):
         out_dir = Path(out_dir_arg) if out_dir_arg else path
         run_dir = path.parent
         snapshots = sorted(run_dir.glob("lut_update_stats_step_*.npz"), key=snapshot_sort_key)
-        stats_files = [p for p in snapshots if not p.name.endswith("_j_stats.npz")]
+        stats_files = [p for p in snapshots if not p.name.endswith(("_j_stats.npz", "_coord_stats.npz"))]
         if not stats_files:
             base = run_dir / "lut_update_stats.npz"
             if base.exists():
@@ -630,6 +644,159 @@ def plot_coverage_timeline(out_dir, coverage_rows, plt):
     return written
 
 
+def selected_tables_for_coord_stats(coord_stats, args, rng, filters, samples):
+    layer_filter, head_filter = filters
+    ffn_sample, attention_sample, new_attention_sample = samples
+    selected = {}
+    for lut_name in sorted(coord_stats):
+        if not lut_passes_filters(lut_name, layer_filter, head_filter,
+                                  args.min_layer, args.max_layer):
+            continue
+        counts = coord_stats[lut_name]
+        if counts.ndim != 2:
+            print(f"Skipping coord stats {lut_name}: expected 2D array, got shape {counts.shape}",
+                  file=sys.stderr)
+            continue
+        tables = selected_tables_for_name(
+            lut_name, counts.shape[0], rng, ffn_sample, attention_sample,
+            new_attention_sample, args.include_other_luts)
+        if tables.size:
+            selected[lut_name] = tables
+    return selected
+
+
+def coord_summary_text(counts):
+    total = int(counts.sum())
+    updated = int(np.count_nonzero(counts))
+    zero = int(counts.size - updated)
+    return (
+        f"mean={float(counts.mean()):.2f}\n"
+        f"var={float(counts.var()):.2f}\n"
+        f"zero={zero}/{counts.size}\n"
+        f"total={total}\n"
+        f"max={int(counts.max()) if counts.size else 0}"
+    )
+
+
+def plot_coord_stats(coord_stats, out_dir, args, plt, selected_by_name):
+    written = []
+    coord_dir = out_dir / "coord_stats"
+    coord_dir.mkdir(parents=True, exist_ok=True)
+    for lut_name, counts in sorted(coord_stats.items()):
+        selected_tables = selected_by_name.get(lut_name, np.array([], dtype=np.int32))
+        if selected_tables.size == 0:
+            continue
+        fig, axes = plt.subplots(selected_tables.size, 1,
+                                 figsize=(12, max(3, 2.7 * selected_tables.size)),
+                                 squeeze=False, sharex=True)
+        for table_idx, ax in zip(selected_tables, axes[:, 0]):
+            coord_counts = counts[int(table_idx)]
+            coords = np.arange(coord_counts.shape[0])
+            if args.line:
+                ax.plot(coords, coord_counts, linewidth=1.0)
+            else:
+                ax.bar(coords, coord_counts, width=1.0)
+            ax.set_title(f"{lut_name} table {int(table_idx)}: coordinate update counts")
+            ax.set_xlabel("coordinate")
+            ax.set_ylabel("non-zero update events")
+            if coord_counts.shape[0] > 1:
+                ax.set_xlim(-0.5, coord_counts.shape[0] - 0.5)
+            ax.text(0.99, 0.95, coord_summary_text(coord_counts),
+                    transform=ax.transAxes, ha="right", va="top", fontsize=8,
+                    bbox={"facecolor": "white", "edgecolor": "0.75", "alpha": 0.9})
+        fig.tight_layout()
+        output_path = coord_dir / f"coords_{_safe_filename(lut_name)}.png"
+        fig.savefig(output_path, dpi=150)
+        written.append(output_path)
+        print(f"{lut_name}: plotted coordinate tables {', '.join(str(int(i)) for i in selected_tables)}")
+        if args.show:
+            plt.show()
+        plt.close(fig)
+    return written
+
+
+def coord_timeline_rows_for_stats(coord_stats, step_label, args, rng, filters, samples):
+    rows = []
+    selected = selected_tables_for_coord_stats(coord_stats, args, rng, filters, samples)
+    for lut_name, tables in selected.items():
+        counts = coord_stats[lut_name]
+        group = lut_group(lut_name)
+        for table_idx in tables:
+            coord_counts = counts[int(table_idx)]
+            total_coords = int(coord_counts.size)
+            updated = int(np.count_nonzero(coord_counts))
+            rows.append({
+                "step_label": step_label,
+                "step": snapshot_step_from_label(step_label),
+                "lut": lut_name,
+                "group": group,
+                "table": int(table_idx),
+                "total_coordinate_updates": int(coord_counts.sum()),
+                "updated_coordinates": updated,
+                "total_coordinates": total_coords,
+                "zero_updated_coordinates": total_coords - updated,
+                "coord_nonzero_pct": 100.0 * updated / total_coords if total_coords else 0.0,
+                "mean_updates_per_coordinate": float(coord_counts.mean()) if total_coords else 0.0,
+                "var_updates_per_coordinate": float(coord_counts.var()) if total_coords else 0.0,
+                "max_updates_on_coordinate": int(coord_counts.max()) if total_coords else 0,
+            })
+    return rows
+
+
+def write_coord_timeline(out_dir, rows):
+    if not rows:
+        return None
+    path = out_dir / "coord_stats_timeline.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "step_label", "step", "lut", "group", "table",
+            "total_coordinate_updates", "updated_coordinates", "total_coordinates",
+            "zero_updated_coordinates", "coord_nonzero_pct",
+            "mean_updates_per_coordinate", "var_updates_per_coordinate",
+            "max_updates_on_coordinate",
+        ])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def plot_coord_timeline(out_dir, rows, plt):
+    if not rows:
+        return []
+    written = []
+    labels = []
+    for row in rows:
+        if row["step_label"] not in labels:
+            labels.append(row["step_label"])
+    groups = sorted({row["group"] for row in rows})
+    x = np.arange(len(labels))
+
+    for metric, ylabel, filename in [
+        ("coord_nonzero_pct", "coordinates updated at least once (%)", "coord_nonzero_pct_over_steps_by_group.png"),
+        ("mean_updates_per_coordinate", "mean non-zero update events per coordinate", "coord_mean_updates_over_steps_by_group.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for group in groups:
+            y = []
+            for label in labels:
+                values = [row[metric] for row in rows
+                          if row["step_label"] == label and row["group"] == group]
+                y.append(float(np.mean(values)) if values else math.nan)
+            ax.plot(x, y, marker="o", label=group)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+        ax.set_ylabel(ylabel)
+        ax.set_title("Coordinate update statistics over saved snapshots")
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        path = out_dir / filename
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        written.append(path)
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot LUT row index vs updates, plus aggregate j statistics when present."
@@ -641,6 +808,10 @@ def main():
                         help="Path to companion j-stats .npz for single-file mode (default: <stats stem>_j_stats.npz)")
     parser.add_argument("--no-j-stats", action="store_true",
                         help="Only plot row-update stats; do not load or plot companion j stats")
+    parser.add_argument("--coord-stats-npz", default=None,
+                        help="Path to companion coordinate-stats .npz for single-file mode (default: <stats stem>_coord_stats.npz)")
+    parser.add_argument("--no-coord-stats", action="store_true",
+                        help="Do not load or plot companion coordinate stats")
     parser.add_argument("--j-top-n", type=int, default=20,
                         help="Top/zero/scarce j bins to write to j_stats_top.csv (default: 20)")
     parser.add_argument("--line", action="store_true",
@@ -702,6 +873,7 @@ def main():
 
     all_written = []
     coverage_rows = []
+    coord_timeline_rows = []
     for stats_path in stats_paths:
         try:
             stats = load_stats(stats_path)
@@ -720,6 +892,26 @@ def main():
         all_written.extend(plot_row_stats(stats, step_out_dir, args, plt, row_rng, filters, samples))
         timeline_rng = np.random.default_rng(args.sample_seed)
         coverage_rows.extend(coverage_rows_for_stats(stats, label, args, timeline_rng, filters, samples))
+
+        coord_path = None
+        coord_stats = {}
+        if not args.no_coord_stats:
+            try:
+                requested_coord_path = Path(args.coord_stats_npz) if args.coord_stats_npz and len(stats_paths) == 1 else default_coord_stats_path(stats_path)
+                coord_path, coord_stats = load_coord_stats(requested_coord_path)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        if coord_path is not None:
+            coord_rng = np.random.default_rng(args.sample_seed)
+            selected_coord_tables = selected_tables_for_coord_stats(coord_stats, args, coord_rng, filters, samples)
+            all_written.extend(plot_coord_stats(coord_stats, step_out_dir, args, plt, selected_coord_tables))
+            timeline_coord_rng = np.random.default_rng(args.sample_seed)
+            coord_timeline_rows.extend(coord_timeline_rows_for_stats(
+                coord_stats, label, args, timeline_coord_rng, filters, samples))
+            print(f"Loaded coordinate stats from {coord_path}")
+        elif not args.no_coord_stats:
+            print(f"No coordinate stats found at {args.coord_stats_npz or default_coord_stats_path(stats_path)}")
 
         j_path = None
         j_stats = {"simple": {}, "components": {}, "joints": {}}
@@ -747,6 +939,10 @@ def main():
         if timeline_csv is not None:
             all_written.append(timeline_csv)
         all_written.extend(plot_coverage_timeline(out_dir, coverage_rows, plt))
+        coord_timeline_csv = write_coord_timeline(out_dir, coord_timeline_rows)
+        if coord_timeline_csv is not None:
+            all_written.append(coord_timeline_csv)
+        all_written.extend(plot_coord_timeline(out_dir, coord_timeline_rows, plt))
 
     for path in all_written:
         print(path)

@@ -268,6 +268,7 @@ class LUTUpdateStats:
     """Counts row and j-bin usage for LUT S updates."""
     def __init__(self):
         self.counts = {}
+        self.coord_counts = {}
         self.j_counts = {}
         self.j_component_counts = {}
         self.j_joint_counts = {}
@@ -275,6 +276,10 @@ class LUTUpdateStats:
     def ensure(self, name, lut):
         if name not in self.counts:
             self.counts[name] = np.zeros(lut.S.shape[:2], dtype=np.uint64)
+
+    def ensure_coord(self, name, lut):
+        if name not in self.coord_counts:
+            self.coord_counts[name] = np.zeros((lut.S.shape[0], lut.y_dim), dtype=np.uint64)
 
     def ensure_j(self, name, n_tables, n_bins):
         if name not in self.j_counts:
@@ -302,6 +307,55 @@ class LUTUpdateStats:
     def record_rows(self, name, lut, trees, rows):
         self.ensure(name, lut)
         self._add_2d_counts(self.counts[name], trees, rows)
+
+    def record_coord_updates(self, name, lut, trees, updates):
+        self.ensure_coord(name, lut)
+        counts = self.coord_counts[name]
+        tree_arr = np.asarray(trees, dtype=np.int64)
+        update_arr = np.asarray(updates)
+        y_dim = lut.y_dim
+        if update_arr.shape[-1] < y_dim:
+            raise ValueError(
+                f"Coordinate update for {name} has {update_arr.shape[-1]} dims; expected at least {y_dim}")
+        update_arr = update_arr[..., :y_dim]
+        if update_arr.shape[:-1] != tree_arr.shape:
+            update_arr = np.broadcast_to(update_arr, tree_arr.shape + (y_dim,))
+        mask = update_arr != 0
+        if not mask.size:
+            return
+        flat_trees = tree_arr.ravel()
+        flat_mask = mask.reshape(flat_trees.size, y_dim)
+        for tree in np.unique(flat_trees):
+            counts[int(tree)] += flat_mask[flat_trees == tree].sum(axis=0).astype(np.uint64)
+
+    def record_simple_coords(self, name, lut, grad):
+        trees = np.broadcast_to(lut.trees, grad.shape[:1] + (lut.S.shape[0],))
+        self.record_coord_updates(name, lut, trees, grad[:, np.newaxis, :lut.y_dim])
+
+    def record_attention_coords(self, name, lut, y_grad, args):
+        trees = np.asarray(lut.trees, dtype=np.int32)
+        for pos in range(1, args.context_size):
+            update_vec = y_grad[pos, :lut.y_dim]
+            repeated = np.broadcast_to(update_vec, (pos, lut.S.shape[0], lut.y_dim))
+            tree_rows = np.broadcast_to(trees, (pos, lut.S.shape[0]))
+            self.record_coord_updates(name, lut, tree_rows, repeated)
+
+    def record_attention_scalar_coords(self, name, lut, scalar_grad, args):
+        trees = np.asarray(lut.trees, dtype=np.int32)
+        for pos in range(1, args.context_size):
+            values = scalar_grad[pos, :pos]
+            repeated = np.broadcast_to(values[:, np.newaxis, np.newaxis],
+                                       (pos, lut.S.shape[0], lut.y_dim))
+            tree_rows = np.broadcast_to(trees, (pos, lut.S.shape[0]))
+            self.record_coord_updates(name, lut, tree_rows, repeated)
+
+    def record_new_attention_final_coords(self, name, lut, y_grad, args):
+        trees = np.asarray(lut.trees, dtype=np.int32)
+        for tok_i in range(1, args.context_size):
+            update_vec = y_grad[tok_i, :lut.y_dim]
+            repeated = np.broadcast_to(update_vec, (tok_i, lut.S.shape[0], lut.y_dim))
+            tree_rows = np.broadcast_to(trees, (tok_i, lut.S.shape[0]))
+            self.record_coord_updates(name, lut, tree_rows, repeated)
 
     def record_j_values(self, name, n_tables, n_bins, tables, j_values):
         self.ensure_j(name, n_tables, n_bins)
@@ -380,6 +434,25 @@ class LUTUpdateStats:
     @staticmethod
     def j_stats_path(path):
         return path[:-4] + "_j_stats.npz" if path.endswith(".npz") else path + "_j_stats.npz"
+
+    @staticmethod
+    def coord_stats_path(path):
+        return path[:-4] + "_coord_stats.npz" if path.endswith(".npz") else path + "_coord_stats.npz"
+
+    @staticmethod
+    def _write_coord_summary(f, name, counts):
+        for table_idx in range(counts.shape[0]):
+            coord_counts = counts[table_idx]
+            total = int(coord_counts.sum())
+            updated = int(np.count_nonzero(coord_counts))
+            total_coords = int(coord_counts.size)
+            f.write(
+                f"{name},{table_idx},{total},{updated},{total_coords},"
+                f"{float(coord_counts.mean()):.6f},"
+                f"{float(coord_counts.var()):.6f},"
+                f"{int(coord_counts.max()) if coord_counts.size else 0},"
+                f"{total_coords - updated}\n"
+            )
 
     @staticmethod
     def _write_distribution_summary(f, kind, name, component, counts):
@@ -478,6 +551,8 @@ class LUTUpdateStats:
         np.savez_compressed(path, **arrays)
         summary_path = path[:-4] + "_summary.csv" if path.endswith(".npz") else path + "_summary.csv"
         hist_path = path[:-4] + "_histogram.csv" if path.endswith(".npz") else path + "_histogram.csv"
+        coord_stats_path = self.coord_stats_path(path)
+        coord_summary_path = path[:-4] + "_coord_stats_summary.csv" if path.endswith(".npz") else path + "_coord_stats_summary.csv"
         j_stats_path = self.j_stats_path(path)
         j_summary_path = path[:-4] + "_j_stats_summary.csv" if path.endswith(".npz") else path + "_j_stats_summary.csv"
         j_top_path = path[:-4] + "_j_stats_top.csv" if path.endswith(".npz") else path + "_j_stats_top.csv"
@@ -503,6 +578,13 @@ class LUTUpdateStats:
                         num_rows = int(hist[updates_per_row])
                         if num_rows:
                             f.write(f"{name},{table_idx},{updates_per_row},{num_rows}\n")
+
+        coord_arrays = {name: counts for name, counts in self.coord_counts.items()}
+        np.savez_compressed(coord_stats_path, **coord_arrays)
+        with open(coord_summary_path, "w") as f:
+            f.write("lut,table,total_coordinate_updates,updated_coordinates,total_coordinates,mean_updates_per_coordinate,var_updates_per_coordinate,max_updates_on_coordinate,zero_updated_coordinates\n")
+            for name in sorted(self.coord_counts):
+                self._write_coord_summary(f, name, self.coord_counts[name])
 
         j_arrays = {}
         for name, counts in self.j_counts.items():
@@ -536,7 +618,7 @@ class LUTUpdateStats:
                 name, row_component, col_component = key
                 self._write_joint_top(
                     f, name, row_component, col_component, self.j_joint_counts[key])
-        return summary_path, hist_path, j_stats_path, j_summary_path, j_top_path
+        return summary_path, hist_path, coord_stats_path, coord_summary_path, j_stats_path, j_summary_path, j_top_path
 
 
 def parse_lut_update_snapshot_steps(text):
@@ -568,22 +650,28 @@ def lut_update_snapshot_path(path, step):
 
 
 def save_lut_update_stats(update_stats, base_path, step=None):
-    summary_path, hist_path, j_stats_path, j_summary_path, j_top_path = update_stats.save(base_path)
+    (summary_path, hist_path, coord_stats_path, coord_summary_path,
+     j_stats_path, j_summary_path, j_top_path) = update_stats.save(base_path)
     saved = {
         'stats_path': base_path,
         'summary_path': summary_path,
         'hist_path': hist_path,
+        'coord_stats_path': coord_stats_path,
+        'coord_summary_path': coord_summary_path,
         'j_stats_path': j_stats_path,
         'j_summary_path': j_summary_path,
         'j_top_path': j_top_path,
     }
     if step is not None:
         snapshot_path = lut_update_snapshot_path(base_path, step)
-        snapshot_summary, snapshot_hist, snapshot_j_stats, snapshot_j_summary, snapshot_j_top = update_stats.save(snapshot_path)
+        (snapshot_summary, snapshot_hist, snapshot_coord_stats, snapshot_coord_summary,
+         snapshot_j_stats, snapshot_j_summary, snapshot_j_top) = update_stats.save(snapshot_path)
         saved.update({
             'snapshot_path': snapshot_path,
             'snapshot_summary_path': snapshot_summary,
             'snapshot_hist_path': snapshot_hist,
+            'snapshot_coord_stats_path': snapshot_coord_stats,
+            'snapshot_coord_summary_path': snapshot_coord_summary,
             'snapshot_j_stats_path': snapshot_j_stats,
             'snapshot_j_summary_path': snapshot_j_summary,
             'snapshot_j_top_path': snapshot_j_top,
@@ -740,6 +828,7 @@ class StandardOutputHead:
         lut = self.unembedder
         if update_stats is not None and not skip_s_update:
             update_stats.record_simple(stats_name, lut, self._j)
+            update_stats.record_simple_coords(stats_name, lut, self.output)
         if HAS_NUMBA and lut.S.dtype == np.float32:
             if skip_s_update:
                 _lut_backward_kernel_noupdate(lut.S, lut.trees, self._j, self._r_min, self._u_min,
@@ -905,6 +994,7 @@ class FactoredOutputHead:
         ]:
             if update_stats is not None and not skip_s_update:
                 update_stats.record_simple(f'{stats_prefix}_{stats_suffix}', lut, j)
+                update_stats.record_simple_coords(f'{stats_prefix}_{stats_suffix}', lut, output)
             if HAS_NUMBA and lut.S.dtype == np.float32:
                 if skip_s_update:
                     _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
@@ -2602,6 +2692,8 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
         update_stats.record_simple(f'{stats_prefix}_V', lutV, head._val_j)
         update_stats.record_new_attention_final(
             f'{stats_prefix}_Final', lutFinal, head._final_v_j, head._qkpe_j, args)
+        update_stats.record_new_attention_final_coords(
+            f'{stats_prefix}_Final', lutFinal, y_grad, args)
 
     if (HAS_NUMBA and lutFinal.S.dtype == np.float32
             and lutQ.S.dtype == np.float32
@@ -2674,6 +2766,12 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
 
     if pe_grad_out is None:
         head.Positional_encoding -= learning_rate * pe_grad
+
+    if update_stats is not None and not skip_s_update:
+        if not pe_only:
+            update_stats.record_simple_coords(f'{stats_prefix}_Q', lutQ, q_grad)
+            update_stats.record_simple_coords(f'{stats_prefix}_K', lutK, k_grad)
+        update_stats.record_simple_coords(f'{stats_prefix}_V', lutV, v_grad)
 
     if not pe_only:
         if HAS_NUMBA and lutQ.S.dtype == np.float32:
@@ -2752,6 +2850,11 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
                 head._attn_w, head._v_vecs, y_grad, score_grad, x_grad, pos_grad,
                 score_lut.a_arr, score_lut.b_arr,
                 shift_qk, pd, CS, N_T, ED, np.float32(learning_rate), skip_s_update)
+
+            if update_stats is not None and not skip_s_update:
+                update_stats.record_simple_coords(f'{stats_prefix}_Value', val_lut, val_grad)
+                update_stats.record_attention_scalar_coords(
+                    f'{stats_prefix}_Score', score_lut, score_grad, args)
 
             if pe_grad_out is None:
                 head.Positional_encoding -= learning_rate * pos_grad
@@ -2843,6 +2946,11 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
             if score_grad_out is not None:
                 score_grad_out[:] = score_grad
 
+            if update_stats is not None and not skip_s_update:
+                update_stats.record_simple_coords(f'{stats_prefix}_Value', val_lut, val_grad)
+                update_stats.record_attention_scalar_coords(
+                    f'{stats_prefix}_Score', score_lut, score_grad, args)
+
             if pe_grad_out is not None:
                 pe_grad_out += pos_grad
             else:
@@ -2855,6 +2963,7 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
     if update_stats is not None and not skip_s_update:
         record_attention_update_rows(update_stats, stats_prefix, lut,
                                      head._v_j, head._pe_j, args)
+        update_stats.record_attention_coords(stats_prefix, lut, y_grad, args)
 
     pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
 
@@ -3090,6 +3199,7 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
         else:
             if update_stats is not None:
                 update_stats.record_simple(f'ffn_{l}', lut, j)
+                update_stats.record_simple_coords(f'ffn_{l}', lut, y_grad)
             if HAS_NUMBA and lut.S.dtype == np.float32:
                 _lut_s_replay_kernel(lut.S, trees, j, y_grad, y_dim, CS, args.n_t,
                                      np.float32(learning_rate))
@@ -3317,8 +3427,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
         j_list = [be._ffn_j[l] for be in batch_elements]
         ygrad_list = [be.grad_accum.ffn_y_grads[l] for be in batch_elements]
         if update_stats is not None:
-            for j in j_list:
+            for j, ygrad in zip(j_list, ygrad_list):
                 update_stats.record_simple(f'ffn_{l}', lut, j)
+                update_stats.record_simple_coords(f'ffn_{l}', lut, ygrad)
         work.append(lambda _l=lut, _j=j_list, _y=ygrad_list:
                     _replay_ffn_task(_l.S, _l.trees, _j, _y, _l.y_dim,
                                      CS, N_T, scale, use_numba))
@@ -3338,14 +3449,20 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                 k_grad_list = [be.grad_accum.new_attn_k_grads[l][h] for be in batch_elements]
                 v_grad_list = [be.grad_accum.new_attn_v_grads[l][h] for be in batch_elements]
                 if update_stats is not None:
-                    for q_j, k_j, val_j, final_v_j, qkpe_j in zip(
-                            q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list):
+                    for q_j, k_j, val_j, final_v_j, qkpe_j, ygrad, q_grad, k_grad, v_grad in zip(
+                            q_j_list, k_j_list, val_j_list, final_v_j_list, qkpe_j_list,
+                            ygrad_list, q_grad_list, k_grad_list, v_grad_list):
                         if not getattr(args, 'PE_only', False):
                             update_stats.record_simple(f'head_{l}_{h}_Q', head.Q, q_j)
+                            update_stats.record_simple_coords(f'head_{l}_{h}_Q', head.Q, q_grad)
                             update_stats.record_simple(f'head_{l}_{h}_K', head.K, k_j)
+                            update_stats.record_simple_coords(f'head_{l}_{h}_K', head.K, k_grad)
                         update_stats.record_simple(f'head_{l}_{h}_V', head.V, val_j)
+                        update_stats.record_simple_coords(f'head_{l}_{h}_V', head.V, v_grad)
                         update_stats.record_new_attention_final(
                             f'head_{l}_{h}_Final', head.Final, final_v_j, qkpe_j, args)
+                        update_stats.record_new_attention_final_coords(
+                            f'head_{l}_{h}_Final', head.Final, ygrad, args)
                 work.append(lambda _head=head, _qj=q_j_list, _kj=k_j_list, _vj=val_j_list,
                                    _fvj=final_v_j_list, _qkpj=qkpe_j_list, _y=ygrad_list,
                                    _qg=q_grad_list, _kg=k_grad_list, _vg=v_grad_list,
@@ -3361,10 +3478,14 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                 score_grad_list = [be.grad_accum.attn_score_grads[l][h] for be in batch_elements]
                 val_grad_list   = [be.grad_accum.attn_val_grads[l][h]   for be in batch_elements]
                 if update_stats is not None:
-                    for val_j, jV, jPE in zip(val_j_list, jV_list, jPE_list):
+                    for val_j, jV, jPE, val_grad, score_grad in zip(
+                            val_j_list, jV_list, jPE_list, val_grad_list, score_grad_list):
                         update_stats.record_simple(f'head_{l}_{h}_Value', head.Value, val_j)
+                        update_stats.record_simple_coords(f'head_{l}_{h}_Value', head.Value, val_grad)
                         record_attention_update_rows(update_stats, f'head_{l}_{h}_Score',
                                                      head.Score, jV, jPE, args)
+                        update_stats.record_attention_scalar_coords(
+                            f'head_{l}_{h}_Score', head.Score, score_grad, args)
                 work.append(lambda _SS=head.Score.S, _VS=head.Value.S,
                                    _st=head.Score.trees, _vt=head.Value.trees,
                                    _jV=jV_list, _jPE=jPE_list, _vj=val_j_list,
@@ -3381,9 +3502,10 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                 lut_v = head.V
                 ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
                 if update_stats is not None:
-                    for jV, jPE in zip(jV_list, jPE_list):
+                    for jV, jPE, ygrad in zip(jV_list, jPE_list, ygrad_list):
                         record_attention_update_rows(update_stats, f'head_{l}_{h}_V',
                                                      lut_v, jV, jPE, args)
+                        update_stats.record_attention_coords(f'head_{l}_{h}_V', lut_v, ygrad, args)
                 work.append(lambda _S=lut_v.S, _jV=jV_list, _jPE=jPE_list,
                                    _y=ygrad_list, _PE=head.Positional_encoding,
                                    _pg=pe_grad_list, _yd=lut_v.y_dim:
@@ -3398,8 +3520,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
             j_list = [getattr(be.output_head, j_attr) for be in batch_elements]
             out_list = [getattr(be.output_head, out_attr) for be in batch_elements]
             if update_stats is not None:
-                for j in j_list:
+                for j, output in zip(j_list, out_list):
                     update_stats.record_simple(f'output_{j_attr[1:-2]}', lut, j)
+                    update_stats.record_simple_coords(f'output_{j_attr[1:-2]}', lut, output)
             work.append(lambda _l=lut, _j=j_list, _o=out_list:
                         _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
                                             CS, N_T, scale, use_numba))
@@ -3408,8 +3531,9 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
         j_list = [be.output_head._j for be in batch_elements]
         out_list = [be.output_head.output for be in batch_elements]
         if update_stats is not None:
-            for j in j_list:
+            for j, output in zip(j_list, out_list):
                 update_stats.record_simple('output', lut, j)
+                update_stats.record_simple_coords('output', lut, output)
         work.append(lambda _l=lut, _j=j_list, _o=out_list:
                     _replay_output_task(_l.S, _l.trees, _j, _o, _l.y_dim,
                                         CS, N_T, scale, use_numba))
