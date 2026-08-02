@@ -27,6 +27,16 @@ def _safe_filename(name):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "lut"
 
 
+def kl_to_uniform(counts):
+    total = float(np.sum(counts))
+    n = int(np.size(counts))
+    if total <= 0.0 or n <= 0:
+        return 0.0
+    probs = np.asarray(counts, dtype=np.float64).ravel() / total
+    probs = probs[probs > 0.0]
+    return float(np.sum(probs * np.log2(probs * n)))
+
+
 def load_stats(path):
     stats_path = Path(path)
     if stats_path.suffix != ".npz":
@@ -666,15 +676,13 @@ def selected_tables_for_coord_stats(coord_stats, args, rng, filters, samples):
 
 
 def coord_summary_text(counts):
-    total = int(counts.sum())
     updated = int(np.count_nonzero(counts))
     zero = int(counts.size - updated)
     return (
         f"mean={float(counts.mean()):.2f}\n"
         f"var={float(counts.var()):.2f}\n"
         f"zero={zero}/{counts.size}\n"
-        f"total={total}\n"
-        f"max={int(counts.max()) if counts.size else 0}"
+        f"KL(unif)={kl_to_uniform(counts):.3f} bits"
     )
 
 
@@ -739,6 +747,7 @@ def coord_timeline_rows_for_stats(coord_stats, step_label, args, rng, filters, s
                 "mean_updates_per_coordinate": float(coord_counts.mean()) if total_coords else 0.0,
                 "var_updates_per_coordinate": float(coord_counts.var()) if total_coords else 0.0,
                 "max_updates_on_coordinate": int(coord_counts.max()) if total_coords else 0,
+                "kl_to_uniform_bits": kl_to_uniform(coord_counts),
             })
     return rows
 
@@ -753,7 +762,7 @@ def write_coord_timeline(out_dir, rows):
             "total_coordinate_updates", "updated_coordinates", "total_coordinates",
             "zero_updated_coordinates", "coord_nonzero_pct",
             "mean_updates_per_coordinate", "var_updates_per_coordinate",
-            "max_updates_on_coordinate",
+            "max_updates_on_coordinate", "kl_to_uniform_bits",
         ])
         writer.writeheader()
         writer.writerows(rows)
@@ -774,6 +783,7 @@ def plot_coord_timeline(out_dir, rows, plt):
     for metric, ylabel, filename in [
         ("coord_nonzero_pct", "coordinates updated at least once (%)", "coord_nonzero_pct_over_steps_by_group.png"),
         ("mean_updates_per_coordinate", "mean non-zero update events per coordinate", "coord_mean_updates_over_steps_by_group.png"),
+        ("kl_to_uniform_bits", "KL divergence from uniform (bits)", "coord_kl_to_uniform_over_steps_by_group.png"),
     ]:
         fig, ax = plt.subplots(figsize=(10, 5))
         for group in groups:

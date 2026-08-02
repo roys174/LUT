@@ -440,18 +440,29 @@ class LUTUpdateStats:
         return path[:-4] + "_coord_stats.npz" if path.endswith(".npz") else path + "_coord_stats.npz"
 
     @staticmethod
+    def _kl_to_uniform(counts):
+        total = float(np.sum(counts))
+        n = int(np.size(counts))
+        if total <= 0.0 or n <= 0:
+            return 0.0
+        probs = np.asarray(counts, dtype=np.float64).ravel() / total
+        probs = probs[probs > 0.0]
+        return float(np.sum(probs * np.log2(probs * n)))
+
+    @staticmethod
     def _write_coord_summary(f, name, counts):
         for table_idx in range(counts.shape[0]):
             coord_counts = counts[table_idx]
             total = int(coord_counts.sum())
             updated = int(np.count_nonzero(coord_counts))
             total_coords = int(coord_counts.size)
+            kl_to_uniform = LUTUpdateStats._kl_to_uniform(coord_counts)
             f.write(
                 f"{name},{table_idx},{total},{updated},{total_coords},"
                 f"{float(coord_counts.mean()):.6f},"
                 f"{float(coord_counts.var()):.6f},"
                 f"{int(coord_counts.max()) if coord_counts.size else 0},"
-                f"{total_coords - updated}\n"
+                f"{total_coords - updated},{kl_to_uniform:.6f}\n"
             )
 
     @staticmethod
@@ -582,7 +593,7 @@ class LUTUpdateStats:
         coord_arrays = {name: counts for name, counts in self.coord_counts.items()}
         np.savez_compressed(coord_stats_path, **coord_arrays)
         with open(coord_summary_path, "w") as f:
-            f.write("lut,table,total_coordinate_updates,updated_coordinates,total_coordinates,mean_updates_per_coordinate,var_updates_per_coordinate,max_updates_on_coordinate,zero_updated_coordinates\n")
+            f.write("lut,table,total_coordinate_updates,updated_coordinates,total_coordinates,mean_updates_per_coordinate,var_updates_per_coordinate,max_updates_on_coordinate,zero_updated_coordinates,kl_to_uniform_bits\n")
             for name in sorted(self.coord_counts):
                 self._write_coord_summary(f, name, self.coord_counts[name])
 
