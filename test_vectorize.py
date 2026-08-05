@@ -1058,3 +1058,143 @@ class TestQKPEDirectSign:
         np.testing.assert_array_equal(q_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
         np.testing.assert_array_equal(k_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
         np.testing.assert_array_equal(pe_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
+
+
+class TestQKPENormalization:
+    def test_normalize_vector_matches_target_stats_and_backward_finite_diff(self):
+        vec = np.array([0.8, -1.2, 0.3, 2.0], dtype=np.float32)
+        upstream = np.array([0.4, -0.7, 0.2, 1.1], dtype=np.float32)
+        target_std = np.float32(0.75)
+        eps = np.float32(1e-6)
+
+        normalized = main_module._normalize_vector_to_target(vec, target_std, eps)
+        assert abs(float(normalized.mean())) < 1e-6
+        np.testing.assert_allclose(
+            np.sqrt(np.mean(normalized * normalized)), target_std, rtol=1e-5, atol=1e-5)
+
+        analytic = main_module._normalize_vector_backward(vec, upstream, target_std, eps)
+        numeric = np.zeros_like(vec)
+        step = np.float32(1e-3)
+        for i in range(vec.size):
+            plus = vec.copy()
+            minus = vec.copy()
+            plus[i] += step
+            minus[i] -= step
+            f_plus = (main_module._normalize_vector_to_target(plus, target_std, eps) * upstream).sum()
+            f_minus = (main_module._normalize_vector_to_target(minus, target_std, eps) * upstream).sum()
+            numeric[i] = (f_plus - f_minus) / (2.0 * step)
+
+        np.testing.assert_allclose(analytic, numeric, rtol=2e-3, atol=2e-3)
+
+    def test_forward_direct_sign_uses_normalized_qk_and_raw_pe(self):
+        args = make_qkpe_direct_model_args(pe_only=False)
+        args.normalize_qk = True
+        args.qk_norm_eps = np.float32(1e-6)
+        args.qk_norm_target_std = np.float32(0.5)
+        np.random.seed(2468)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        head.Positional_encoding[:] = np.array([
+            [0.0, 0.0, 0.0],
+            [4.0, 3.0, -100.0],
+            [-2.0, 1.0, 100.0],
+        ], dtype=np.float32)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        expected = np.zeros_like(head._qkpe_j)
+        for tok_i in range(1, args.context_size):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                pe_pos = tok_i - tok_j
+                active = args.positional_dim
+                qk = main_module._normalize_vector_to_target(
+                    head._q_embed[tok_i, :active] + head._k_embed[tok_j, :active],
+                    args.qk_norm_target_std, args.qk_norm_eps)
+                u = qk + head.Positional_encoding[pe_pos, :active]
+                expected[pair, :] = int(((u > 0).astype(np.int32) * args.pe_bitmasks).sum())
+
+        np.testing.assert_array_equal(head._qkpe_j, expected)
+
+
+    def test_forward_anchor_comparisons_use_normalized_qk_and_raw_pe(self):
+        args = make_pe_only_model_args()
+        args.PE_only = False
+        args.normalize_qk = True
+        args.qk_norm_eps = np.float32(1e-6)
+        args.qk_norm_target_std = np.float32(0.5)
+        np.random.seed(1357)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        head.Positional_encoding[:] = np.array([
+            [0.0, 0.0],
+            [5.0, -1.0],
+            [-3.0, 2.0],
+            [1.0, -4.0],
+        ], dtype=np.float32)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        expected = np.zeros_like(head._qkpe_j)
+        for tok_i in range(1, args.context_size):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                pe_pos = tok_i - tok_j
+                active = args.attn_qk_dim
+                qk = main_module._normalize_vector_to_target(
+                    head._q_embed[tok_i, :active] + head._k_embed[tok_j, :active],
+                    args.qk_norm_target_std, args.qk_norm_eps)
+                combined = qk + head.Positional_encoding[pe_pos, :active]
+                for t in range(args.n_t):
+                    j = 0
+                    for c in range(args.positional_dim):
+                        a = head._qkpe_a_arr[t, c]
+                        b = head._qkpe_b_arr[t, c]
+                        if combined[a] - combined[b] > 0.0:
+                            j |= int(head._qkpe_bitmasks[c])
+                    expected[pair, t] = j
+
+        np.testing.assert_array_equal(head._qkpe_j, expected)
+
+    def test_pe_only_forward_anchor_comparisons_ignore_normalization(self):
+        args = make_pe_only_model_args()
+        args.normalize_qk = True
+        args.qk_norm_eps = np.float32(1e-6)
+        args.qk_norm_target_std = np.float32(0.5)
+        np.random.seed(9753)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        head.Positional_encoding[:] = np.array([
+            [0.0, 0.0],
+            [3.0, -2.0],
+            [-1.0, 4.0],
+            [2.0, 1.0],
+        ], dtype=np.float32)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        expected = np.zeros_like(head._qkpe_j)
+        for tok_i in range(1, args.context_size):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                pe_pos = tok_i - tok_j
+                for t in range(args.n_t):
+                    j = 0
+                    for c in range(args.positional_dim):
+                        a = head._qkpe_a_arr[t, c]
+                        b = head._qkpe_b_arr[t, c]
+                        if (head.Positional_encoding[pe_pos, a]
+                                - head.Positional_encoding[pe_pos, b]) > 0.0:
+                            j |= int(head._qkpe_bitmasks[c])
+                    expected[pair, t] = j
+
+        np.testing.assert_array_equal(head._qkpe_j, expected)

@@ -698,6 +698,7 @@ class NewAttentionHead:
                  '_q_embed', '_k_embed', '_v_embed', '_qk_embed',
                  '_q_grad', '_k_grad', '_v_grad', '_pe_grad',
                  '_qkpe_j', '_qkpe_r_min', '_qkpe_u_min',
+                 '_qk_mean', '_qk_inv_std',
                  '_final_v_j', '_final_v_r_min', '_final_v_u_min',
                  '_qkpe_a_arr', '_qkpe_b_arr', '_qkpe_bitmasks',
                  '_val_j', '_val_r_min', '_val_u_min',
@@ -739,6 +740,8 @@ class NewAttentionHead:
         self._qkpe_j = np.zeros((n_pairs, N_T), dtype=np.int32)
         self._qkpe_r_min = np.zeros((n_pairs, N_T), dtype=np.int32)
         self._qkpe_u_min = np.zeros((n_pairs, N_T), dtype=np.float32)
+        self._qk_mean = np.zeros(n_pairs, dtype=np.float32)
+        self._qk_inv_std = np.ones(n_pairs, dtype=np.float32)
         self._qkpe_a_arr = np.zeros((N_T, POSITIONAL_DIM), dtype=np.int32)
         self._qkpe_b_arr = np.zeros((N_T, POSITIONAL_DIM), dtype=np.int32)
         self._qkpe_bitmasks = (1 << np.arange(POSITIONAL_DIM)).astype(np.int32)
@@ -1377,6 +1380,23 @@ def _f32(arr):
     return arr if arr.dtype == np.float32 else arr.astype(np.float32)
 
 
+def _normalize_vector_to_target(vec, target_std, eps):
+    mean = np.float32(vec.mean())
+    centered = vec - mean
+    inv_std = np.float32(1.0) / np.sqrt(np.float32((centered * centered).mean()) + eps)
+    return np.float32(target_std) * centered * inv_std
+
+
+def _normalize_vector_backward(vec, grad, target_std, eps):
+    mean = np.float32(vec.mean())
+    centered = vec - mean
+    inv_std = np.float32(1.0) / np.sqrt(np.float32((centered * centered).mean()) + eps)
+    xhat = centered * inv_std
+    grad_mean = np.float32(grad.mean())
+    grad_xhat_mean = np.float32((grad * xhat).mean())
+    return np.float32(target_std) * inv_std * (grad - grad_mean - xhat * grad_xhat_mean)
+
+
 def layernorm_forward(x, gamma, beta, eps=1e-5):
     """x: (CS, ED). Returns (y, xhat, rstd)."""
     mean = x.mean(axis=1, keepdims=True)
@@ -1435,13 +1455,15 @@ def _new_attention_forward_kernel(
     q_j, k_j, val_j,
     q_embed, k_embed, v_embed,
     qkpe_j, qkpe_r_min, qkpe_u_min,
+    qk_mean_arr, qk_inv_std_arr,
     final_v_j, final_v_r_min, final_v_u_min,
     y,
     PE,
     q_trees, k_trees, v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, Q_N_T, QD, y_dim, qkpe_direct_sign
+    pd, CS, N_T, N_C, Q_N_T, QD, y_dim, qkpe_direct_sign,
+    normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Fused forward for Q(x_i)+K(x_j)+PE and V(x_j) into Final LUT."""
     n_pairs = CS * (CS - 1) // 2
@@ -1491,6 +1513,27 @@ def _new_attention_forward_kernel(
         final_v_u_min[pos, t] = u_min_val
 
     # Phase 4: final qkpe-side row bits from Q(x_i)+K(x_j)+PE(i-j).
+    if normalize_qk:
+        active_dim = pd if qkpe_direct_sign else QD
+        for pair in prange(n_pairs):
+            tok_i = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
+            tok_j = pair - (tok_i * (tok_i - 1)) // 2
+            pe_pos = tok_i - tok_j
+            qk_mean_val = np.float32(0.0)
+
+            for d in range(active_dim):
+                qk_mean_val += q_embed[tok_i, d] + k_embed[tok_j, d]
+            qk_mean_val /= np.float32(active_dim)
+
+            qk_var = np.float32(0.0)
+            for d in range(active_dim):
+                qk_centered = q_embed[tok_i, d] + k_embed[tok_j, d] - qk_mean_val
+                qk_var += qk_centered * qk_centered
+            qk_var /= np.float32(active_dim)
+
+            qk_mean_arr[pair] = qk_mean_val
+            qk_inv_std_arr[pair] = np.float32(1.0) / np.sqrt(qk_var + qk_norm_eps)
+
     for work in prange(n_pairs * N_T):
         pair = work // N_T
         t = work - pair * N_T
@@ -1502,14 +1545,38 @@ def _new_attention_forward_kernel(
         r_min = np.int32(0)
         u_min_val = np.float32(0.0)
 
+        if normalize_qk:
+            qk_mean_val = qk_mean_arr[pair]
+            qk_inv_std_val = qk_inv_std_arr[pair]
+
         for c in range(pd):
             if qkpe_direct_sign:
-                u_val = q_embed[tok_i, c] + k_embed[tok_j, c] + PE[pe_pos, c]
+                if normalize_qk:
+                    qk_val = qk_norm_target_std * (
+                        q_embed[tok_i, c] + k_embed[tok_j, c] - qk_mean_val
+                    ) * qk_inv_std_val
+                    u_val = qk_val + PE[pe_pos, c]
+                else:
+                    u_val = q_embed[tok_i, c] + k_embed[tok_j, c] + PE[pe_pos, c]
             else:
                 a = qkpe_a_arr[t, c]
                 b = qkpe_b_arr[t, c]
-                ua = q_embed[tok_i, a] + k_embed[tok_j, a] + PE[pe_pos, a]
-                ub = q_embed[tok_i, b] + k_embed[tok_j, b] + PE[pe_pos, b]
+                if normalize_qk:
+                    ua = (
+                        qk_norm_target_std * (
+                            q_embed[tok_i, a] + k_embed[tok_j, a] - qk_mean_val
+                        ) * qk_inv_std_val
+                        + PE[pe_pos, a]
+                    )
+                    ub = (
+                        qk_norm_target_std * (
+                            q_embed[tok_i, b] + k_embed[tok_j, b] - qk_mean_val
+                        ) * qk_inv_std_val
+                        + PE[pe_pos, b]
+                    )
+                else:
+                    ua = q_embed[tok_i, a] + k_embed[tok_j, a] + PE[pe_pos, a]
+                    ub = q_embed[tok_i, b] + k_embed[tok_j, b] + PE[pe_pos, b]
                 u_val = ua - ub
             if u_val > np.float32(0.0):
                 j |= qkpe_bitmasks[c]
@@ -1645,12 +1712,14 @@ def _new_attention_final_backward_kernel(
     final_v_j, final_v_r_min, final_v_u_min,
     qkpe_j, qkpe_r_min, qkpe_u_min,
     y_grad,
+    q_embed, k_embed, PE,
+    qk_mean_arr, qk_inv_std_arr,
     q_grad, k_grad, v_grad, pe_grad,
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
     pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
-    freeze_pe
+    freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
     n_pairs = CS * (CS - 1) // 2
@@ -1692,7 +1761,47 @@ def _new_attention_final_backward_kernel(
         u_qkpe = qkpe_u_min[pair, t]
         sign_qkpe = np.float32(1.0) if u_qkpe > np.float32(0.0) else np.float32(-1.0)
         delta_qkpe = gi_qkpe * (np.float32(-0.5) * sign_qkpe / (np.float32(1.0) + abs(u_qkpe)) ** 2)
-        if qkpe_direct_sign:
+        if normalize_qk:
+            active_dim = pd if qkpe_direct_sign else q_dim
+            if qkpe_direct_sign:
+                a_qkpe = r_qkpe
+                b_qkpe = np.int32(-1)
+            else:
+                a_qkpe = qkpe_a_arr[t, r_qkpe]
+                b_qkpe = qkpe_b_arr[t, r_qkpe]
+
+            if not pe_only:
+                qk_mean_val = qk_mean_arr[pair]
+                qk_inv_std_val = qk_inv_std_arr[pair]
+
+                qk_xhat_a = (q_embed[tok_i, a_qkpe] + k_embed[tok_j, a_qkpe] - qk_mean_val) * qk_inv_std_val
+                if qkpe_direct_sign:
+                    qk_grad_mean = delta_qkpe / np.float32(active_dim)
+                    qk_grad_xhat_mean = delta_qkpe * qk_xhat_a / np.float32(active_dim)
+                else:
+                    qk_xhat_b = (q_embed[tok_i, b_qkpe] + k_embed[tok_j, b_qkpe] - qk_mean_val) * qk_inv_std_val
+                    qk_grad_mean = np.float32(0.0)
+                    qk_grad_xhat_mean = delta_qkpe * (qk_xhat_a - qk_xhat_b) / np.float32(active_dim)
+
+                for d_qk in range(active_dim):
+                    upstream = np.float32(0.0)
+                    if d_qk == a_qkpe:
+                        upstream += delta_qkpe
+                    if (not qkpe_direct_sign) and d_qk == b_qkpe:
+                        upstream -= delta_qkpe
+                    qk_xhat = (q_embed[tok_i, d_qk] + k_embed[tok_j, d_qk] - qk_mean_val) * qk_inv_std_val
+                    qk_delta = (
+                        qk_norm_target_std * qk_inv_std_val
+                        * (upstream - qk_grad_mean - qk_xhat * qk_grad_xhat_mean)
+                    )
+                    q_grad_thr[tid, tok_i, d_qk] += qk_delta
+                    k_grad_thr[tid, tok_j, d_qk] += qk_delta
+
+            if not freeze_pe:
+                pe_grad_thr[tid, pe_pos, a_qkpe] += delta_qkpe
+                if not qkpe_direct_sign:
+                    pe_grad_thr[tid, pe_pos, b_qkpe] -= delta_qkpe
+        elif qkpe_direct_sign:
             if not pe_only:
                 q_grad_thr[tid, tok_i, r_qkpe] += delta_qkpe
                 k_grad_thr[tid, tok_j, r_qkpe] += delta_qkpe
@@ -2541,6 +2650,9 @@ def new_attention_forward(head, x, y, args):
     n_pairs = CS * (CS - 1) // 2
     pe_only = getattr(args, 'PE_only', False)
     qkpe_direct_sign = getattr(args, 'qkpe_direct_sign', False)
+    normalize_qk = getattr(args, 'normalize_qk', False) and not pe_only
+    qk_norm_target_std = np.float32(getattr(args, 'qk_norm_target_std', 1.0 / math.sqrt(3.0)))
+    qk_norm_eps = np.float32(getattr(args, 'qk_norm_eps', 1e-6))
 
     if not pe_only:
         cache_index_batch(lutQ, x, head._q_j, head._q_r_min, head._q_u_min)
@@ -2572,6 +2684,7 @@ def new_attention_forward(head, x, y, args):
                 head._q_j, head._k_j, head._val_j,
                 head._q_embed, head._k_embed, head._v_embed,
                 head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
+                head._qk_mean, head._qk_inv_std,
                 head._final_v_j, head._final_v_r_min, head._final_v_u_min,
                 y,
                 head.Positional_encoding,
@@ -2579,7 +2692,8 @@ def new_attention_forward(head, x, y, args):
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
                 args.positional_dim, CS, args.n_t, args.n_c,
-                args.attn_qk_n_t, q_dim, y_dim, qkpe_direct_sign
+                args.attn_qk_n_t, q_dim, y_dim, qkpe_direct_sign,
+                normalize_qk, qk_norm_target_std, qk_norm_eps
             )
     else:
         if pe_only:
@@ -2596,10 +2710,15 @@ def new_attention_forward(head, x, y, args):
         cache_index_batch(lutFinal, head._v_embed,
                           head._final_v_j, head._final_v_r_min, head._final_v_u_min)
 
+        active_dim = args.positional_dim if qkpe_direct_sign else q_dim
         for pair in range(n_pairs):
             tok_i = int((np.sqrt(8.0 * pair + 1.0) + 1.0) * 0.5)
             tok_j = pair - (tok_i * (tok_i - 1)) // 2
             pe_pos = tok_i - tok_j
+            if normalize_qk:
+                qk_vec = _normalize_vector_to_target(
+                    head._q_embed[tok_i, :active_dim] + head._k_embed[tok_j, :active_dim],
+                    qk_norm_target_std, qk_norm_eps)
             for t in range(args.n_t):
                 j = np.int32(0)
                 min_abs_u = np.float32(1e38)
@@ -2607,7 +2726,9 @@ def new_attention_forward(head, x, y, args):
                 u_min_val = np.float32(0.0)
                 for c in range(args.positional_dim):
                     if qkpe_direct_sign:
-                        if pe_only:
+                        if normalize_qk:
+                            u_val = qk_vec[c] + head.Positional_encoding[pe_pos, c]
+                        elif pe_only:
                             u_val = head.Positional_encoding[pe_pos, c]
                         else:
                             u_val = (head._q_embed[tok_i, c] + head._k_embed[tok_j, c]
@@ -2615,7 +2736,10 @@ def new_attention_forward(head, x, y, args):
                     else:
                         a = head._qkpe_a_arr[t, c]
                         b = head._qkpe_b_arr[t, c]
-                        if pe_only:
+                        if normalize_qk:
+                            ua = qk_vec[a] + head.Positional_encoding[pe_pos, a]
+                            ub = qk_vec[b] + head.Positional_encoding[pe_pos, b]
+                        elif pe_only:
                             ua = head.Positional_encoding[pe_pos, a]
                             ub = head.Positional_encoding[pe_pos, b]
                         else:
@@ -2745,6 +2869,9 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     pe_only = getattr(args, 'PE_only', False)
     freeze_pe = getattr(args, 'freeze_PE', False)
     qkpe_direct_sign = getattr(args, 'qkpe_direct_sign', False)
+    normalize_qk = getattr(args, 'normalize_qk', False) and not pe_only
+    qk_norm_target_std = np.float32(getattr(args, 'qk_norm_target_std', 1.0 / math.sqrt(3.0)))
+    qk_norm_eps = np.float32(getattr(args, 'qk_norm_eps', 1e-6))
 
     q_grad = q_grad_out if q_grad_out is not None else head._q_grad
     k_grad = k_grad_out if k_grad_out is not None else head._k_grad
@@ -2781,13 +2908,15 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             head._final_v_j, head._final_v_r_min, head._final_v_u_min,
             head._qkpe_j, head._qkpe_r_min, head._qkpe_u_min,
             y_grad,
+            head._q_embed, head._k_embed, head.Positional_encoding,
+            head._qk_mean, head._qk_inv_std,
             q_grad, k_grad, v_grad, pe_grad,
             treesFinal,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
             POSITIONAL_DIM, CS, N_T, y_dim, QD,
             np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign,
-            freeze_pe)
+            freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps)
     else:
         for tok_i in range(1, CS):
             y_g = y_grad[tok_i, :y_dim]
@@ -2816,7 +2945,26 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                     u_qkpe = float(head._qkpe_u_min[pair_idx, t])
                     sign_qkpe = 1.0 if u_qkpe > 0.0 else -1.0
                     delta_qkpe = gi_qkpe * (-0.5 * sign_qkpe / (1.0 + abs(u_qkpe)) ** 2)
-                    if qkpe_direct_sign:
+                    if normalize_qk:
+                        active_dim = POSITIONAL_DIM if qkpe_direct_sign else QD
+                        upstream = np.zeros(active_dim, dtype=np.float32)
+                        if qkpe_direct_sign:
+                            upstream[r_qkpe] = delta_qkpe
+                        else:
+                            a_qkpe = int(head._qkpe_a_arr[t, r_qkpe])
+                            b_qkpe = int(head._qkpe_b_arr[t, r_qkpe])
+                            upstream[a_qkpe] += delta_qkpe
+                            upstream[b_qkpe] -= delta_qkpe
+
+                        qk_raw = (head._q_embed[tok_i, :active_dim]
+                                  + head._k_embed[tok_j, :active_dim])
+                        qk_delta = _normalize_vector_backward(
+                            qk_raw, upstream, qk_norm_target_std, qk_norm_eps)
+                        q_grad[tok_i, :active_dim] += qk_delta
+                        k_grad[tok_j, :active_dim] += qk_delta
+                        if not freeze_pe:
+                            pe_grad[pe_pos, :active_dim] += upstream
+                    elif qkpe_direct_sign:
                         if not pe_only:
                             q_grad[tok_i, r_qkpe] += delta_qkpe
                             k_grad[tok_j, r_qkpe] += delta_qkpe
@@ -3987,6 +4135,10 @@ def main():
                         help='Scale for frozen PE random magnitudes sampled from [0, scale]')
     parser.add_argument('--qkpe-direct-sign', action='store_true',
                         help='With --new-attention, build qkpe bins from qkpe[c] > 0 instead of qkpe[a] > qkpe[b]')
+    parser.add_argument('--normalize-qk', action='store_true',
+                        help='With --new-attention, normalize Q+K to PE init statistics before summing with raw PE')
+    parser.add_argument('--qk-norm-eps', type=float, default=1e-6,
+                        help='Epsilon for --normalize-qk vector variance normalization')
     args = parser.parse_args()
     if args.PE_only and not args.new_attention:
         parser.error('--PE-only requires --new-attention')
@@ -3994,8 +4146,18 @@ def main():
         parser.error('--qkpe-direct-sign requires --new-attention')
     if args.qkpe_direct_sign and args.positional_dim > args.attn_qk_dim:
         parser.error('--qkpe-direct-sign requires --positional-dim <= --attn_qk_dim')
+    if args.normalize_qk and not args.new_attention:
+        parser.error('--normalize-qk requires --new-attention')
+    if args.normalize_qk and args.qkpe_direct_sign and args.positional_dim < 2:
+        parser.error('--normalize-qk with --qkpe-direct-sign requires --positional-dim >= 2')
+    if args.normalize_qk and not args.qkpe_direct_sign and args.attn_qk_dim < 2:
+        parser.error('--normalize-qk requires --attn_qk_dim >= 2')
     if args.PE_init_scale < 0.0:
         parser.error('--PE-init-scale must be non-negative')
+    if args.qk_norm_eps <= 0.0:
+        parser.error('--qk-norm-eps must be positive')
+    pe_stat_scale = args.PE_init_scale if args.freeze_PE else 1.0
+    args.qk_norm_target_std = np.float32(pe_stat_scale / math.sqrt(3.0))
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
     configure_lut_comparison_mode(args, parser)
@@ -4087,6 +4249,9 @@ def main():
     print(f"  freeze_PE         = {args.freeze_PE}")
     print(f"  PE_init_scale     = {args.PE_init_scale}")
     print(f"  qkpe_direct_sign  = {args.qkpe_direct_sign}")
+    print(f"  normalize_qk    = {args.normalize_qk}")
+    print(f"  qk_norm_eps     = {args.qk_norm_eps}")
+    print(f"  qk_norm_target_std = {float(args.qk_norm_target_std):.6f}")
     print("=" * 50)
 
     wandb_run = None
