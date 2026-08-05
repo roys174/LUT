@@ -2467,6 +2467,31 @@ def save_model(m, path, args):
         d['ln_ffn_beta']   = m.ln_ffn_beta
     np.savez_compressed(path, **d)
 
+
+def model_save_display_path(path):
+    """Return the actual .npz filename np.savez_compressed will create."""
+    path = str(path)
+    return path if path.endswith(".npz") else path + ".npz"
+
+
+def checkpoint_save_path(path, step):
+    """Return a step-tagged checkpoint path derived from --save-model."""
+    path = str(path)
+    if path.endswith(".npz"):
+        return path[:-4] + f"_step_{step}.npz"
+    return path + f"_step_{step}"
+
+
+def save_training_checkpoint(m, args, step):
+    """Save a training checkpoint and return the displayed filename."""
+    checkpoint_path = (
+        checkpoint_save_path(args.save_model, step)
+        if args.save_multiple_checkpoints else args.save_model
+    )
+    save_model(m, checkpoint_path, args)
+    return model_save_display_path(checkpoint_path)
+
+
 def load_model(m, path, args):
     """Load weights saved by save_model into an already-built model."""
     d = np.load(path)
@@ -3924,6 +3949,8 @@ def main():
                         help='Random seed for Python and NumPy RNGs (default: no seeding)')
     parser.add_argument('--save-model', type=str, default=None,
                         help='Path to save model weights (.npz) at each validation interval and end of training')
+    parser.add_argument('--save-multiple-checkpoints', action='store_true',
+                        help='With --save-model, keep initial and step-tagged validation checkpoints instead of overwriting the same file')
     parser.add_argument('--load-model', type=str, default=None,
                         help='Path to load model weights (.npz) before training begins')
     parser.add_argument('--lut-update-stats-file', type=str, default=None,
@@ -4042,6 +4069,7 @@ def main():
     print(f"  loss_file         = {args.loss_file}")
     print(f"  seed              = {args.seed}")
     print(f"  save_model        = {args.save_model}")
+    print(f"  save_multiple_checkpoints = {args.save_multiple_checkpoints}")
     print(f"  load_model        = {args.load_model}")
     print(f"  lut_update_stats_file = {args.lut_update_stats_file}")
     print(f"  wandb             = {args.wandb}")
@@ -4116,6 +4144,10 @@ def main():
         batch_elements = None
         pool = None
         replay_pool = None
+
+    if args.save_model is not None and args.save_multiple_checkpoints:
+        saved_model_path = save_training_checkpoint(m, args, 0)
+        print(f"Saved initial model checkpoint to {saved_model_path}")
 
     pbar = tqdm(range(args.max_steps), desc="Training", unit="step")
     last_ppl = None
@@ -4211,8 +4243,8 @@ def main():
                 f.write(f"{t}, {validation_loss:.6f}, {perplexity:.2f}, {validation_accuracy:.6f}\n")
 
             if args.save_model is not None:
-                save_model(m, args.save_model, args)
-                tqdm.write(f"Saved model to {args.save_model}.npz")
+                saved_model_path = save_training_checkpoint(m, args, current_step)
+                tqdm.write(f"Saved model to {saved_model_path}")
             if update_stats is not None:
                 saved_stats = save_lut_update_stats(update_stats, args.lut_update_stats_file)
                 tqdm.write(
@@ -4264,7 +4296,7 @@ def main():
 
     if args.save_model is not None:
         save_model(m, args.save_model, args)
-        print(f"Saved final model to {args.save_model}.npz")
+        print(f"Saved final model to {model_save_display_path(args.save_model)}")
     if update_stats is not None:
         saved_stats = save_lut_update_stats(update_stats, args.lut_update_stats_file)
         print(
