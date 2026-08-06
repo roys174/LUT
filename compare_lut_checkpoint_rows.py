@@ -24,40 +24,45 @@ PLOT_METRIC_LABELS = {
     "row-l2": "row delta L2",
     "row-rmse": "row delta RMSE",
     "row-lmin": "minimum absolute coordinate delta",
+    "row-linf": "maximum absolute coordinate delta",
     "binary": "changed row indicator",
 }
 
 
 ROW_DIFF_FIELDS = [
     "pair_label", "left_label", "right_label", "left_step", "right_step",
+    "base_index", "forward_index", "base_label", "forward_label",
     "left_path", "right_path", "lut", "group", "layer", "head", "component",
     "table", "dtype_left", "dtype_right", "shape", "n_tables", "total_rows",
     "y_dim", "changed_rows", "unchanged_rows", "changed_pct",
     "changed_elements", "total_elements", "changed_element_pct",
     "mean_abs_diff", "max_abs_diff",
-    "plot_metric", "plot_metric_mean", "plot_metric_max",
+    "plot_metric", "plot_metric_relative", "plot_metric_mean", "plot_metric_max",
     "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
 ]
 
 SUMMARY_FIELDS = [
     "pair_label", "left_label", "right_label", "left_step", "right_step",
+    "base_index", "forward_index", "base_label", "forward_label",
     "lut", "group", "layer", "head", "component", "tables_compared",
     "total_rows", "changed_rows", "unchanged_rows", "changed_pct",
     "total_elements", "changed_elements", "changed_element_pct",
     "mean_abs_diff", "max_abs_diff",
-    "plot_metric", "plot_metric_mean", "plot_metric_max",
+    "plot_metric", "plot_metric_relative", "plot_metric_mean", "plot_metric_max",
     "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
 ]
 
 TIMELINE_FIELDS = [
-    "pair_label", "right_label", "right_step", "lut", "group", "table",
-    "total_rows", "changed_rows", "changed_pct", "plot_metric",
+    "pair_label", "right_label", "right_step", "base_index", "forward_index",
+    "base_label", "forward_label", "lut", "group", "table",
+    "total_rows", "changed_rows", "changed_pct", "plot_metric", "plot_metric_relative",
     "plot_metric_mean", "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
 ]
 
 ROW_DELTA_TIMELINE_FIELDS = [
-    "pair_label", "right_label", "right_step", "lut", "group", "table",
-    "plot_metric", "plot_metric_mean", "plot_metric_nonzero_rows",
+    "pair_label", "right_label", "right_step", "base_index", "forward_index",
+    "base_label", "forward_label", "lut", "group", "table",
+    "plot_metric", "plot_metric_relative", "plot_metric_mean", "plot_metric_nonzero_rows",
     "plot_metric_nonzero_pct",
 ]
 
@@ -77,6 +82,14 @@ class Checkpoint:
     path: Path
     label: str
     step: int | None
+
+
+@dataclass(frozen=True)
+class PairSpec:
+    base_index: int
+    forward_index: int
+    base: Checkpoint
+    forward: Checkpoint
 
 
 def safe_filename(name):
@@ -260,14 +273,33 @@ def resolve_checkpoint_paths(inputs):
     return [Checkpoint(path, default_label(path), step_from_path(path)) for path in paths]
 
 
-def pairs_for_mode(checkpoints, mode):
+def pair_specs_for_mode(checkpoints, mode):
     if mode == "first-last":
-        return [(checkpoints[0], checkpoints[-1])]
+        return [PairSpec(0, len(checkpoints) - 1, checkpoints[0], checkpoints[-1])]
     if mode == "first-all":
-        return [(checkpoints[0], ckpt) for ckpt in checkpoints[1:]]
+        return [PairSpec(0, idx, checkpoints[0], ckpt)
+                for idx, ckpt in enumerate(checkpoints[1:], start=1)]
     if mode == "consecutive":
-        return list(zip(checkpoints[:-1], checkpoints[1:]))
+        return [PairSpec(idx, idx + 1, checkpoints[idx], checkpoints[idx + 1])
+                for idx in range(len(checkpoints) - 1)]
     raise ValueError(f"unknown mode {mode!r}")
+
+
+def pair_specs_for_args(checkpoints, args):
+    base_set = args.base_index is not None
+    forward_set = args.forward_index is not None
+    if base_set != forward_set:
+        raise ValueError("--base-index and --forward-index must be provided together")
+    if not base_set:
+        return pair_specs_for_mode(checkpoints, args.mode)
+    if args.base_index < 0 or args.base_index >= len(checkpoints):
+        raise ValueError(f"--base-index {args.base_index} is outside [0, {len(checkpoints) - 1}]")
+    if args.forward_index < 0 or args.forward_index >= len(checkpoints):
+        raise ValueError(f"--forward-index {args.forward_index} is outside [0, {len(checkpoints) - 1}]")
+    return [PairSpec(
+        args.base_index, args.forward_index,
+        checkpoints[args.base_index], checkpoints[args.forward_index],
+    )]
 
 
 def pair_label(left, right):
@@ -300,13 +332,19 @@ def row_diff_mask(left, right, atol, rtol):
     return np.any(changed_elements, axis=1), changed_elements
 
 
-def common_record(left_ckpt, right_ckpt, info, table_idx, shape, dtype_left, dtype_right):
+def common_record(pair_spec, info, table_idx, shape, dtype_left, dtype_right):
+    left_ckpt = pair_spec.base
+    right_ckpt = pair_spec.forward
     return {
         "pair_label": pair_label(left_ckpt, right_ckpt),
         "left_label": left_ckpt.label,
         "right_label": right_ckpt.label,
         "left_step": "" if left_ckpt.step is None else left_ckpt.step,
         "right_step": "" if right_ckpt.step is None else right_ckpt.step,
+        "base_index": pair_spec.base_index,
+        "forward_index": pair_spec.forward_index,
+        "base_label": left_ckpt.label,
+        "forward_label": right_ckpt.label,
         "left_path": str(left_ckpt.path),
         "right_path": str(right_ckpt.path),
         "lut": info.name,
@@ -324,13 +362,35 @@ def common_record(left_ckpt, right_ckpt, info, table_idx, shape, dtype_left, dty
     }
 
 
-def plot_metric_values(abs_diff, row_changed, plot_metric):
+def norm_values(abs_values, plot_metric):
     if plot_metric == "row-l2":
-        return np.linalg.norm(abs_diff, axis=1)
+        return np.linalg.norm(abs_values, axis=1)
     if plot_metric == "row-rmse":
-        if abs_diff.shape[1] == 0:
-            return np.zeros(abs_diff.shape[0], dtype=np.float64)
-        return np.linalg.norm(abs_diff, axis=1) / math.sqrt(abs_diff.shape[1])
+        if abs_values.shape[1] == 0:
+            return np.zeros(abs_values.shape[0], dtype=np.float64)
+        return np.linalg.norm(abs_values, axis=1) / math.sqrt(abs_values.shape[1])
+    if plot_metric == "row-linf":
+        if abs_values.shape[1] == 0:
+            return np.zeros(abs_values.shape[0], dtype=np.float64)
+        return np.max(abs_values, axis=1)
+    raise ValueError(f"{plot_metric!r} is not a norm-like plot metric")
+
+
+def relative_values(numerator, denominator):
+    values = np.zeros_like(numerator, dtype=np.float64)
+    nonzero_denominator = denominator != 0.0
+    np.divide(numerator, denominator, out=values, where=nonzero_denominator)
+    values[(~nonzero_denominator) & (numerator != 0.0)] = np.inf
+    return np.clip(values, 0.0, 50.0)
+
+
+def plot_metric_values(abs_diff, row_changed, plot_metric, base_abs, relative):
+    if relative:
+        numerator = norm_values(abs_diff, plot_metric)
+        denominator = norm_values(base_abs, plot_metric)
+        return relative_values(numerator, denominator)
+    if plot_metric in {"row-l2", "row-rmse", "row-linf"}:
+        return norm_values(abs_diff, plot_metric)
     if plot_metric == "row-lmin":
         if abs_diff.shape[1] == 0:
             return np.zeros(abs_diff.shape[0], dtype=np.float64)
@@ -340,12 +400,13 @@ def plot_metric_values(abs_diff, row_changed, plot_metric):
     raise ValueError(f"unknown --plot-metric {plot_metric!r}")
 
 
-def compare_table(left_table, right_table, atol, rtol, plot_metric):
+def compare_table(left_table, right_table, atol, rtol, plot_metric, relative=False):
     row_changed, element_changed = row_diff_mask(left_table, right_table, atol, rtol)
+    base_abs = np.abs(np.asarray(left_table, dtype=np.float64))
     diff = np.asarray(right_table, dtype=np.float64) - np.asarray(left_table, dtype=np.float64)
     abs_diff = np.abs(diff)
     effective_abs_diff = np.where(element_changed, abs_diff, 0.0)
-    values = plot_metric_values(effective_abs_diff, row_changed, plot_metric)
+    values = plot_metric_values(effective_abs_diff, row_changed, plot_metric, base_abs, relative)
     changed_rows = int(np.count_nonzero(row_changed))
     changed_elements = int(np.count_nonzero(element_changed))
     total_rows = int(row_changed.size)
@@ -361,6 +422,7 @@ def compare_table(left_table, right_table, atol, rtol, plot_metric):
         "mean_abs_diff": float(abs_diff.mean()) if abs_diff.size else 0.0,
         "max_abs_diff": float(abs_diff.max()) if abs_diff.size else 0.0,
         "plot_metric": plot_metric,
+        "plot_metric_relative": bool(relative),
         "plot_metric_mean": float(values.mean()) if values.size else 0.0,
         "plot_metric_max": float(values.max()) if values.size else 0.0,
         "plot_metric_nonzero_rows": metric_nonzero_rows,
@@ -369,8 +431,10 @@ def compare_table(left_table, right_table, atol, rtol, plot_metric):
 
 
 def compare_checkpoint_pair(
-    left_ckpt, right_ckpt, args, layers, heads, table_selection, explicit_luts,
+    pair_spec, args, layers, heads, table_selection, explicit_luts,
 ):
+    left_ckpt = pair_spec.base
+    right_ckpt = pair_spec.forward
     detail_rows = []
     plot_counts = {}
     warnings = []
@@ -429,11 +493,11 @@ def compare_checkpoint_pair(
                 table_idx = int(table_idx)
                 row_values, metrics = compare_table(
                     left_arr[table_idx], right_arr[table_idx],
-                    args.atol, args.rtol, args.plot_metric,
+                    args.atol, args.rtol, args.plot_metric, args.relative,
                 )
                 lut_values[table_idx] = row_values
                 row = common_record(
-                    left_ckpt, right_ckpt, info, table_idx, left_arr.shape,
+                    pair_spec, info, table_idx, left_arr.shape,
                     left_arr.dtype, right_arr.dtype,
                 )
                 row.update(metrics)
@@ -448,7 +512,8 @@ def summarize_detail_rows(detail_rows):
     for row in detail_rows:
         key = (
             row["pair_label"], row["left_label"], row["right_label"],
-            row["left_step"], row["right_step"], row["lut"], row["group"],
+            row["left_step"], row["right_step"], row["base_index"],
+            row["forward_index"], row["lut"], row["group"],
             row["layer"], row["head"], row["component"],
         )
         item = grouped.setdefault(key, {
@@ -457,6 +522,10 @@ def summarize_detail_rows(detail_rows):
             "right_label": row["right_label"],
             "left_step": row["left_step"],
             "right_step": row["right_step"],
+            "base_index": row["base_index"],
+            "forward_index": row["forward_index"],
+            "base_label": row["base_label"],
+            "forward_label": row["forward_label"],
             "lut": row["lut"],
             "group": row["group"],
             "layer": row["layer"],
@@ -471,6 +540,7 @@ def summarize_detail_rows(detail_rows):
             "_weighted_abs_sum": 0.0,
             "max_abs_diff": 0.0,
             "plot_metric": row["plot_metric"],
+            "plot_metric_relative": row["plot_metric_relative"],
             "_weighted_plot_metric_sum": 0.0,
             "plot_metric_max": 0.0,
             "plot_metric_nonzero_rows": 0,
@@ -512,6 +582,10 @@ def timeline_rows(detail_rows):
             "pair_label": row["pair_label"],
             "right_label": row["right_label"],
             "right_step": row["right_step"],
+            "base_index": row["base_index"],
+            "forward_index": row["forward_index"],
+            "base_label": row["base_label"],
+            "forward_label": row["forward_label"],
             "lut": row["lut"],
             "group": row["group"],
             "table": row["table"],
@@ -519,6 +593,7 @@ def timeline_rows(detail_rows):
             "changed_rows": row["changed_rows"],
             "changed_pct": row["changed_pct"],
             "plot_metric": row["plot_metric"],
+            "plot_metric_relative": row["plot_metric_relative"],
             "plot_metric_mean": row["plot_metric_mean"],
             "plot_metric_nonzero_rows": row["plot_metric_nonzero_rows"],
             "plot_metric_nonzero_pct": row["plot_metric_nonzero_pct"],
@@ -543,20 +618,27 @@ def selected_plot_tables(info, n_tables, selected_tables, args, rng):
     return np.array([idx for idx in sampled if int(idx) in requested], dtype=np.int32)
 
 
-def plot_metric_label(plot_metric):
-    return PLOT_METRIC_LABELS[plot_metric]
+def plot_metric_label(plot_metric, relative=False):
+    label = PLOT_METRIC_LABELS[plot_metric]
+    return f"relative {label}" if relative else label
 
 
-def plot_metric_filename(plot_metric):
-    return plot_metric.replace("-", "_")
+def plot_metric_filename(plot_metric, relative=False):
+    filename = plot_metric.replace("-", "_")
+    return f"{filename}_relative" if relative else filename
+
+
+def plot_metric_png_suffix(plot_metric, relative=False):
+    suffix = plot_metric
+    return f"{suffix}_relative" if relative else suffix
 
 
 def plot_pair_counts(plot_counts, out_dir, args, plt):
     written = []
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.sample_seed)
-    ylabel = plot_metric_label(args.plot_metric)
-    metric_name = safe_filename(args.plot_metric)
+    ylabel = plot_metric_label(args.plot_metric, args.relative)
+    metric_name = safe_filename(plot_metric_png_suffix(args.plot_metric, args.relative))
     for lut_name in sorted(plot_counts):
         info, counts, selected_tables = plot_counts[lut_name]
         plot_tables = selected_plot_tables(info, counts.shape[0], selected_tables, args, rng)
@@ -682,8 +764,9 @@ def plot_timeline(out_dir, rows, plt):
     if not rows:
         return written
     metric = rows[0]["plot_metric"]
-    metric_file = plot_metric_filename(metric)
-    ylabel = plot_metric_label(metric)
+    relative = bool(rows[0]["plot_metric_relative"])
+    metric_file = plot_metric_filename(metric, relative)
+    ylabel = plot_metric_label(metric, relative)
     written.extend(plot_series_by_group_and_lut(
         out_dir, rows, "plot_metric_nonzero_pct",
         f"{ylabel} non-zero rows (%)",
@@ -736,6 +819,12 @@ def build_arg_parser():
     parser.add_argument("--mode", choices=["first-last", "first-all", "consecutive"],
                         default="first-last",
                         help="Checkpoint pairs to compare (default: first-last)")
+    parser.add_argument("--base-index", type=int, default=None,
+                        help="Resolved checkpoint index to use as base; requires --forward-index")
+    parser.add_argument("--forward-index", type=int, default=None,
+                        help="Resolved checkpoint index to use as forward/new; requires --base-index")
+    parser.add_argument("--relative", action="store_true",
+                        help="Plot selected norm as ||forward - base|| / ||base||")
     parser.add_argument("--layers", default=None,
                         help="Layer filter, e.g. all, 0, 0-2, or 0,2")
     parser.add_argument("--heads", default=None,
@@ -752,7 +841,7 @@ def build_arg_parser():
                         help="Absolute tolerance for row comparison (default: 0)")
     parser.add_argument("--rtol", type=float, default=0.0,
                         help="Relative tolerance for row comparison (default: 0)")
-    parser.add_argument("--plot-metric", choices=["row-l2", "row-rmse", "row-lmin", "binary"],
+    parser.add_argument("--plot-metric", choices=["row-l2", "row-rmse", "row-lmin", "row-linf", "binary"],
                         default="row-l2",
                         help="Per-row metric to plot on the Y-axis (default: row-l2)")
     parser.add_argument("--line", action="store_true",
@@ -787,8 +876,10 @@ def main_with_args(argv=None):
         heads = parse_int_list(args.heads, "--heads")
         table_selection = parse_index_selection(args.tables, "--tables")
         explicit_luts = set(args.lut or [])
+        if args.relative and args.plot_metric in {"row-lmin", "binary"}:
+            raise ValueError("--relative only supports row-l2, row-rmse, and row-linf")
         checkpoints = resolve_checkpoint_paths(args.checkpoints)
-        pairs = pairs_for_mode(checkpoints, args.mode)
+        pair_specs = pair_specs_for_args(checkpoints, args)
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -810,18 +901,27 @@ def main_with_args(argv=None):
         return 1
 
     try:
-        for left_ckpt, right_ckpt in pairs:
+        if args.base_index is not None:
+            print("Resolved checkpoints:")
+            for idx, checkpoint in enumerate(checkpoints):
+                print(f"  [{idx}] {checkpoint.path}")
+            only_pair = pair_specs[0]
+            print(
+                f"Using base=[{only_pair.base_index}] {only_pair.base.path}, "
+                f"forward=[{only_pair.forward_index}] {only_pair.forward.path}"
+            )
+        for pair_spec in pair_specs:
             detail_rows, plot_counts, warnings = compare_checkpoint_pair(
-                left_ckpt, right_ckpt, args, layers, heads, table_selection, explicit_luts
+                pair_spec, args, layers, heads, table_selection, explicit_luts
             )
             for warning in warnings:
                 print(warning, file=sys.stderr)
             if not detail_rows:
-                raise ValueError(f"No LUT tables were compared for {pair_label(left_ckpt, right_ckpt)}")
+                raise ValueError(f"No LUT tables were compared for {pair_label(pair_spec.base, pair_spec.forward)}")
             all_detail_rows.extend(detail_rows)
             all_timeline_rows.extend(timeline_rows(detail_rows))
             if plt is not None:
-                pair_out_dir = out_dir / pair_label(left_ckpt, right_ckpt) if len(pairs) > 1 else out_dir
+                pair_out_dir = out_dir / pair_label(pair_spec.base, pair_spec.forward) if len(pair_specs) > 1 else out_dir
                 all_written.extend(plot_pair_counts(plot_counts, pair_out_dir, args, plt))
 
         detail_path = out_dir / "checkpoint_row_diffs.csv"
@@ -830,7 +930,7 @@ def main_with_args(argv=None):
         write_csv(summary_path, summarize_detail_rows(all_detail_rows), SUMMARY_FIELDS)
         all_written.extend([detail_path, summary_path])
 
-        if args.mode in {"first-all", "consecutive"}:
+        if len(pair_specs) > 1:
             timeline_path = out_dir / "changed_pct_timeline.csv"
             write_csv(timeline_path, all_timeline_rows, TIMELINE_FIELDS)
             all_written.append(timeline_path)

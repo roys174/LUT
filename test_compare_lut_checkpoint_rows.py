@@ -158,10 +158,12 @@ class CheckpointRowDiffTest(unittest.TestCase):
         l2_values, l2_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-l2")
         rmse_values, _ = compare.compare_table(left, right, 0.0, 0.0, "row-rmse")
         lmin_values, lmin_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-lmin")
+        linf_values, _ = compare.compare_table(left, right, 0.0, 0.0, "row-linf")
 
         np.testing.assert_allclose(l2_values, [5.0, 3.0, 0.0])
         np.testing.assert_allclose(rmse_values, [5.0 / np.sqrt(3.0), np.sqrt(3.0), 0.0])
         np.testing.assert_allclose(lmin_values, [0.0, 1.0, 0.0])
+        np.testing.assert_allclose(linf_values, [4.0, 2.0, 0.0])
         self.assertEqual(l2_metrics["plot_metric_nonzero_rows"], 2)
         self.assertAlmostEqual(l2_metrics["plot_metric_nonzero_pct"], 100.0 * 2.0 / 3.0)
         self.assertEqual(lmin_metrics["plot_metric_nonzero_rows"], 1)
@@ -207,6 +209,110 @@ class CheckpointRowDiffTest(unittest.TestCase):
             rows = read_csv(out_dir / "checkpoint_row_diffs.csv")
             self.assertEqual(rows[0]["plot_metric"], "row-lmin")
             self.assertEqual(int(rows[0]["plot_metric_nonzero_rows"]), 1)
+
+    def test_base_and_forward_indices_select_exact_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            a = np.zeros((1, 2, 1), dtype=np.float32)
+            b = a.copy()
+            c = a.copy()
+            c[0, 1, 0] = 5.0
+            write_checkpoint(tmp / "model_step_0.npz", ffn=a)
+            write_checkpoint(tmp / "model_step_5.npz", ffn=b)
+            write_checkpoint(tmp / "model.npz", ffn=c)
+            out_dir = tmp / "out"
+
+            code = compare.main_with_args([
+                str(tmp), "--out-dir", str(out_dir), "--no-plots",
+                "--base-index", "1", "--forward-index", "2",
+            ])
+
+            self.assertEqual(code, 0)
+            rows = read_csv(out_dir / "checkpoint_row_diffs.csv")
+            self.assertEqual(rows[0]["base_index"], "1")
+            self.assertEqual(rows[0]["forward_index"], "2")
+            self.assertEqual(rows[0]["base_label"], "step_5")
+            self.assertEqual(rows[0]["forward_label"], "model")
+            self.assertEqual(rows[0]["left_label"], "step_5")
+            self.assertEqual(rows[0]["right_label"], "model")
+
+    def test_relative_l2_and_linf_values_are_computed_from_base_norm(self):
+        left = np.array([
+            [3.0, 4.0],
+            [2.0, -1.0],
+        ], dtype=np.float32)
+        right = np.array([
+            [6.0, 8.0],
+            [5.0, -5.0],
+        ], dtype=np.float32)
+
+        l2_values, l2_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-l2", True)
+        linf_values, linf_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-linf", True)
+
+        np.testing.assert_allclose(l2_values, [1.0, 5.0 / np.sqrt(5.0)])
+        np.testing.assert_allclose(linf_values, [1.0, 2.0])
+        self.assertTrue(l2_metrics["plot_metric_relative"])
+        self.assertTrue(linf_metrics["plot_metric_relative"])
+
+    def test_relative_values_are_clamped_to_50(self):
+        left = np.array([[1.0, 0.0]], dtype=np.float32)
+        right = np.array([[101.0, 0.0]], dtype=np.float32)
+
+        values, metrics = compare.compare_table(left, right, 0.0, 0.0, "row-l2", True)
+
+        self.assertEqual(values[0], 50.0)
+        self.assertEqual(metrics["plot_metric_max"], 50.0)
+
+    def test_relative_zero_base_returns_zero_or_cap(self):
+        left = np.zeros((2, 2), dtype=np.float32)
+        right = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+
+        values, metrics = compare.compare_table(left, right, 0.0, 0.0, "row-l2", True)
+
+        self.assertEqual(values[0], 0.0)
+        self.assertEqual(values[1], 50.0)
+        self.assertEqual(metrics["plot_metric_max"], 50.0)
+
+    def test_relative_rejects_invalid_metrics_and_bad_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            arr = np.zeros((1, 2, 1), dtype=np.float32)
+            write_checkpoint(tmp / "model_step_0.npz", ffn=arr)
+            write_checkpoint(tmp / "model.npz", ffn=arr)
+
+            self.assertEqual(compare.main_with_args([
+                str(tmp), "--out-dir", str(tmp / "bad1"), "--no-plots",
+                "--relative", "--plot-metric", "row-lmin",
+            ]), 1)
+            self.assertEqual(compare.main_with_args([
+                str(tmp), "--out-dir", str(tmp / "bad2"), "--no-plots",
+                "--base-index", "0",
+            ]), 1)
+            self.assertEqual(compare.main_with_args([
+                str(tmp), "--out-dir", str(tmp / "bad3"), "--no-plots",
+                "--base-index", "0", "--forward-index", "9",
+            ]), 1)
+
+    def test_relative_png_filename_includes_relative_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            base = np.ones((1, 4, 2), dtype=np.float32)
+            final = base.copy()
+            final[0, 2, :] = [2.0, 3.0]
+            write_checkpoint(tmp / "model_step_0.npz", ffn=base)
+            write_checkpoint(tmp / "model.npz", ffn=final)
+            out_dir = tmp / "out"
+
+            with patch.dict("os.environ", {"MPLBACKEND": "Agg"}):
+                code = compare.main_with_args([
+                    str(tmp), "--out-dir", str(out_dir), "--relative",
+                    "--plot-metric", "row-linf",
+                ])
+
+            self.assertEqual(code, 0)
+            self.assertTrue((out_dir / "ffn_0_row-linf_relative.png").exists())
+            rows = read_csv(out_dir / "checkpoint_row_diffs.csv")
+            self.assertEqual(rows[0]["plot_metric_relative"], "True")
 
 
 if __name__ == "__main__":
