@@ -20,6 +20,14 @@ from pathlib import Path
 import numpy as np
 
 
+PLOT_METRIC_LABELS = {
+    "row-l2": "row delta L2",
+    "row-rmse": "row delta RMSE",
+    "row-lmin": "minimum absolute coordinate delta",
+    "binary": "changed row indicator",
+}
+
+
 ROW_DIFF_FIELDS = [
     "pair_label", "left_label", "right_label", "left_step", "right_step",
     "left_path", "right_path", "lut", "group", "layer", "head", "component",
@@ -27,6 +35,8 @@ ROW_DIFF_FIELDS = [
     "y_dim", "changed_rows", "unchanged_rows", "changed_pct",
     "changed_elements", "total_elements", "changed_element_pct",
     "mean_abs_diff", "max_abs_diff",
+    "plot_metric", "plot_metric_mean", "plot_metric_max",
+    "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
 ]
 
 SUMMARY_FIELDS = [
@@ -35,11 +45,20 @@ SUMMARY_FIELDS = [
     "total_rows", "changed_rows", "unchanged_rows", "changed_pct",
     "total_elements", "changed_elements", "changed_element_pct",
     "mean_abs_diff", "max_abs_diff",
+    "plot_metric", "plot_metric_mean", "plot_metric_max",
+    "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
 ]
 
 TIMELINE_FIELDS = [
     "pair_label", "right_label", "right_step", "lut", "group", "table",
-    "total_rows", "changed_rows", "changed_pct",
+    "total_rows", "changed_rows", "changed_pct", "plot_metric",
+    "plot_metric_mean", "plot_metric_nonzero_rows", "plot_metric_nonzero_pct",
+]
+
+ROW_DELTA_TIMELINE_FIELDS = [
+    "pair_label", "right_label", "right_step", "lut", "group", "table",
+    "plot_metric", "plot_metric_mean", "plot_metric_nonzero_rows",
+    "plot_metric_nonzero_pct",
 ]
 
 
@@ -305,15 +324,34 @@ def common_record(left_ckpt, right_ckpt, info, table_idx, shape, dtype_left, dty
     }
 
 
-def compare_table(left_table, right_table, atol, rtol):
+def plot_metric_values(abs_diff, row_changed, plot_metric):
+    if plot_metric == "row-l2":
+        return np.linalg.norm(abs_diff, axis=1)
+    if plot_metric == "row-rmse":
+        if abs_diff.shape[1] == 0:
+            return np.zeros(abs_diff.shape[0], dtype=np.float64)
+        return np.linalg.norm(abs_diff, axis=1) / math.sqrt(abs_diff.shape[1])
+    if plot_metric == "row-lmin":
+        if abs_diff.shape[1] == 0:
+            return np.zeros(abs_diff.shape[0], dtype=np.float64)
+        return np.min(abs_diff, axis=1)
+    if plot_metric == "binary":
+        return row_changed.astype(np.float64)
+    raise ValueError(f"unknown --plot-metric {plot_metric!r}")
+
+
+def compare_table(left_table, right_table, atol, rtol, plot_metric):
     row_changed, element_changed = row_diff_mask(left_table, right_table, atol, rtol)
-    diff = np.asarray(left_table, dtype=np.float64) - np.asarray(right_table, dtype=np.float64)
+    diff = np.asarray(right_table, dtype=np.float64) - np.asarray(left_table, dtype=np.float64)
     abs_diff = np.abs(diff)
+    effective_abs_diff = np.where(element_changed, abs_diff, 0.0)
+    values = plot_metric_values(effective_abs_diff, row_changed, plot_metric)
     changed_rows = int(np.count_nonzero(row_changed))
     changed_elements = int(np.count_nonzero(element_changed))
     total_rows = int(row_changed.size)
     total_elements = int(element_changed.size)
-    return row_changed.astype(np.uint8), {
+    metric_nonzero_rows = int(np.count_nonzero(values))
+    return values.astype(np.float64), {
         "changed_rows": changed_rows,
         "unchanged_rows": total_rows - changed_rows,
         "changed_pct": 100.0 * changed_rows / total_rows if total_rows else 0.0,
@@ -322,6 +360,11 @@ def compare_table(left_table, right_table, atol, rtol):
         "changed_element_pct": 100.0 * changed_elements / total_elements if total_elements else 0.0,
         "mean_abs_diff": float(abs_diff.mean()) if abs_diff.size else 0.0,
         "max_abs_diff": float(abs_diff.max()) if abs_diff.size else 0.0,
+        "plot_metric": plot_metric,
+        "plot_metric_mean": float(values.mean()) if values.size else 0.0,
+        "plot_metric_max": float(values.max()) if values.size else 0.0,
+        "plot_metric_nonzero_rows": metric_nonzero_rows,
+        "plot_metric_nonzero_pct": 100.0 * metric_nonzero_rows / total_rows if total_rows else 0.0,
     }
 
 
@@ -381,20 +424,21 @@ def compare_checkpoint_pair(
                 warnings.append(f"Skipping {name}: selected tables are outside [0, {left_arr.shape[0] - 1}]")
                 continue
 
-            lut_counts = np.zeros((left_arr.shape[0], left_arr.shape[1]), dtype=np.uint8)
+            lut_values = np.zeros((left_arr.shape[0], left_arr.shape[1]), dtype=np.float64)
             for table_idx in table_indices:
                 table_idx = int(table_idx)
-                row_counts, metrics = compare_table(
-                    left_arr[table_idx], right_arr[table_idx], args.atol, args.rtol
+                row_values, metrics = compare_table(
+                    left_arr[table_idx], right_arr[table_idx],
+                    args.atol, args.rtol, args.plot_metric,
                 )
-                lut_counts[table_idx] = row_counts
+                lut_values[table_idx] = row_values
                 row = common_record(
                     left_ckpt, right_ckpt, info, table_idx, left_arr.shape,
                     left_arr.dtype, right_arr.dtype,
                 )
                 row.update(metrics)
                 detail_rows.append(row)
-            plot_counts[info.name] = (info, lut_counts, table_indices)
+            plot_counts[info.name] = (info, lut_values, table_indices)
 
     return detail_rows, plot_counts, warnings
 
@@ -426,6 +470,10 @@ def summarize_detail_rows(detail_rows):
             "changed_elements": 0,
             "_weighted_abs_sum": 0.0,
             "max_abs_diff": 0.0,
+            "plot_metric": row["plot_metric"],
+            "_weighted_plot_metric_sum": 0.0,
+            "plot_metric_max": 0.0,
+            "plot_metric_nonzero_rows": 0,
         })
         item["tables_compared"] += 1
         item["total_rows"] += int(row["total_rows"])
@@ -435,6 +483,9 @@ def summarize_detail_rows(detail_rows):
         item["changed_elements"] += int(row["changed_elements"])
         item["_weighted_abs_sum"] += float(row["mean_abs_diff"]) * int(row["total_elements"])
         item["max_abs_diff"] = max(float(item["max_abs_diff"]), float(row["max_abs_diff"]))
+        item["_weighted_plot_metric_sum"] += float(row["plot_metric_mean"]) * int(row["total_rows"])
+        item["plot_metric_max"] = max(float(item["plot_metric_max"]), float(row["plot_metric_max"]))
+        item["plot_metric_nonzero_rows"] += int(row["plot_metric_nonzero_rows"])
 
     rows = []
     for item in grouped.values():
@@ -445,7 +496,12 @@ def summarize_detail_rows(detail_rows):
             100.0 * item["changed_elements"] / total_elements if total_elements else 0.0
         )
         item["mean_abs_diff"] = item["_weighted_abs_sum"] / total_elements if total_elements else 0.0
+        item["plot_metric_mean"] = item["_weighted_plot_metric_sum"] / total_rows if total_rows else 0.0
+        item["plot_metric_nonzero_pct"] = (
+            100.0 * item["plot_metric_nonzero_rows"] / total_rows if total_rows else 0.0
+        )
         del item["_weighted_abs_sum"]
+        del item["_weighted_plot_metric_sum"]
         rows.append(item)
     return sorted(rows, key=lambda row: (row["pair_label"], row["group"], row["lut"]))
 
@@ -462,6 +518,10 @@ def timeline_rows(detail_rows):
             "total_rows": row["total_rows"],
             "changed_rows": row["changed_rows"],
             "changed_pct": row["changed_pct"],
+            "plot_metric": row["plot_metric"],
+            "plot_metric_mean": row["plot_metric_mean"],
+            "plot_metric_nonzero_rows": row["plot_metric_nonzero_rows"],
+            "plot_metric_nonzero_pct": row["plot_metric_nonzero_pct"],
         }
         for row in detail_rows
     ]
@@ -469,7 +529,7 @@ def timeline_rows(detail_rows):
 
 def write_csv(path, rows, fieldnames):
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -483,10 +543,20 @@ def selected_plot_tables(info, n_tables, selected_tables, args, rng):
     return np.array([idx for idx in sampled if int(idx) in requested], dtype=np.int32)
 
 
+def plot_metric_label(plot_metric):
+    return PLOT_METRIC_LABELS[plot_metric]
+
+
+def plot_metric_filename(plot_metric):
+    return plot_metric.replace("-", "_")
+
+
 def plot_pair_counts(plot_counts, out_dir, args, plt):
     written = []
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.sample_seed)
+    ylabel = plot_metric_label(args.plot_metric)
+    metric_name = safe_filename(args.plot_metric)
     for lut_name in sorted(plot_counts):
         info, counts, selected_tables = plot_counts[lut_name]
         plot_tables = selected_plot_tables(info, counts.shape[0], selected_tables, args, rng)
@@ -498,17 +568,18 @@ def plot_pair_counts(plot_counts, out_dir, args, plt):
         if args.overlay_tables:
             fig, ax = plt.subplots(1, 1, figsize=(12, 5))
             for table_idx in plot_tables:
+                values = counts[int(table_idx)]
                 if args.line:
-                    ax.plot(rows, counts[int(table_idx)], linewidth=1.0,
-                            label=f"table {int(table_idx)}")
+                    ax.plot(rows, values, linewidth=1.0, label=f"table {int(table_idx)}")
                 else:
-                    ax.bar(rows, counts[int(table_idx)], width=1.0, alpha=0.35,
+                    ax.bar(rows, values, width=1.0, alpha=0.35,
                            label=f"table {int(table_idx)}")
-            ax.set_title(f"{lut_name}: changed rows")
+            ax.set_title(f"{lut_name}: {ylabel}")
             ax.set_xlabel("row")
-            ax.set_ylabel("changed")
+            ax.set_ylabel(ylabel)
             ax.set_xlim(1, n_rows)
-            ax.set_ylim(0, 1.05)
+            if args.plot_metric == "binary":
+                ax.set_ylim(0, 1.05)
             ax.legend(loc="best")
         else:
             fig, axes = plt.subplots(
@@ -517,28 +588,32 @@ def plot_pair_counts(plot_counts, out_dir, args, plt):
                 squeeze=False, sharex=True,
             )
             for table_idx, ax in zip(plot_tables, axes[:, 0]):
-                table_counts = counts[int(table_idx)]
+                values = counts[int(table_idx)]
                 if args.line:
-                    ax.plot(rows, table_counts, linewidth=1.0)
+                    ax.plot(rows, values, linewidth=1.0)
                 else:
-                    ax.bar(rows, table_counts, width=1.0)
-                changed = int(np.count_nonzero(table_counts))
-                pct = 100.0 * changed / n_rows if n_rows else 0.0
-                ax.set_title(f"{lut_name} table {int(table_idx)}: changed rows ({pct:.2f}%)")
+                    ax.bar(rows, values, width=1.0)
+                nonzero = int(np.count_nonzero(values))
+                pct = 100.0 * nonzero / n_rows if n_rows else 0.0
+                ax.set_title(f"{lut_name} table {int(table_idx)}: {ylabel} ({pct:.2f}% non-zero)")
                 ax.set_xlabel("row")
-                ax.set_ylabel("changed")
+                ax.set_ylabel(ylabel)
                 ax.set_xlim(1, n_rows)
-                ax.set_ylim(0, 1.05)
+                if args.plot_metric == "binary":
+                    ax.set_ylim(0, 1.05)
         fig.tight_layout()
-        output_path = out_dir / f"{safe_filename(lut_name)}.png"
+        output_path = out_dir / f"{safe_filename(lut_name)}_{metric_name}.png"
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
         written.append(output_path)
-        print(f"{lut_name}: plotted row tables {', '.join(str(int(i)) for i in plot_tables)}")
+        print(
+            f"{lut_name}: plotted {args.plot_metric} tables "
+            f"{', '.join(str(int(i)) for i in plot_tables)}"
+        )
     return written
 
 
-def plot_timeline(out_dir, rows, plt):
+def plot_series_by_group_and_lut(out_dir, rows, metric, ylabel, title, filename_prefix, plt):
     if not rows:
         return []
     written = []
@@ -554,18 +629,18 @@ def plot_timeline(out_dir, rows, plt):
     for group in groups:
         y = []
         for label in labels:
-            values = [row["changed_pct"] for row in rows
+            values = [row[metric] for row in rows
                       if row["right_label"] == label and row["group"] == group]
             y.append(float(np.mean(values)) if values else math.nan)
         ax.plot(x, y, marker="o", label=group)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
-    ax.set_ylabel("mean rows changed (%)")
-    ax.set_title("Changed row coverage over checkpoint comparisons")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(axis="y", alpha=0.25)
     ax.legend(loc="best")
     fig.tight_layout()
-    path = out_dir / "changed_pct_over_steps_by_group.png"
+    path = out_dir / f"{filename_prefix}_by_group.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     written.append(path)
@@ -575,14 +650,14 @@ def plot_timeline(out_dir, rows, plt):
     for lut_name in lut_names:
         y = []
         for label in labels:
-            values = [row["changed_pct"] for row in rows
+            values = [row[metric] for row in rows
                       if row["right_label"] == label and row["lut"] == lut_name]
             y.append(float(np.mean(values)) if values else math.nan)
         ax.plot(x, y, marker="o", linewidth=1.0, label=lut_name)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=25, ha="right")
-    ax.set_ylabel("mean rows changed (% of sampled tables)")
-    ax.set_title("Changed row coverage over checkpoint comparisons by LUT")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{title} by LUT")
     ax.grid(axis="y", alpha=0.25)
     if len(lut_names) <= 18:
         ax.legend(loc="best", fontsize=8)
@@ -590,10 +665,37 @@ def plot_timeline(out_dir, rows, plt):
         ax.text(0.99, 0.02, f"{len(lut_names)} LUTs; see CSV for labels",
                 transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
     fig.tight_layout()
-    path = out_dir / "changed_pct_over_steps_by_lut.png"
+    path = out_dir / f"{filename_prefix}_by_lut.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     written.append(path)
+    return written
+
+
+def plot_timeline(out_dir, rows, plt):
+    written = []
+    written.extend(plot_series_by_group_and_lut(
+        out_dir, rows, "changed_pct", "mean rows changed (%)",
+        "Changed row coverage over checkpoint comparisons",
+        "changed_pct_over_steps", plt,
+    ))
+    if not rows:
+        return written
+    metric = rows[0]["plot_metric"]
+    metric_file = plot_metric_filename(metric)
+    ylabel = plot_metric_label(metric)
+    written.extend(plot_series_by_group_and_lut(
+        out_dir, rows, "plot_metric_nonzero_pct",
+        f"{ylabel} non-zero rows (%)",
+        f"{ylabel} non-zero coverage over checkpoint comparisons",
+        f"{metric_file}_nonzero_pct_over_steps", plt,
+    ))
+    written.extend(plot_series_by_group_and_lut(
+        out_dir, rows, "plot_metric_mean",
+        f"mean {ylabel}",
+        f"Mean {ylabel} over checkpoint comparisons",
+        f"{metric_file}_mean_over_steps", plt,
+    ))
     return written
 
 
@@ -650,6 +752,9 @@ def build_arg_parser():
                         help="Absolute tolerance for row comparison (default: 0)")
     parser.add_argument("--rtol", type=float, default=0.0,
                         help="Relative tolerance for row comparison (default: 0)")
+    parser.add_argument("--plot-metric", choices=["row-l2", "row-rmse", "row-lmin", "binary"],
+                        default="row-l2",
+                        help="Per-row metric to plot on the Y-axis (default: row-l2)")
     parser.add_argument("--line", action="store_true",
                         help="Use line plots instead of bars")
     parser.add_argument("--overlay-tables", action="store_true",
@@ -729,6 +834,9 @@ def main_with_args(argv=None):
             timeline_path = out_dir / "changed_pct_timeline.csv"
             write_csv(timeline_path, all_timeline_rows, TIMELINE_FIELDS)
             all_written.append(timeline_path)
+            row_delta_path = out_dir / "row_delta_timeline.csv"
+            write_csv(row_delta_path, all_timeline_rows, ROW_DELTA_TIMELINE_FIELDS)
+            all_written.append(row_delta_path)
             if plt is not None:
                 all_written.extend(plot_timeline(out_dir, all_timeline_rows, plt))
 

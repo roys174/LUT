@@ -144,7 +144,69 @@ class CheckpointRowDiffTest(unittest.TestCase):
                 code = compare.main_with_args([str(tmp), "--out-dir", str(out_dir)])
 
             self.assertEqual(code, 0)
-            self.assertTrue((out_dir / "ffn_0.png").exists())
+            self.assertTrue((out_dir / "ffn_0_row-l2.png").exists())
+            self.assertFalse((out_dir / "ffn_0_binary.png").exists())
+
+    def test_plot_metric_values_are_computed_from_known_row_deltas(self):
+        left = np.zeros((3, 3), dtype=np.float32)
+        right = np.array([
+            [3.0, 4.0, 0.0],
+            [1.0, 2.0, 2.0],
+            [0.0, 0.0, 0.0],
+        ], dtype=np.float32)
+
+        l2_values, l2_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-l2")
+        rmse_values, _ = compare.compare_table(left, right, 0.0, 0.0, "row-rmse")
+        lmin_values, lmin_metrics = compare.compare_table(left, right, 0.0, 0.0, "row-lmin")
+
+        np.testing.assert_allclose(l2_values, [5.0, 3.0, 0.0])
+        np.testing.assert_allclose(rmse_values, [5.0 / np.sqrt(3.0), np.sqrt(3.0), 0.0])
+        np.testing.assert_allclose(lmin_values, [0.0, 1.0, 0.0])
+        self.assertEqual(l2_metrics["plot_metric_nonzero_rows"], 2)
+        self.assertAlmostEqual(l2_metrics["plot_metric_nonzero_pct"], 100.0 * 2.0 / 3.0)
+        self.assertEqual(lmin_metrics["plot_metric_nonzero_rows"], 1)
+        self.assertAlmostEqual(lmin_metrics["plot_metric_nonzero_pct"], 100.0 / 3.0)
+
+    def test_plot_metric_uses_tolerance_adjusted_deltas_for_nonzero_percentage(self):
+        left = np.zeros((2, 2), dtype=np.float32)
+        right = np.array([[0.001, 0.5], [0.001, 0.002]], dtype=np.float32)
+
+        values, metrics = compare.compare_table(left, right, 0.01, 0.0, "row-lmin")
+
+        np.testing.assert_allclose(values, [0.0, 0.0])
+        self.assertEqual(metrics["changed_rows"], 1)
+        self.assertEqual(metrics["plot_metric_nonzero_rows"], 0)
+
+    def test_binary_plot_metric_preserves_old_indicator_values(self):
+        left = np.zeros((2, 2), dtype=np.float32)
+        right = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+        values, metrics = compare.compare_table(left, right, 0.0, 0.0, "binary")
+
+        np.testing.assert_allclose(values, [0.0, 1.0])
+        self.assertEqual(metrics["plot_metric_nonzero_rows"], 1)
+
+    def test_selected_plot_metric_controls_png_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            base = np.zeros((1, 4, 2), dtype=np.float32)
+            final = base.copy()
+            final[0, 2, :] = [1.0, 2.0]
+            write_checkpoint(tmp / "model_step_0.npz", ffn=base)
+            write_checkpoint(tmp / "model.npz", ffn=final)
+            out_dir = tmp / "out"
+
+            with patch.dict("os.environ", {"MPLBACKEND": "Agg"}):
+                code = compare.main_with_args([
+                    str(tmp), "--out-dir", str(out_dir), "--plot-metric", "row-lmin",
+                ])
+
+            self.assertEqual(code, 0)
+            self.assertTrue((out_dir / "ffn_0_row-lmin.png").exists())
+            self.assertFalse((out_dir / "ffn_0_binary.png").exists())
+            rows = read_csv(out_dir / "checkpoint_row_diffs.csv")
+            self.assertEqual(rows[0]["plot_metric"], "row-lmin")
+            self.assertEqual(int(rows[0]["plot_metric_nonzero_rows"]), 1)
 
 
 if __name__ == "__main__":
