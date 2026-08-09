@@ -9,9 +9,9 @@ from main import (
     apply_averaged_gradients, attention_backward, attention_forward,
     model_backward, model_forward,
     new_attention_backward, new_attention_forward,
-    initialize_positional_encoding,
+    initialize_positional_encoding, print_model_stats,
     build_no_overlap_comparison_arrays, build_overlap_comparison_arrays,
-    configure_lut_comparison_mode,
+    configure_lut_comparison_mode, configure_weight_sharing,
     fill_vector_with_random_integers,
     fill_vector_with_random_integers_different_from_vector2,
 )
@@ -419,6 +419,184 @@ class TestCacheIndex:
         np.testing.assert_array_equal(cache_new.j, cache_old.j)
         np.testing.assert_array_equal(cache_new.r_min, cache_old.r_min)
         np.testing.assert_array_equal(cache_new.u_min, cache_old.u_min)
+
+
+class TestFinalWeightSharing:
+    def make_args(self, batch_size=1):
+        args = SimpleNamespace(
+            vocab_size_input=8,
+            vocab_size_output=5,
+            context_size=4,
+            embedding_dim=4,
+            positional_dim=2,
+            num_layers=1,
+            num_heads=1,
+            n_t=8,
+            n_c=2,
+            weight_sharing=2,
+            attn_qk_dim=2,
+            attn_qk_n_c=2,
+            attn_qk_n_t=2,
+            factored_output=False,
+            fp16=False,
+            batch_size=batch_size,
+            cpu_cores=1,
+            num_workers=1,
+            numba_threads=1,
+            replay_workers=1,
+            soft_attention=False,
+            layernorm=False,
+            dropout=0.0,
+            POS_task=False,
+            new_attention=True,
+            PE_only=True,
+            freeze_PE=False,
+            qkpe_direct_sign=False,
+            normalize_qk=False,
+            qk_norm_eps=np.float32(1e-6),
+            PE_init_scale=1.0,
+            lut_comparison_mode='random',
+        )
+        args.pe_bitmasks = (1 << np.arange(args.positional_dim)).astype(np.int32)
+        args.shift_qk = args.n_c + args.positional_dim
+        args.qk_norm_target_std = np.float32(1.0 / np.sqrt(3.0))
+        configure_weight_sharing(args, ParserStub())
+        return args
+
+    def test_build_uses_physical_final_trees_and_logical_caches(self):
+        args = self.make_args()
+        np.random.seed(1234)
+        model = Model(args)
+        build_Model(model, args)
+        head = model.head[0][0]
+
+        assert head.Final.S.shape[0] == 2
+        assert head.Final.a_arr.shape[0] == args.n_t
+        assert head.Final.b_arr.shape[0] == args.n_t
+        assert head._final_v_j.shape == (args.context_size, args.n_t)
+        assert head._qkpe_j.shape[1] == args.n_t
+        np.testing.assert_array_equal(
+            head.Final.trees,
+            np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32))
+
+    def test_model_stats_counts_physical_final_parameters(self, capsys):
+        args = self.make_args()
+        np.random.seed(1235)
+        model = Model(args)
+        build_Model(model, args)
+
+        print_model_stats(model, args)
+        out = capsys.readouterr().out
+        total = model.Token_embedder.size + model.FFN[0].S.size
+        head = model.head[0][0]
+        total += head.Q.S.size + head.K.S.size + head.V.S.size + head.Final.S.size
+        total += head.Positional_encoding.size + model.output_head.unembedder.S.size
+        assert f"Model: {total:,} parameters" in out
+        assert head.Final.S.size < args.n_t * head.Final.S.shape[1] * head.Final.S.shape[2]
+
+    def test_forward_sums_logical_slots_through_shared_physical_trees(self):
+        args = self.make_args()
+        np.random.seed(1236)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        expected = np.zeros_like(y)
+        for tok_i in range(1, args.context_size):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                for t in range(args.n_t):
+                    tree = head.Final.trees[t]
+                    j_bin = ((int(head._final_v_j[tok_j, t]) << args.positional_dim)
+                             | int(head._qkpe_j[pair, t]))
+                    expected[tok_i] += _f32(head.Final.S[tree, j_bin])
+        np.testing.assert_allclose(y, expected, atol=1e-6)
+
+    def test_backward_updates_shared_physical_final_rows(self):
+        args = self.make_args()
+        np.random.seed(1237)
+        model = Model(args)
+        build_Model(model, args)
+        head = randomize_pe_only_attention_values(model)
+        x = np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+        y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        new_attention_forward(head, x, y, args)
+
+        y_grad = np.zeros_like(y)
+        y_grad[1, :] = np.arange(1, args.embedding_dim + 1, dtype=np.float32)
+        before = head.Final.S.copy()
+        expected = before.copy()
+        for t in range(args.n_t):
+            tree = head.Final.trees[t]
+            j_bin = ((int(head._final_v_j[0, t]) << args.positional_dim)
+                     | int(head._qkpe_j[0, t]))
+            expected[tree, j_bin] -= 0.05 * y_grad[1]
+
+        main_module.learning_rate = 0.05
+        x_grad = np.zeros_like(x)
+        new_attention_backward(head, x_grad, y_grad, args)
+        np.testing.assert_allclose(head.Final.S, expected, atol=1e-6)
+
+    def test_sparse_replay_matches_direct_shared_final_updates(self):
+        args = self.make_args(batch_size=2)
+        np.random.seed(1238)
+        replay_model = Model(args)
+        build_Model(replay_model, args)
+        randomize_pe_only_attention_values(replay_model)
+        replay_head = replay_model.head[0][0]
+
+        batch_elements = [BatchElement(replay_model, args) for _ in range(args.batch_size)]
+        inputs = [np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+                  for _ in range(args.batch_size)]
+        grads = [np.random.randn(args.context_size, args.embedding_dim).astype(np.float32)
+                 for _ in range(args.batch_size)]
+
+        for be, x, y_grad in zip(batch_elements, inputs, grads):
+            y = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+            new_attention_forward(be.head[0][0], x, y, args)
+            x_grad = np.zeros_like(x)
+            new_attention_backward(
+                be.head[0][0], x_grad, y_grad, args, skip_s_update=True,
+                q_grad_out=be.grad_accum.new_attn_q_grads[0][0],
+                k_grad_out=be.grad_accum.new_attn_k_grads[0][0],
+                v_grad_out=be.grad_accum.new_attn_v_grads[0][0],
+                pe_grad_out=be.grad_accum.pe_grads[0][0])
+            be.grad_accum.attn_y_grads[0] = y_grad.copy()
+
+        scale = np.float32(0.05 / args.batch_size)
+        expected = replay_head.Final.S.copy()
+        for be in batch_elements:
+            head = be.head[0][0]
+            y_grad = be.grad_accum.attn_y_grads[0]
+            for t in range(args.n_t):
+                tree = replay_head.Final.trees[t]
+                for tok_i in range(1, args.context_size):
+                    y_g = y_grad[tok_i, :replay_head.Final.y_dim]
+                    for tok_j in range(tok_i):
+                        pair = tok_i * (tok_i - 1) // 2 + tok_j
+                        j_bin = ((int(head._final_v_j[tok_j, t]) << args.positional_dim)
+                                 | int(head._qkpe_j[pair, t]))
+                        expected[tree, j_bin] -= scale * y_g
+
+        main_module._replay_new_attn_task(
+            replay_head,
+            [be.head[0][0]._q_j for be in batch_elements],
+            [be.head[0][0]._k_j for be in batch_elements],
+            [be.head[0][0]._val_j for be in batch_elements],
+            [be.head[0][0]._final_v_j for be in batch_elements],
+            [be.head[0][0]._qkpe_j for be in batch_elements],
+            [be.grad_accum.attn_y_grads[0] for be in batch_elements],
+            [be.grad_accum.new_attn_q_grads[0][0] for be in batch_elements],
+            [be.grad_accum.new_attn_k_grads[0][0] for be in batch_elements],
+            [be.grad_accum.new_attn_v_grads[0][0] for be in batch_elements],
+            [be.grad_accum.pe_grads[0][0] for be in batch_elements],
+            args.context_size, args.n_t, args.attn_qk_n_t,
+            scale, main_module.HAS_NUMBA, pe_only=True, freeze_pe=False)
+        np.testing.assert_allclose(replay_head.Final.S, expected, atol=1e-6)
 
 
 class TestCachePEIndex:

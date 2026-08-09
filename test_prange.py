@@ -206,7 +206,7 @@ class TestPrangeBackwardKernel:
         _attention_backward_kernel(
             S_par, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
             y_grad, x_grad_par, pos_grad_par, a_arr, b_arr,
-            shift_qk, pd, context_size, n_t, ed, lr)
+            shift_qk, pd, context_size, n_t, ed, lr, False)
 
         np.testing.assert_allclose(x_grad_par, x_grad_seq, atol=1e-5,
             err_msg=f"x_grad mismatch at context_size={context_size}")
@@ -243,7 +243,7 @@ class TestPrangeBackwardKernel:
             _attention_backward_kernel(
                 S, all_jV, all_rV, all_uV, all_jPE, all_rPE, all_uPE,
                 y_grad, x_grad, pos_grad, a_arr, b_arr,
-                shift_qk, pd, cs, n_t, ed, lr)
+                shift_qk, pd, cs, n_t, ed, lr, False)
             results.append((x_grad.copy(), pos_grad.copy(), S.copy()))
 
         for i in range(1, len(results)):

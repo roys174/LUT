@@ -249,6 +249,24 @@ def configure_lut_comparison_mode(args, parser):
             parser.error(f"--lut-comparison-mode overlap: {exc}")
 
 
+def configure_weight_sharing(args, parser):
+    weight_sharing = getattr(args, 'weight_sharing', None)
+    if weight_sharing is None:
+        args.final_n_t = args.n_t
+        args.final_share_m = 1
+        return
+    if not getattr(args, 'new_attention', False):
+        parser.error('--weight-sharing requires --new-attention')
+    if weight_sharing < 1:
+        parser.error('--weight-sharing must be at least 1')
+    if weight_sharing > args.n_t:
+        parser.error('--weight-sharing must be no greater than --n-t')
+    if args.n_t % weight_sharing != 0:
+        parser.error('--n-t must be divisible by --weight-sharing')
+    args.final_n_t = weight_sharing
+    args.final_share_m = args.n_t // weight_sharing
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -351,10 +369,11 @@ class LUTUpdateStats:
 
     def record_new_attention_final_coords(self, name, lut, y_grad, args):
         trees = np.asarray(lut.trees, dtype=np.int32)
+        n_logical = trees.shape[0]
         for tok_i in range(1, args.context_size):
             update_vec = y_grad[tok_i, :lut.y_dim]
-            repeated = np.broadcast_to(update_vec, (tok_i, lut.S.shape[0], lut.y_dim))
-            tree_rows = np.broadcast_to(trees, (tok_i, lut.S.shape[0]))
+            repeated = np.broadcast_to(update_vec, (tok_i, n_logical, lut.y_dim))
+            tree_rows = np.broadcast_to(trees, (tok_i, n_logical))
             self.record_coord_updates(name, lut, tree_rows, repeated)
 
     def record_j_values(self, name, n_tables, n_bins, tables, j_values):
@@ -1322,7 +1341,8 @@ class BatchElement:
 # LUT operations
 # ---------------------------------------------------------------------------
 
-def build_LUT_custom(lut, total_n_c, y_dim, args, n_t=None, n_c=None, input_dim=None):
+def build_LUT_custom(lut, total_n_c, y_dim, args, n_t=None, n_c=None,
+                     input_dim=None, s_n_t=None, trees=None):
     requested_n_t = args.n_t if n_t is None else n_t
     N_C = args.n_c if n_c is None else n_c
     INPUT_DIM = args.embedding_dim if input_dim is None else input_dim
@@ -1332,10 +1352,21 @@ def build_LUT_custom(lut, total_n_c, y_dim, args, n_t=None, n_c=None, input_dim=
     a_arr, b_arr = build_comparison_arrays(mode, requested_n_t, N_C, INPUT_DIM)
 
     N_T = a_arr.shape[0]
+    S_N_T = N_T if s_n_t is None else s_n_t
     lut.y_dim = y_dim
-    lut.trees = np.arange(N_T, dtype=np.int32)
+    if trees is None:
+        lut.trees = np.arange(N_T, dtype=np.int32)
+    else:
+        trees = np.asarray(trees, dtype=np.int32)
+        if trees.shape != (N_T,):
+            raise ValueError(
+                f"trees mapping has shape {trees.shape}; expected ({N_T},)")
+        if trees.size and (trees.min() < 0 or trees.max() >= S_N_T):
+            raise ValueError(
+                f"trees mapping must reference physical trees in [0, {S_N_T})")
+        lut.trees = trees
     num_bins = 1 << total_n_c
-    lut.S = np.zeros((N_T, num_bins, y_dim), dtype=s_dtype)
+    lut.S = np.zeros((S_N_T, num_bins, y_dim), dtype=s_dtype)
     lut.a_arr = a_arr
     lut.b_arr = b_arr
     lut.bitmasks = (1 << np.arange(N_C)).astype(np.int32)
@@ -1357,7 +1388,8 @@ def cache_index_batch(lut, x_batch, j_out, r_min_out, u_min_out):
         abs_u = np.abs(u)
         r_min_out[:] = abs_u.argmin(axis=2)
         cs_idx = np.arange(x_batch.shape[0])[:, np.newaxis]
-        u_min_out[:] = u[cs_idx, lut.trees, r_min_out]
+        tree_idx = np.arange(lut.a_arr.shape[0])
+        u_min_out[:] = u[cs_idx, tree_idx, r_min_out]
 
 
 def cache_PE_index_batch(u_batch, j_out, r_min_out, u_min_out, args):
@@ -1843,28 +1875,36 @@ def _new_attention_final_backward_kernel(
         v_grad[pos, d] += total
 
     # Phase 3: update Final.S after all gradients read the original rows.
+    # Parallelize over physical tree and output dim so logical slots sharing a
+    # tree cannot race on the same S row.
     if not skip_s_update:
-        for t in prange(N_T):
-            tree = final_trees[t]
-            for tok_i in range(1, CS):
-                for tok_j in range(tok_i):
-                    pair = tok_i * (tok_i - 1) // 2 + tok_j
-                    j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
-                    for d in range(y_dim):
-                        FS[tree, j_bin, d] -= lr * y_grad[tok_i, d]
+        final_n_t = FS.shape[0]
+        for work in prange(final_n_t * y_dim):
+            tree = work // y_dim
+            d = work - tree * y_dim
+            for t in range(N_T):
+                if final_trees[t] == tree:
+                    for tok_i in range(1, CS):
+                        for tok_j in range(tok_i):
+                            pair = tok_i * (tok_i - 1) // 2 + tok_j
+                            j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+                            FS[tree, j_bin, d] -= lr * y_grad[tok_i, d]
 
 @njit(parallel=True, cache=True)
 def _new_attention_final_s_replay_kernel(FS, final_trees, final_v_j, qkpe_j,
                                          y_grad, pd, CS, N_T, y_dim, scale):
     """Replay Final.S updates for new attention from cached row halves."""
-    for t in prange(N_T):
-        tree = final_trees[t]
-        for tok_i in range(1, CS):
-            for tok_j in range(tok_i):
-                pair = tok_i * (tok_i - 1) // 2 + tok_j
-                j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
-                for d in range(y_dim):
-                    FS[tree, j_bin, d] -= scale * y_grad[tok_i, d]
+    final_n_t = FS.shape[0]
+    for work in prange(final_n_t * y_dim):
+        tree = work // y_dim
+        d = work - tree * y_dim
+        for t in range(N_T):
+            if final_trees[t] == tree:
+                for tok_i in range(1, CS):
+                    for tok_j in range(tok_i):
+                        pair = tok_i * (tok_i - 1) // 2 + tok_j
+                        j_bin = (final_v_j[tok_j, t] << pd) | qkpe_j[pair, t]
+                        FS[tree, j_bin, d] -= scale * y_grad[tok_i, d]
 
 
 @njit(parallel=True)
@@ -2509,8 +2549,12 @@ def build_Model(m, args):
                                  input_dim=EMBEDDING_DIM)
                 build_LUT_custom(head.V, N_C, EMBEDDING_DIM, args,
                                  n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM)
+                final_n_t = getattr(args, 'final_n_t', N_T)
+                final_share_m = getattr(args, 'final_share_m', 1)
+                final_trees = np.repeat(np.arange(final_n_t, dtype=np.int32), final_share_m)
                 build_LUT_custom(head.Final, N_C + POSITIONAL_DIM, EMBEDDING_DIM, args,
-                                 n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM)
+                                 n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM,
+                                 s_n_t=final_n_t, trees=final_trees)
                 qkpe_a, qkpe_b = build_comparison_arrays(
                     getattr(args, 'lut_comparison_mode', 'random'), N_T,
                     POSITIONAL_DIM, args.attn_qk_dim)
@@ -2540,10 +2584,19 @@ def _lut_save(d, prefix, lut):
     d[f'{prefix}_a']   = lut.a_arr
     d[f'{prefix}_b']   = lut.b_arr
 
+def _load_array_checked(d, key, target):
+    saved = d[key]
+    if saved.shape != target.shape:
+        raise ValueError(
+            f"Checkpoint array {key} has shape {saved.shape}; expected {target.shape}. "
+            "Check that --n-t, --n-c, dimensions, and --weight-sharing match the checkpoint.")
+    target[:] = saved
+
+
 def _lut_load(d, prefix, lut):
-    lut.S[:]      = d[f'{prefix}_S']
-    lut.a_arr[:]  = d[f'{prefix}_a']
-    lut.b_arr[:]  = d[f'{prefix}_b']
+    _load_array_checked(d, f'{prefix}_S', lut.S)
+    _load_array_checked(d, f'{prefix}_a', lut.a_arr)
+    _load_array_checked(d, f'{prefix}_b', lut.b_arr)
 
 def save_model(m, path, args):
     """Save all learned weights to a .npz file."""
@@ -4062,6 +4115,8 @@ def main():
     parser.add_argument('--num-heads', type=int, default=4)
     parser.add_argument('--n-t', type=int, default=16)
     parser.add_argument('--n-c', type=int, default=6)
+    parser.add_argument('--weight-sharing', type=int, default=None,
+                        help='With --new-attention, use N physical Final LUT trees shared by logical --n-t comparator slots')
     parser.add_argument('--lut-comparison-mode', choices=['random', 'no-overlap', 'overlap'],
                         default='random',
                         help='How LUT a/b comparison indices are assigned (default: random)')
@@ -4161,6 +4216,7 @@ def main():
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
     configure_lut_comparison_mode(args, parser)
+    configure_weight_sharing(args, parser)
 
     # Seed RNGs before anything else
     if args.seed is not None:
@@ -4206,6 +4262,9 @@ def main():
     print(f"  num_heads         = {args.num_heads}")
     print(f"  n_t               = {args.n_t}")
     print(f"  n_c               = {args.n_c}")
+    print(f"  weight_sharing    = {args.weight_sharing}")
+    print(f"  final_n_t         = {args.final_n_t}")
+    print(f"  final_share_m     = {args.final_share_m}")
     print(f"  lut_comparison_mode = {args.lut_comparison_mode}")
     print(f"  attn_qk_dim       = {args.attn_qk_dim}")
     print(f"  attn_qk_n_c       = {args.attn_qk_n_c}")

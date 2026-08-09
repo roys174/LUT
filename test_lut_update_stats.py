@@ -11,6 +11,7 @@ from main import LUT, LUTUpdateStats, record_attention_update_rows
 def make_lut(n_tables, n_rows):
     lut = LUT(n_tables)
     lut.S = np.zeros((n_tables, n_rows, 1), dtype=np.float32)
+    lut.y_dim = 1
     return lut
 
 
@@ -84,6 +85,30 @@ class LUTUpdateStatsTest(unittest.TestCase):
         expected_joint[1, 1, 3] = 1
         np.testing.assert_array_equal(joint, expected_joint)
 
+    def test_record_new_attention_final_shared_trees_aggregate_physical_rows(self):
+        args = SimpleNamespace(context_size=3, n_t=4, n_c=1, positional_dim=1)
+        stats = LUTUpdateStats()
+        lut = make_lut(2, 1 << (args.n_c + args.positional_dim))
+        lut.trees = np.array([0, 0, 1, 1], dtype=np.int32)
+        final_v_j = np.array([[0, 1, 0, 1], [1, 0, 1, 0], [0, 0, 0, 0]], dtype=np.int32)
+        qkpe_j = np.array([[0, 0, 1, 1], [1, 0, 0, 1], [0, 1, 0, 1]], dtype=np.int32)
+        y_grad = np.array([[0.0], [2.0], [3.0]], dtype=np.float32)
+
+        stats.record_new_attention_final("shared_Final", lut, final_v_j, qkpe_j, args)
+        stats.record_new_attention_final_coords("shared_Final", lut, y_grad, args)
+
+        expected_rows = np.zeros_like(stats.counts["shared_Final"])
+        for tok_i in range(1, args.context_size):
+            for tok_j in range(tok_i):
+                pair = tok_i * (tok_i - 1) // 2 + tok_j
+                for t, tree in enumerate(lut.trees):
+                    row = (final_v_j[tok_j, t] << args.positional_dim) | qkpe_j[pair, t]
+                    expected_rows[tree, row] += 1
+        np.testing.assert_array_equal(stats.counts["shared_Final"], expected_rows)
+        np.testing.assert_array_equal(
+            stats.coord_counts["shared_Final"],
+            np.array([[6], [6]], dtype=np.uint64))
+
     def test_save_writes_j_stats_sidecar_without_changing_row_npz_keys(self):
         stats = LUTUpdateStats()
         lut = make_lut(1, 4)
@@ -91,10 +116,13 @@ class LUTUpdateStatsTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             raw_path = Path(tmp) / "lut_update_stats.npz"
-            summary_path, hist_path, j_path, j_summary_path, j_top_path = stats.save(str(raw_path))
+            (summary_path, hist_path, coord_path, coord_summary_path,
+             j_path, j_summary_path, j_top_path) = stats.save(str(raw_path))
             self.assertTrue(raw_path.exists())
             self.assertTrue(Path(summary_path).exists())
             self.assertTrue(Path(hist_path).exists())
+            self.assertTrue(Path(coord_path).exists())
+            self.assertTrue(Path(coord_summary_path).exists())
             self.assertTrue(Path(j_path).exists())
             self.assertTrue(Path(j_summary_path).exists())
             self.assertTrue(Path(j_top_path).exists())
