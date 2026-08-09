@@ -69,6 +69,8 @@ def configure_cpu_parallelism(args, parser):
         parser.error('--numba-threads must be non-negative')
     if args.replay_workers < 0:
         parser.error('--replay-workers must be non-negative')
+    if args.head_workers < 0:
+        parser.error('--head-workers must be non-negative')
 
     cpu_cores = args.cpu_cores
 
@@ -79,13 +81,26 @@ def configure_cpu_parallelism(args, parser):
     else:
         batch_workers = min(args.batch_size, args.num_workers)
 
-    replay_units = args.num_layers * (1 + args.num_heads) + (2 if args.factored_output else 1)
+    mha_o_units = 1 if getattr(args, 'new_MHA', False) else 0
+    replay_units = args.num_layers * (1 + args.num_heads + mha_o_units) + (2 if args.factored_output else 1)
     if args.batch_size == 1:
         replay_workers = 1
     elif args.replay_workers == 0:
         replay_workers = min(replay_units, cpu_cores)
     else:
         replay_workers = min(replay_units, args.replay_workers)
+
+    if getattr(args, 'new_MHA', False) and args.batch_size == 1:
+        if args.head_workers == 0:
+            head_workers = min(args.num_heads, cpu_cores)
+        else:
+            head_workers = min(args.num_heads, args.head_workers)
+    else:
+        if args.head_workers > 1 and not getattr(args, 'new_MHA', False):
+            parser.error('--head-workers > 1 requires --new-MHA')
+        if args.head_workers > 1 and args.batch_size > 1:
+            parser.error('--head-workers > 1 currently requires --batch-size 1')
+        head_workers = 1
 
     if HAS_NUMBA:
         if args.numba_threads == 0:
@@ -104,6 +119,7 @@ def configure_cpu_parallelism(args, parser):
 
     args.num_workers = batch_workers
     args.replay_workers = replay_workers
+    args.head_workers = head_workers
     args.numba_threads = actual_numba_threads
     args.requested_numba_threads = requested_numba_threads
 
@@ -247,6 +263,18 @@ def configure_lut_comparison_mode(args, parser):
                 args.attn_qk_n_t, args.attn_qk_n_c, args.embedding_dim)
         except ValueError as exc:
             parser.error(f"--lut-comparison-mode overlap: {exc}")
+
+
+def configure_new_mha(args, parser):
+    if getattr(args, 'new_MHA', False):
+        args.new_attention = True
+        if getattr(args, 'soft_attention', False):
+            parser.error('--new-MHA is incompatible with --soft-attention')
+        if args.embedding_dim % args.num_heads != 0:
+            parser.error('--new-MHA requires --embedding-dim to be divisible by --num-heads')
+        args.mha_head_dim = args.embedding_dim // args.num_heads
+    else:
+        args.mha_head_dim = args.embedding_dim
 
 
 def configure_weight_sharing(args, parser):
@@ -730,6 +758,7 @@ class NewAttentionHead:
         POSITIONAL_DIM = args.positional_dim
         ED = args.embedding_dim
         QD = args.attn_qk_dim
+        value_dim = ED
         soft = getattr(args, 'soft_attention', False)
         self.Positional_encoding = np.zeros((CS, QD), dtype=np.float32)
         n_pairs = CS * (CS - 1) // 2
@@ -738,11 +767,11 @@ class NewAttentionHead:
         self._v_u_min = np.zeros((n_pairs, N_T), dtype=np.float32)
         self._q_embed = np.zeros((CS, QD), dtype=np.float32)
         self._k_embed = np.zeros((CS, QD), dtype=np.float32)
-        self._v_embed = np.zeros((CS, ED), dtype=np.float32)
+        self._v_embed = np.zeros((CS, value_dim), dtype=np.float32)
         self._qk_embed = np.zeros((n_pairs, QD), dtype=np.float32)
         self._q_grad = np.zeros((CS, QD), dtype=np.float32)
         self._k_grad = np.zeros((CS, QD), dtype=np.float32)
-        self._v_grad = np.zeros((CS, ED), dtype=np.float32)
+        self._v_grad = np.zeros((CS, value_dim), dtype=np.float32)
         self._pe_grad = np.zeros((CS, QD), dtype=np.float32)
         self._q_j = np.zeros((CS, Q_N_T), dtype=np.int32)
         self._q_r_min = np.zeros((CS, Q_N_T), dtype=np.int32)
@@ -1109,6 +1138,8 @@ class FactoredOutputHead:
 class Model:
     __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
                  '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
+                 'MHA_O', '_mha_concat', '_mha_o_j', '_mha_o_r_min',
+                 '_mha_o_u_min', '_mha_o_grad',
                  'ln_attn_gamma', 'ln_attn_beta', 'ln_ffn_gamma', 'ln_ffn_beta',
                  '_ln_attn_xhat', '_ln_attn_rstd', '_ln_ffn_xhat', '_ln_ffn_rstd',
                  '_ln_ffn_buf', '_drop_attn_mask', '_drop_ffn_mask']
@@ -1120,6 +1151,7 @@ class Model:
         N_T = args.n_t
         CS = args.context_size
         new_attention = args.new_attention
+        new_mha = getattr(args, 'new_MHA', False)
 
         self.Token_embedder = np.zeros((VOCAB_SIZE, EMBEDDING_DIM), dtype=np.float32)
         self.tokens = np.zeros(CS + 1, dtype=np.int32)
@@ -1135,6 +1167,22 @@ class Model:
             self.head = [[NewAttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
         else:
             self.head = [[AttentionHead(args) for _ in range(NUM_HEADS)] for _ in range(NUM_LAYERS)]
+
+        if new_mha:
+            concat_dim = NUM_HEADS * args.mha_head_dim
+            self.MHA_O = [LUT(N_T) for _ in range(NUM_LAYERS)]
+            self._mha_concat = [np.zeros((CS, concat_dim), dtype=np.float32) for _ in range(NUM_LAYERS)]
+            self._mha_o_j = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
+            self._mha_o_r_min = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
+            self._mha_o_u_min = [np.zeros((CS, N_T), dtype=np.float32) for _ in range(NUM_LAYERS)]
+            self._mha_o_grad = [np.zeros((CS, concat_dim), dtype=np.float32) for _ in range(NUM_LAYERS)]
+        else:
+            self.MHA_O = None
+            self._mha_concat = None
+            self._mha_o_j = None
+            self._mha_o_r_min = None
+            self._mha_o_u_min = None
+            self._mha_o_grad = None
 
         if args.factored_output:
             self.output_head = FactoredOutputHead(args)
@@ -1182,6 +1230,7 @@ class SparseGradAccumulator:
     __slots__ = ['ffn_y_grads', 'attn_y_grads', 'pe_grads',
                  'attn_score_grads', 'attn_val_grads',
                  'new_attn_q_grads', 'new_attn_k_grads', 'new_attn_v_grads',
+                 'new_attn_final_y_grads',
                  'ln_attn_dgamma', 'ln_attn_dbeta', 'ln_ffn_dgamma', 'ln_ffn_dbeta']
 
     def __init__(self, args):
@@ -1192,6 +1241,8 @@ class SparseGradAccumulator:
         PD = args.positional_dim
         ED = args.embedding_dim
         QD = getattr(args, 'attn_qk_dim', ED)
+        new_mha = getattr(args, 'new_MHA', False)
+        value_dim = ED
         self.ffn_y_grads = [None] * NL      # filled during backward
         self.attn_y_grads = [None] * NL     # filled during backward
         if getattr(args, 'new_attention', False):
@@ -1201,8 +1252,10 @@ class SparseGradAccumulator:
                                       for _ in range(NH)] for _ in range(NL)]
             self.new_attn_k_grads = [[np.zeros((CS, QD), dtype=np.float32)
                                       for _ in range(NH)] for _ in range(NL)]
-            self.new_attn_v_grads = [[np.zeros((CS, ED), dtype=np.float32)
+            self.new_attn_v_grads = [[np.zeros((CS, value_dim), dtype=np.float32)
                                       for _ in range(NH)] for _ in range(NL)]
+            self.new_attn_final_y_grads = ([[None for _ in range(NH)] for _ in range(NL)]
+                                           if new_mha else None)
             self.attn_score_grads = None
             self.attn_val_grads = None
         else:
@@ -1211,6 +1264,7 @@ class SparseGradAccumulator:
             self.new_attn_q_grads = None
             self.new_attn_k_grads = None
             self.new_attn_v_grads = None
+            self.new_attn_final_y_grads = None
             if getattr(args, 'soft_attention', False):
                 self.attn_score_grads = [[np.zeros((CS, CS), dtype=np.float32)
                                           for _ in range(NH)] for _ in range(NL)]
@@ -1241,6 +1295,10 @@ class SparseGradAccumulator:
                 for layer in grads:
                     for g in layer:
                         g[:] = 0
+        if self.new_attn_final_y_grads is not None:
+            for layer in self.new_attn_final_y_grads:
+                for i in range(len(layer)):
+                    layer[i] = None
         for layer in self.pe_grads:
             for g in layer:
                 g[:] = 0
@@ -1264,6 +1322,8 @@ class BatchElement:
     """Per-sequence scratch space that duck-types as Model, sharing S tables."""
     __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
                  '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
+                 'MHA_O', '_mha_concat', '_mha_o_j', '_mha_o_r_min',
+                 '_mha_o_u_min', '_mha_o_grad',
                  'grad_accum',
                  'ln_attn_gamma', 'ln_attn_beta', 'ln_ffn_gamma', 'ln_ffn_beta',
                  '_ln_attn_xhat', '_ln_attn_rstd', '_ln_ffn_xhat', '_ln_ffn_rstd',
@@ -1275,6 +1335,7 @@ class BatchElement:
         NT = args.n_t
         NL = args.num_layers
         NH = args.num_heads
+        new_mha = getattr(args, 'new_MHA', False)
 
         # Shared (read-only during batch processing)
         self.Token_embedder = m.Token_embedder
@@ -1292,6 +1353,23 @@ class BatchElement:
         self._ffn_j = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
         self._ffn_r_min = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
         self._ffn_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
+        if new_mha:
+            concat_dim = NH * args.mha_head_dim
+            self.MHA_O = [LUT(NT) for _ in range(NL)]
+            self._mha_concat = [np.zeros((CS, concat_dim), dtype=np.float32) for _ in range(NL)]
+            self._mha_o_j = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
+            self._mha_o_r_min = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
+            self._mha_o_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
+            self._mha_o_grad = [np.zeros((CS, concat_dim), dtype=np.float32) for _ in range(NL)]
+            for l in range(NL):
+                _share_lut(self.MHA_O[l], m.MHA_O[l])
+        else:
+            self.MHA_O = None
+            self._mha_concat = None
+            self._mha_o_j = None
+            self._mha_o_r_min = None
+            self._mha_o_u_min = None
+            self._mha_o_grad = None
 
         # Per-element attention heads (own scratch, shared LUTs and PE)
         if getattr(args, 'new_attention', False):
@@ -1494,7 +1572,7 @@ def _new_attention_forward_kernel(
     q_trees, k_trees, v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, Q_N_T, QD, y_dim, qkpe_direct_sign,
+    pd, CS, N_T, N_C, Q_N_T, QD, v_dim, y_dim, qkpe_direct_sign,
     normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Fused forward for Q(x_i)+K(x_j)+PE and V(x_j) into Final LUT."""
@@ -1513,9 +1591,9 @@ def _new_attention_forward_kernel(
         k_embed[pos, d] = k_acc
 
     # Phase 2: token-side V embeddings.
-    for work in prange(CS * y_dim):
-        pos = work // y_dim
-        d = work - pos * y_dim
+    for work in prange(CS * v_dim):
+        pos = work // v_dim
+        d = work - pos * v_dim
         v_acc = np.float32(0.0)
         for t in range(N_T):
             v_acc += VS[v_trees[t], val_j[pos, t], d]
@@ -1649,7 +1727,7 @@ def _new_attention_pe_only_forward_kernel(
     v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, QD, y_dim, qkpe_direct_sign
+    pd, CS, N_T, N_C, QD, v_dim, y_dim, qkpe_direct_sign
 ):
     """Fused PE-only forward: PE(i-j) and V(x_j) into Final LUT."""
     n_pairs = CS * (CS - 1) // 2
@@ -1662,9 +1740,9 @@ def _new_attention_pe_only_forward_kernel(
         k_embed[pos, d] = np.float32(0.0)
 
     # Token-side V embeddings.
-    for work in prange(CS * y_dim):
-        pos = work // y_dim
-        d = work - pos * y_dim
+    for work in prange(CS * v_dim):
+        pos = work // v_dim
+        d = work - pos * v_dim
         v_acc = np.float32(0.0)
         for t in range(N_T):
             v_acc += VS[v_trees[t], val_j[pos, t], d]
@@ -1750,7 +1828,7 @@ def _new_attention_final_backward_kernel(
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
-    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
+    pd, CS, N_T, v_dim, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
     freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
@@ -1758,7 +1836,7 @@ def _new_attention_final_backward_kernel(
     n_threads = get_num_threads()
     q_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
     k_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
-    v_grad_thr = np.zeros((n_threads, CS, y_dim), dtype=np.float32)
+    v_grad_thr = np.zeros((n_threads, CS, v_dim), dtype=np.float32)
     pe_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
 
     # Phase 1: compute embedding-space gradients from fragile final bits.
@@ -1866,9 +1944,9 @@ def _new_attention_final_backward_kernel(
         k_grad[pos, d] += k_total
         pe_grad[pos, d] += pe_total
 
-    for work in prange(CS * y_dim):
-        pos = work // y_dim
-        d = work - pos * y_dim
+    for work in prange(CS * v_dim):
+        pos = work // v_dim
+        d = work - pos * v_dim
         total = np.float32(0.0)
         for thr in range(n_threads):
             total += v_grad_thr[thr, pos, d]
@@ -2515,7 +2593,9 @@ def build_Model(m, args):
     POSITIONAL_DIM = args.positional_dim
     freeze_pe = getattr(args, 'freeze_PE', False)
     new_attention = getattr(args, 'new_attention', False)
-    
+    new_mha = getattr(args, 'new_MHA', False)
+    head_value_dim = args.mha_head_dim if new_mha else EMBEDDING_DIM
+
     N_T = args.n_t
 
     m.Token_embedder[:] = random_vector(VOCAB_SIZE_INPUT * EMBEDDING_DIM, 1.0).reshape(VOCAB_SIZE_INPUT, EMBEDDING_DIM)
@@ -2532,6 +2612,10 @@ def build_Model(m, args):
 
     for l in range(NUM_LAYERS):
         build_LUT(m.FFN[l], N_C, EMBEDDING_DIM, args)
+        if new_mha:
+            build_LUT_custom(m.MHA_O[l], N_C, EMBEDDING_DIM, args,
+                             n_t=N_T, n_c=N_C,
+                             input_dim=NUM_HEADS * head_value_dim)
         for h in range(NUM_HEADS):
             if new_attention:
                 head = m.head[l][h]
@@ -2552,7 +2636,7 @@ def build_Model(m, args):
                 final_n_t = getattr(args, 'final_n_t', N_T)
                 final_share_m = getattr(args, 'final_share_m', 1)
                 final_trees = np.repeat(np.arange(final_n_t, dtype=np.int32), final_share_m)
-                build_LUT_custom(head.Final, N_C + POSITIONAL_DIM, EMBEDDING_DIM, args,
+                build_LUT_custom(head.Final, N_C + POSITIONAL_DIM, head_value_dim, args,
                                  n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM,
                                  s_n_t=final_n_t, trees=final_trees)
                 qkpe_a, qkpe_b = build_comparison_arrays(
@@ -2603,6 +2687,8 @@ def save_model(m, path, args):
     d = {'token_embedder': m.Token_embedder}
     for l in range(args.num_layers):
         _lut_save(d, f'ffn_{l}', m.FFN[l])
+        if getattr(args, 'new_MHA', False):
+            _lut_save(d, f'mha_o_{l}', m.MHA_O[l])
         for h in range(args.num_heads):
             d[f'pe_{l}_{h}'] = m.head[l][h].Positional_encoding
             if getattr(args, 'new_attention', False):
@@ -2660,6 +2746,8 @@ def load_model(m, path, args):
     m.Token_embedder[:] = d['token_embedder']
     for l in range(args.num_layers):
         _lut_load(d, f'ffn_{l}', m.FFN[l])
+        if getattr(args, 'new_MHA', False):
+            _lut_load(d, f'mha_o_{l}', m.MHA_O[l])
         for h in range(args.num_heads):
             m.head[l][h].Positional_encoding[:] = d[f'pe_{l}_{h}']
             if getattr(args, 'new_attention', False):
@@ -2728,7 +2816,7 @@ def new_attention_forward(head, x, y, args):
                 treesV, treesFinal,
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
-                args.positional_dim, CS, args.n_t, args.n_c, q_dim, y_dim,
+                args.positional_dim, CS, args.n_t, args.n_c, q_dim, lutV.y_dim, y_dim,
                 qkpe_direct_sign
             )
         else:
@@ -2745,7 +2833,7 @@ def new_attention_forward(head, x, y, args):
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
                 args.positional_dim, CS, args.n_t, args.n_c,
-                args.attn_qk_n_t, q_dim, y_dim, qkpe_direct_sign,
+                args.attn_qk_n_t, q_dim, lutV.y_dim, y_dim, qkpe_direct_sign,
                 normalize_qk, qk_norm_target_std, qk_norm_eps
             )
     else:
@@ -2886,6 +2974,31 @@ def attention_forward(head, x, y, args):
             y[pos, :y_dim] += _f32(lut.S[trees, j_bins]).sum(axis=1).sum(axis=0)
 
 
+def _lut_forward_add(lut, x, j, r_min, u_min, y, args):
+    cache_index_batch(lut, x, j, r_min, u_min)
+    if HAS_NUMBA and lut.S.dtype == np.float32:
+        _lut_forward_add_kernel(lut.S, lut.trees, j, y,
+                                args.context_size, args.n_t, lut.y_dim)
+    else:
+        y[:, :lut.y_dim] += _f32(lut.S[lut.trees, j]).sum(axis=1)
+
+
+def _lut_backward_to_input(lut, j, r_min, u_min, grad, x_grad, args, skip_s_update=False):
+    if HAS_NUMBA and lut.S.dtype == np.float32:
+        if skip_s_update:
+            _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
+                                          grad, x_grad, lut.a_arr, lut.b_arr,
+                                          lut.y_dim, args.context_size, args.n_t)
+        else:
+            _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
+                                 grad, x_grad, lut.a_arr, lut.b_arr,
+                                 lut.y_dim, args.context_size, args.n_t,
+                                 np.float32(learning_rate))
+    else:
+        _lut_backward_python(lut, j, r_min, u_min, grad, x_grad,
+                             lut.y_dim, args.context_size, args.n_t, skip_s_update)
+
+
 def _lut_backward_python(lut, j, r_min, u_min, grad, x_grad, y_dim, CS, N_T, skip_s_update):
     """Python fallback for simple LUT backward with optional S update."""
     global learning_rate
@@ -2967,7 +3080,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             treesFinal,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
-            POSITIONAL_DIM, CS, N_T, y_dim, QD,
+            POSITIONAL_DIM, CS, N_T, lutV.y_dim, y_dim, QD,
             np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign,
             freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps)
     else:
@@ -3081,18 +3194,19 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             _lut_backward_python(lutK, head._k_j, head._k_r_min, head._k_u_min,
                                  k_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
 
+    v_y_dim = lutV.y_dim
     if HAS_NUMBA and lutV.S.dtype == np.float32:
         if skip_s_update:
             _lut_backward_kernel_noupdate(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
                                           v_grad, x_grad, lutV.a_arr, lutV.b_arr,
-                                          ED, CS, N_T)
+                                          v_y_dim, CS, N_T)
         else:
             _lut_backward_kernel(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
                                  v_grad, x_grad, lutV.a_arr, lutV.b_arr,
-                                 ED, CS, N_T, np.float32(learning_rate))
+                                 v_y_dim, CS, N_T, np.float32(learning_rate))
     else:
         _lut_backward_python(lutV, head._val_j, head._val_r_min, head._val_u_min,
-                             v_grad, x_grad, ED, CS, N_T, skip_s_update)
+                             v_grad, x_grad, v_y_dim, CS, N_T, skip_s_update)
 
 
 def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None,
@@ -3362,7 +3476,12 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
         head.Positional_encoding -= learning_rate * pos_grad
 
 
-def model_forward(m, args, training=True):
+def _new_mha_head_forward_task(task):
+    head, x, out, args = task
+    new_attention_forward(head, x, out, args)
+
+
+def model_forward(m, args, training=True, head_pool=None):
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
     use_ln = getattr(args, 'layernorm', False)
@@ -3377,11 +3496,30 @@ def model_forward(m, args, training=True):
             np.copyto(m._x_buf, m.z)
 
         z_pre_attn = m.z.copy() if (dr > 0.0 and training) else None
-        for h in range(NUM_HEADS):
-            if getattr(args, 'new_attention', False):
-                new_attention_forward(m.head[l][h], m._x_buf, m.z, args)
+        if getattr(args, 'new_MHA', False):
+            concat = m._mha_concat[l]
+            concat.fill(0.0)
+            head_dim = args.mha_head_dim
+            if head_pool is not None and NUM_HEADS > 1:
+                tasks = []
+                for h in range(NUM_HEADS):
+                    start = h * head_dim
+                    tasks.append((m.head[l][h], m._x_buf,
+                                  concat[:, start:start + head_dim], args))
+                head_pool.map(_new_mha_head_forward_task, tasks)
             else:
-                attention_forward(m.head[l][h], m._x_buf, m.z, args)
+                for h in range(NUM_HEADS):
+                    start = h * head_dim
+                    new_attention_forward(m.head[l][h], m._x_buf,
+                                          concat[:, start:start + head_dim], args)
+            _lut_forward_add(m.MHA_O[l], concat, m._mha_o_j[l],
+                             m._mha_o_r_min[l], m._mha_o_u_min[l], m.z, args)
+        else:
+            for h in range(NUM_HEADS):
+                if getattr(args, 'new_attention', False):
+                    new_attention_forward(m.head[l][h], m._x_buf, m.z, args)
+                else:
+                    attention_forward(m.head[l][h], m._x_buf, m.z, args)
         if dr > 0.0 and training:
             mask = (np.random.rand(*m.z.shape) >= dr).astype(np.float32) / (1.0 - dr)
             m._drop_attn_mask[l] = mask
@@ -3501,34 +3639,64 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
 
         soft = getattr(args, 'soft_attention', False)
         new_attn = getattr(args, 'new_attention', False)
-        if grad_accum is not None and not soft:
-            # Save y_grad once per layer (shared across heads) for hard/new attention replay
-            grad_accum.attn_y_grads[l] = y_grad.copy()
-        for h in range(NUM_HEADS):
-            if new_attn:
+        new_mha = getattr(args, 'new_MHA', False)
+        if new_mha:
+            o_lut = m.MHA_O[l]
+            o_grad = m._mha_o_grad[l]
+            o_grad.fill(0.0)
+            if grad_accum is not None:
+                grad_accum.attn_y_grads[l] = y_grad[:, :o_lut.y_dim].copy()
+            elif update_stats is not None:
+                update_stats.record_simple(f'mha_o_{l}', o_lut, m._mha_o_j[l])
+                update_stats.record_simple_coords(f'mha_o_{l}', o_lut, y_grad)
+            _lut_backward_to_input(o_lut, m._mha_o_j[l], m._mha_o_r_min[l],
+                                   m._mha_o_u_min[l], y_grad, o_grad, args,
+                                   skip_s_update=skip_s)
+            head_dim = args.mha_head_dim
+            for h in range(NUM_HEADS):
+                head_y_grad = o_grad[:, h * head_dim:(h + 1) * head_dim]
                 if grad_accum is not None:
+                    grad_accum.new_attn_final_y_grads[l][h] = head_y_grad.copy()
                     new_attention_backward(
-                        m.head[l][h], x_grad, y_grad, args,
+                        m.head[l][h], x_grad, head_y_grad, args,
                         skip_s_update=True,
                         pe_grad_out=grad_accum.pe_grads[l][h],
                         q_grad_out=grad_accum.new_attn_q_grads[l][h],
                         k_grad_out=grad_accum.new_attn_k_grads[l][h],
                         v_grad_out=grad_accum.new_attn_v_grads[l][h])
                 else:
-                    new_attention_backward(m.head[l][h], x_grad, y_grad, args,
+                    new_attention_backward(m.head[l][h], x_grad, head_y_grad, args,
                                            update_stats=update_stats,
                                            stats_prefix=f'head_{l}_{h}')
-            elif grad_accum is not None:
-                attention_backward(m.head[l][h], x_grad, y_grad, args,
-                                   skip_s_update=True,
-                                   pe_grad_out=grad_accum.pe_grads[l][h],
-                                   score_grad_out=grad_accum.attn_score_grads[l][h] if soft else None,
-                                   val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None)
-            else:
-                stats_prefix = f'head_{l}_{h}' if soft else f'head_{l}_{h}_V'
-                attention_backward(m.head[l][h], x_grad, y_grad, args,
-                                   update_stats=update_stats,
-                                   stats_prefix=stats_prefix)
+        else:
+            if grad_accum is not None and not soft:
+                # Save y_grad once per layer (shared across heads) for hard/new attention replay
+                grad_accum.attn_y_grads[l] = y_grad.copy()
+            for h in range(NUM_HEADS):
+                if new_attn:
+                    if grad_accum is not None:
+                        new_attention_backward(
+                            m.head[l][h], x_grad, y_grad, args,
+                            skip_s_update=True,
+                            pe_grad_out=grad_accum.pe_grads[l][h],
+                            q_grad_out=grad_accum.new_attn_q_grads[l][h],
+                            k_grad_out=grad_accum.new_attn_k_grads[l][h],
+                            v_grad_out=grad_accum.new_attn_v_grads[l][h])
+                    else:
+                        new_attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                               update_stats=update_stats,
+                                               stats_prefix=f'head_{l}_{h}')
+                elif grad_accum is not None:
+                    attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                       skip_s_update=True,
+                                       pe_grad_out=grad_accum.pe_grads[l][h],
+                                       score_grad_out=grad_accum.attn_score_grads[l][h] if soft else None,
+                                       val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None)
+                else:
+                    stats_prefix = f'head_{l}_{h}' if soft else f'head_{l}_{h}_V'
+                    attention_backward(m.head[l][h], x_grad, y_grad, args,
+                                       update_stats=update_stats,
+                                       stats_prefix=stats_prefix)
 
         if use_ln:
             ln_attn_dx = x_grad - x_before_attn
@@ -3549,8 +3717,8 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
     #         m.Token_embedder[m.tokens[pos]][k] -= learning_rate * x_grad[pos][k]
 
 
-def model_training_step(m, args, update_stats=None):
-    model_forward(m, args, training=True)
+def model_training_step(m, args, update_stats=None, head_pool=None):
+    model_forward(m, args, training=True, head_pool=head_pool)
     loss = m.output_head.training_loss(args)
     m.output_head.compute_gradients(args)
     model_backward(m, args, update_stats=update_stats)
@@ -3725,6 +3893,18 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                     _replay_ffn_task(_l.S, _l.trees, _j, _y, _l.y_dim,
                                      CS, N_T, scale, use_numba))
 
+        if getattr(args, 'new_MHA', False):
+            o_lut = m.MHA_O[l]
+            j_list = [be._mha_o_j[l] for be in batch_elements]
+            ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+            if update_stats is not None:
+                for j, ygrad in zip(j_list, ygrad_list):
+                    update_stats.record_simple(f'mha_o_{l}', o_lut, j)
+                    update_stats.record_simple_coords(f'mha_o_{l}', o_lut, ygrad)
+            work.append(lambda _l=o_lut, _j=j_list, _y=ygrad_list:
+                        _replay_output_task(_l.S, _l.trees, _j, _y, _l.y_dim,
+                                            CS, N_T, scale, use_numba))
+
         # Attention: one task per (layer, head)
         for h in range(args.num_heads):
             head = m.head[l][h]
@@ -3735,7 +3915,11 @@ def apply_averaged_gradients(m, batch_elements, lr, args, pool=None, update_stat
                 val_j_list = [be.head[l][h]._val_j for be in batch_elements]
                 final_v_j_list = [be.head[l][h]._final_v_j for be in batch_elements]
                 qkpe_j_list = [be.head[l][h]._qkpe_j for be in batch_elements]
-                ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
+                if getattr(args, 'new_MHA', False):
+                    ygrad_list = [be.grad_accum.new_attn_final_y_grads[l][h]
+                                  for be in batch_elements]
+                else:
+                    ygrad_list = [be.grad_accum.attn_y_grads[l] for be in batch_elements]
                 q_grad_list = [be.grad_accum.new_attn_q_grads[l][h] for be in batch_elements]
                 k_grad_list = [be.grad_accum.new_attn_k_grads[l][h] for be in batch_elements]
                 v_grad_list = [be.grad_accum.new_attn_v_grads[l][h] for be in batch_elements]
@@ -4047,6 +4231,8 @@ def print_model_stats(m, args):
     for l in range(args.num_layers):
         # FFN LUT
         count_array(m.FFN[l].S)
+        if getattr(args, 'new_MHA', False):
+            count_array(m.MHA_O[l].S)
         # Attention heads
         for h in range(args.num_heads):
             head = m.head[l][h]
@@ -4142,6 +4328,8 @@ def main():
                         help='Numba threads per worker/kernel (0 = derive from --cpu-cores)')
     parser.add_argument('--replay-workers', type=int, default=0,
                         help='Worker threads for batched sparse-gradient replay (0 = derive from --cpu-cores)')
+    parser.add_argument('--head-workers', type=int, default=0,
+                        help='Worker threads for parallel --new-MHA heads when --batch-size 1 (0 = derive from --cpu-cores)')
     parser.add_argument('--soft-attention', action='store_true',
                         help='Decomposed Score+Value LUTs with softmax weighting (transformer-style)')
     parser.add_argument('--layernorm', action='store_true',
@@ -4182,6 +4370,8 @@ def main():
                         help='Directory for cached POS encodings used by --POS-task')
     parser.add_argument('--new-attention', action='store_true',
                         help='Use new attention implementation (default: off)')
+    parser.add_argument('--new-MHA', '--new-mha', dest='new_MHA', action='store_true',
+                        help='Use lower-dimensional new-attention heads followed by a layer-level O LUT')
     parser.add_argument('--PE-only', dest='PE_only', action='store_true',
                         help='With --new-attention, zero Q/K embeddings and train PE+V+Final only')
     parser.add_argument('--freeze-PE', dest='freeze_PE', action='store_true',
@@ -4195,6 +4385,7 @@ def main():
     parser.add_argument('--qk-norm-eps', type=float, default=1e-6,
                         help='Epsilon for --normalize-qk vector variance normalization')
     args = parser.parse_args()
+    configure_new_mha(args, parser)
     if args.PE_only and not args.new_attention:
         parser.error('--PE-only requires --new-attention')
     if args.qkpe_direct_sign and not args.new_attention:
@@ -4276,6 +4467,7 @@ def main():
     print(f"  cpu_cores         = {args.cpu_cores}")
     print(f"  num_workers       = {args.num_workers}")
     print(f"  replay_workers    = {args.replay_workers}")
+    print(f"  head_workers      = {args.head_workers}")
     print(f"  numba_available   = {HAS_NUMBA}")
     print(f"  numba_threads     = {args.numba_threads}")
     print(f"  soft_attention    = {args.soft_attention}")
@@ -4304,6 +4496,8 @@ def main():
     print(f"  POS_task          = {args.POS_task}")
     print(f"  pos_cache_dir     = {args.pos_cache_dir}")
     print(f"  new_attention     = {args.new_attention}")
+    print(f"  new_MHA           = {args.new_MHA}")
+    print(f"  mha_head_dim      = {args.mha_head_dim}")
     print(f"  PE_only           = {args.PE_only}")
     print(f"  freeze_PE         = {args.freeze_PE}")
     print(f"  PE_init_scale     = {args.PE_init_scale}")
@@ -4360,6 +4554,7 @@ def main():
         sys.exit(1)
 
     batch_size = args.batch_size
+    head_pool = ThreadPool(args.head_workers) if args.head_workers > 1 else None
     if batch_size > 1:
         batch_elements = [BatchElement(m, args) for _ in range(batch_size)]
         pool = ThreadPool(args.num_workers) if args.num_workers > 1 else None
@@ -4389,7 +4584,7 @@ def main():
             load_snippet(m, training.data, get_random_training_index(training), args,
                          training.pos_data if args.POS_task else None)
             step_stats = update_stats if learning_rate != 0.0 else None
-            loss = model_training_step(m, args, update_stats=step_stats)
+            loss = model_training_step(m, args, update_stats=step_stats, head_pool=head_pool)
             ema_loss = loss if ema_loss is None else ema_alpha * loss + (1 - ema_alpha) * ema_loss
         else:
             # Batched path: parallel forward+backward, then averaged S update
@@ -4437,7 +4632,7 @@ def main():
             for i in tqdm(range(args.testing_length), desc="  Val", leave=False, unit="snip"):
                 load_snippet(m, training.val_data, int(training.testing_input_data[i]), args,
                              training.val_pos_data if args.POS_task else None)
-                model_forward(m, args, training=False)
+                model_forward(m, args, training=False, head_pool=head_pool)
                 sample_accuracy = m.output_head.validation_accuracy(args)
                 sample_loss = m.output_head.validation_loss(args)
                 if sample_loss is not None:
@@ -4532,6 +4727,9 @@ def main():
     if pool is not None:
         pool.close()
         pool.join()
+    if head_pool is not None:
+        head_pool.close()
+        head_pool.join()
     if replay_pool is not None:
         replay_pool.close()
         replay_pool.join()
