@@ -777,7 +777,7 @@ class NewAttentionHead:
         POSITIONAL_DIM = args.positional_dim
         ED = args.embedding_dim
         QD = args.attn_qk_dim
-        value_dim = ED
+        value_dim = getattr(args, 'mha_head_dim', ED) if getattr(args, 'new_MHA', False) else ED
         soft = getattr(args, 'soft_attention', False)
         self.Positional_encoding = np.zeros((CS, QD), dtype=np.float32)
         n_pairs = CS * (CS - 1) // 2
@@ -1261,7 +1261,7 @@ class SparseGradAccumulator:
         ED = args.embedding_dim
         QD = getattr(args, 'attn_qk_dim', ED)
         new_mha = getattr(args, 'new_MHA', False)
-        value_dim = ED
+        value_dim = getattr(args, 'mha_head_dim', ED) if new_mha else ED
         self.ffn_y_grads = [None] * NL      # filled during backward
         self.attn_y_grads = [None] * NL     # filled during backward
         if getattr(args, 'new_attention', False):
@@ -1591,7 +1591,7 @@ def _new_attention_forward_kernel(
     q_trees, k_trees, v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, Q_N_T, QD, v_dim, y_dim, qkpe_direct_sign,
+    pd, CS, N_T, N_C, Q_N_T, QD, y_dim, qkpe_direct_sign,
     normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Fused forward for Q(x_i)+K(x_j)+PE and V(x_j) into Final LUT."""
@@ -1610,9 +1610,9 @@ def _new_attention_forward_kernel(
         k_embed[pos, d] = k_acc
 
     # Phase 2: token-side V embeddings.
-    for work in prange(CS * v_dim):
-        pos = work // v_dim
-        d = work - pos * v_dim
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
         v_acc = np.float32(0.0)
         for t in range(N_T):
             v_acc += VS[v_trees[t], val_j[pos, t], d]
@@ -1746,7 +1746,7 @@ def _new_attention_pe_only_forward_kernel(
     v_trees, final_trees,
     final_v_a_arr, final_v_b_arr, final_v_bitmasks,
     qkpe_a_arr, qkpe_b_arr, qkpe_bitmasks,
-    pd, CS, N_T, N_C, QD, v_dim, y_dim, qkpe_direct_sign
+    pd, CS, N_T, N_C, QD, y_dim, qkpe_direct_sign
 ):
     """Fused PE-only forward: PE(i-j) and V(x_j) into Final LUT."""
     n_pairs = CS * (CS - 1) // 2
@@ -1759,9 +1759,9 @@ def _new_attention_pe_only_forward_kernel(
         k_embed[pos, d] = np.float32(0.0)
 
     # Token-side V embeddings.
-    for work in prange(CS * v_dim):
-        pos = work // v_dim
-        d = work - pos * v_dim
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
         v_acc = np.float32(0.0)
         for t in range(N_T):
             v_acc += VS[v_trees[t], val_j[pos, t], d]
@@ -1847,7 +1847,7 @@ def _new_attention_final_backward_kernel(
     final_trees,
     final_v_a_arr, final_v_b_arr,
     qkpe_a_arr, qkpe_b_arr,
-    pd, CS, N_T, v_dim, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
+    pd, CS, N_T, y_dim, q_dim, lr, skip_s_update, pe_only, qkpe_direct_sign,
     freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps
 ):
     """Backward through the new attention Final LUT into Q/K/V/PE embeddings."""
@@ -1855,7 +1855,7 @@ def _new_attention_final_backward_kernel(
     n_threads = get_num_threads()
     q_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
     k_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
-    v_grad_thr = np.zeros((n_threads, CS, v_dim), dtype=np.float32)
+    v_grad_thr = np.zeros((n_threads, CS, y_dim), dtype=np.float32)
     pe_grad_thr = np.zeros((n_threads, CS, q_dim), dtype=np.float32)
 
     # Phase 1: compute embedding-space gradients from fragile final bits.
@@ -1963,9 +1963,9 @@ def _new_attention_final_backward_kernel(
         k_grad[pos, d] += k_total
         pe_grad[pos, d] += pe_total
 
-    for work in prange(CS * v_dim):
-        pos = work // v_dim
-        d = work - pos * v_dim
+    for work in prange(CS * y_dim):
+        pos = work // y_dim
+        d = work - pos * y_dim
         total = np.float32(0.0)
         for thr in range(n_threads):
             total += v_grad_thr[thr, pos, d]
@@ -2650,13 +2650,13 @@ def build_Model(m, args):
                 build_LUT_custom(head.K, args.attn_qk_n_c, args.attn_qk_dim, args,
                                  n_t=args.attn_qk_n_t, n_c=args.attn_qk_n_c,
                                  input_dim=EMBEDDING_DIM)
-                build_LUT_custom(head.V, N_C, EMBEDDING_DIM, args,
+                build_LUT_custom(head.V, N_C, head_value_dim, args,
                                  n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM)
                 final_n_t = getattr(args, 'final_n_t', N_T)
                 final_share_m = getattr(args, 'final_share_m', 1)
                 final_trees = np.repeat(np.arange(final_n_t, dtype=np.int32), final_share_m)
                 build_LUT_custom(head.Final, N_C + POSITIONAL_DIM, head_value_dim, args,
-                                 n_t=N_T, n_c=N_C, input_dim=EMBEDDING_DIM,
+                                 n_t=N_T, n_c=N_C, input_dim=head_value_dim,
                                  s_n_t=final_n_t, trees=final_trees)
                 qkpe_a, qkpe_b = build_comparison_arrays(
                     getattr(args, 'lut_comparison_mode', 'random'), N_T,
@@ -2835,7 +2835,7 @@ def new_attention_forward(head, x, y, args):
                 treesV, treesFinal,
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
-                args.positional_dim, CS, args.n_t, args.n_c, q_dim, lutV.y_dim, y_dim,
+                args.positional_dim, CS, args.n_t, args.n_c, q_dim, y_dim,
                 qkpe_direct_sign
             )
         else:
@@ -2852,7 +2852,7 @@ def new_attention_forward(head, x, y, args):
                 lutFinal.a_arr, lutFinal.b_arr, lutFinal.bitmasks,
                 head._qkpe_a_arr, head._qkpe_b_arr, head._qkpe_bitmasks,
                 args.positional_dim, CS, args.n_t, args.n_c,
-                args.attn_qk_n_t, q_dim, lutV.y_dim, y_dim, qkpe_direct_sign,
+                args.attn_qk_n_t, q_dim, y_dim, qkpe_direct_sign,
                 normalize_qk, qk_norm_target_std, qk_norm_eps
             )
     else:
@@ -3099,7 +3099,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
             treesFinal,
             lutFinal.a_arr, lutFinal.b_arr,
             head._qkpe_a_arr, head._qkpe_b_arr,
-            POSITIONAL_DIM, CS, N_T, lutV.y_dim, y_dim, QD,
+            POSITIONAL_DIM, CS, N_T, y_dim, QD,
             np.float32(learning_rate), skip_s_update, pe_only, qkpe_direct_sign,
             freeze_pe, normalize_qk, qk_norm_target_std, qk_norm_eps)
     else:
