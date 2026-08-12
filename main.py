@@ -33,6 +33,10 @@ except ImportError:
 
 
 # Global learning rate (updated each step)
+DEFAULT_WARMUP_STEPS = 4000
+DEFAULT_MAX_LEARNING_RATE = 1.0 / math.sqrt(DEFAULT_WARMUP_STEPS + 1)
+DEFAULT_INVERSE_SQRT_ALPHA = 0.5
+DEFAULT_COSINE_MIN_LR_RATIO = 0.01
 learning_rate = 0.0
 UNK_TOKEN_ID = 0
 IGNORE_INDEX = -1
@@ -41,6 +45,21 @@ IGNORE_INDEX = -1
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def get_learning_rate(step, args):
+    """Return the learning rate for a zero-based training step."""
+    if step < args.warmup_steps:
+        return args.max_learning_rate * step / args.warmup_steps
+
+    if args.lr_scheduler == 'inverse-sqrt':
+        return args.max_learning_rate * (args.warmup_steps / step) ** args.inverse_sqrt_alpha
+
+    # else cosine
+    decay_steps = max(1, args.max_steps - args.warmup_steps)
+    progress = min(1.0, (step - args.warmup_steps) / decay_steps)
+    min_learning_rate = args.max_learning_rate * args.cosine_min_lr_ratio
+    return min_learning_rate + 0.5 * (args.max_learning_rate - min_learning_rate) * (
+        1.0 + math.cos(math.pi * progress))
 
 def softmax(x, size, temperature):
     max_val = np.max(x[:size])
@@ -4311,6 +4330,16 @@ def main():
     parser.add_argument('--attn_qk_n_t', type=int, default=4)
     parser.add_argument('--testing-length', type=int, default=10000)
     parser.add_argument('--max-steps', type=int, default=100000000)
+    parser.add_argument('--warmup-steps', type=int, default=DEFAULT_WARMUP_STEPS,
+                        help=f'Learning-rate warmup steps (default: {DEFAULT_WARMUP_STEPS})')
+    parser.add_argument('--max-learning-rate', type=float, default=DEFAULT_MAX_LEARNING_RATE,
+                        help=f'Peak learning rate after warmup (default: {DEFAULT_MAX_LEARNING_RATE:.8g})')
+    parser.add_argument('--lr-scheduler', choices=['inverse-sqrt', 'cosine'], default='inverse-sqrt',
+                        help='Learning-rate decay after warmup (default: inverse-sqrt)')
+    parser.add_argument('--inverse-sqrt-alpha', type=float, default=DEFAULT_INVERSE_SQRT_ALPHA,
+                        help=f'Inverse-sqrt decay exponent after warmup (default: {DEFAULT_INVERSE_SQRT_ALPHA:g})')
+    parser.add_argument('--cosine-min-lr-ratio', type=float, default=DEFAULT_COSINE_MIN_LR_RATIO,
+                        help=f'Cosine final LR as a fraction of max LR (default: {DEFAULT_COSINE_MIN_LR_RATIO:g})')
     parser.add_argument('--validation-interval', type=int, default=10000)
     parser.add_argument('--temperature', type=float, default=0.4)
     parser.add_argument('--loss-file', type=str, default='loss.csv')
@@ -4406,6 +4435,14 @@ def main():
     args.qk_norm_target_std = np.float32(pe_stat_scale / math.sqrt(3.0))
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
+    if args.warmup_steps < 1:
+        parser.error('--warmup-steps must be at least 1')
+    if args.inverse_sqrt_alpha < 0.0:
+        parser.error('--inverse-sqrt-alpha must be non-negative')
+    if args.max_learning_rate <= 0.0:
+        parser.error('--max-learning-rate must be positive')
+    if not 0.0 <= args.cosine_min_lr_ratio <= 1.0:
+        parser.error('--cosine-min-lr-ratio must be between 0 and 1')
     configure_lut_comparison_mode(args, parser)
     configure_weight_sharing(args, parser)
 
@@ -4473,8 +4510,15 @@ def main():
     print(f"  soft_attention    = {args.soft_attention}")
     print(f"  layernorm         = {args.layernorm}")
     print(f"  dropout           = {args.dropout}")
+    if args.lr_scheduler == 'inverse-sqrt':
+        print(f"  inverse_sqrt_alpha = {args.inverse_sqrt_alpha}")
     print(f"  tokenizer         = {args.tokenizer}")
     print(f"  max_steps         = {args.max_steps}")
+    print(f"  warmup_steps      = {args.warmup_steps}")
+    print(f"  max_learning_rate = {args.max_learning_rate}")
+    print(f"  lr_scheduler      = {args.lr_scheduler}")
+    if args.lr_scheduler == 'cosine':
+        print(f"  cosine_min_lr_ratio = {args.cosine_min_lr_ratio}")
     print(f"  validation_interval = {args.validation_interval}")
     print(f"  testing_length    = {args.testing_length}")
     print(f"  training_data     = {args.training_data}")
@@ -4576,8 +4620,7 @@ def main():
     ema_alpha = 0.02
 
     for t in pbar:
-        # Adam learning rate scheduler
-        learning_rate = min(1.0 / math.sqrt(1 + t), t / 4000.0 / math.sqrt(4000))
+        learning_rate = get_learning_rate(t, args)
 
         if batch_size == 1:
             # Fast path: identical to original code (no overhead)
