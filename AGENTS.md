@@ -32,6 +32,35 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 - `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
 - `loss.csv`: `step, loss, perplexity, accuracy`.
 
+## Cluster Sandbox and Command Execution — Read This Before Running Anything
+
+**The default command/file sandbox is incompatible with this cluster. Do not repeatedly retry it or debug the repository when it fails.**
+
+The characteristic infrastructure error is:
+
+```text
+bwrap: Creating new namespace failed, likely because the kernel does not support user namespaces.
+bwrap must be installed setuid on such systems.
+```
+
+This happens before the requested command runs. It is not a Python, test, dependency, or repository failure.
+
+Follow these rules:
+
+1. Run terminal commands for this repository with the execution tool's host/escalated sandbox permission from the first attempt. Set the working directory explicitly to `/cs/labs/roys/yuval.rubin/LUT/LUT` and give a narrow, honest justification.
+2. If a command was accidentally started in the default sandbox and returns the `bwrap` error above, rerun that same command once with host/escalated permission. Do not keep retrying the default sandbox, modify the command to evade it, or investigate application code.
+3. Escalated execution only bypasses the broken namespace sandbox; it does not authorize destructive, unrelated, network, or system-wide actions. Keep commands scoped to this repository and request any additional approval normally.
+4. The dedicated `apply_patch` helper currently enters the same broken sandbox and may fail before reading a file. Try the prescribed patch helper once when required. If it fails with the exact `bwrap` error, use `git apply` through an escalated terminal call with a small reviewed unified diff. Do not rewrite tracked files with `cat`, shell redirection, `sed -i`, or Python.
+5. A long command may return a process/session ID instead of finishing. Poll that existing process with the execution tool's stdin/poll operation; do not launch a duplicate test or training run. Keep each wait under 60 seconds so the user continues receiving updates.
+6. Preserve dirty and untracked user work. Check `git status --short` before editing, patch only the intended file, and never use reset/checkout/clean to recover from a patch problem.
+
+Environment notes:
+
+- Use `.venv/bin/python` for application imports and smoke runs when possible.
+- The project virtualenv may not contain pytest, while the cluster Python may not contain project dependencies such as `tiktoken`. Probe the intended interpreter first. Do not install or mix site-packages without explicit need and approval.
+- For syntax-only shell validation, use `bash -n script.sh`; do not submit or execute the SLURM job.
+- Network access remains separately restricted even under normal repository work. If an essential download fails for network/sandbox reasons, use the execution tool's approval flow rather than implementing a workaround.
+
 ## How `main.py` Fits Together
 
 The file is intentionally monolithic and tightly coupled. Changes to a LUT or attention path normally affect several surfaces:
