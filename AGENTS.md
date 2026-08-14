@@ -1,54 +1,219 @@
 # AGENTS.md
 
-Read this before changing the repo. Keep future edits small and validate with a smoke run when possible.
+Read this before changing this directory, especially `main.py`. This is research code: preserve experiment provenance and prefer small, testable changes over broad cleanup.
 
-## What This Repo Is
+## Repository Purpose and Current State
 
-This is a NumPy/Numba research codebase for a lookup-table language model, based on the SNN/LUT transformer idea. The active implementation is `main.py`; it trains either next-token prediction or a part-of-speech prediction task. The repo also contains a fork/copy of `nanoGPT_POS/` used as a transformer POS baseline.
+This is a NumPy/Numba lookup-table (LUT) language model derived from the SNN/LUT transformer idea. `main.py` is the active implementation and supports next-token language modeling and part-of-speech (POS) prediction. `nanoGPT_POS/` is the transformer POS baseline.
 
-Most current experiments are POS tagging on WikiText-style data with a word tokenizer. POS mode uses word IDs as inputs and predicts 18 universal POS labels as outputs.
+The active branch is ahead of `main` by a long experiment series. The progression was roughly:
 
-## Important Files
+1. Vectorize and Numba-compile LUT forward/backward paths.
+2. Add soft attention, pre-norm LayerNorm, dropout, batching, and sparse gradient replay.
+3. Add word tokenization, POS caching/inference/accuracy, W&B, save/load, and multi-seed scripts.
+4. Instrument which LUT rows, coordinates, and row indices (`j`) are updated.
+5. Introduce the current Q/K/V/Final new-attention mechanism and its backward/replay paths.
+6. Run positional encoding, comparison-layout, QK normalization, Final sharing, MHA, and LR-schedule experiments.
+7. Add the committed `--comparisons-per-bit` XOR aggregation architecture (commit `adce4de`).
 
-- `main.py`: main model, training loop, CLI, save/load, validation, W&B logging, LUT update stats.
-- `word_tokenizer.py`: word vocabulary/tokenization and POS label helpers.
-- `run_files/run_POS_one.sh`: current single-run SLURM template for large new-attention POS experiments.
-- `run_files/run_POS_multiseed_new_attn.sh`: launches seeds 42-45 across SLURM tasks for new-attention POS.
-- `run_files/run_GPT_POS.sh`: nanoGPT/POS baseline script name is historical; inspect before trusting.
-- `analyze_lut_model_tables.py`, `analyze_lut_hot_rows.py`, `compare_lut_table_stats.py`, `plot_lut_update_histograms.py`: post-hoc analysis for saved LUTs and row-update coverage.
-- `results/`: experiment outputs; configs are useful provenance. Do not treat as source code.
-- `saved_models/`, `out/`: checkpoints. Some `out/` and `nanoGPT_POS/` files are untracked in Git.
+Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, overwrite, or silently reformat it.
 
-## Main Architecture Decisions
+## Start Here
 
-- LUTs are represented by `LUT.S`, `a_arr`, `b_arr`, `bitmasks`, and `trees`. `S` rows are updated directly during backprop/replay.
-- There are three attention modes:
-  - default old hard attention: one `V` LUT indexed by query/key/position bits.
-  - `--soft-attention`: decomposed `Score` and `Value` LUTs with softmax weighting.
-  - `--new-attention`: separate `Q`, `K`, `V`, and `Final` LUTs. Q/K use `--attn_qk_dim`, `--attn_qk_n_c`, and `--attn_qk_n_t`; `Final` combines value rows with QK+positional bits.
-- POS task intentionally disables `--factored-output`; it uses `StandardOutputHead` with `vocab_size_output = len(POS_LABELS)`.
-- Batch size > 1 uses `BatchElement` scratch models and `SparseGradAccumulator`; gradients are replayed as averaged sparse LUT updates in `apply_averaged_gradients`.
-- Numba kernels are the fast path for `float32` LUT tables. `--fp16` can save memory but may fall back to slower Python/NumPy paths in places.
-- `--layernorm` is pre-norm before attention and FFN. `--dropout` applies to residual deltas during training only.
+- `main.py`: model structures, LUT construction/indexing, Numba kernels, forward/backward, batching/replay, CLI, training, validation, checkpointing, update statistics, and W&B.
+- `word_tokenizer.py`: word vocabulary, tokenization, universal POS labels, spaCy alignment, and cached POS encoding.
+- `run_files/run_POS_one.sh`: newest single-run template; uses new MHA, scheduler control, frozen PE, direct-sign QKPE, and the legacy-equivalent `--comparisons-per-bit 1`. Its `--weight-sharing` line is currently commented out.
+- `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
+- `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
+- `run_files/run_POS_one_PE_only.sh`: PE-only ablation.
+- `run_files/run_POS_one_multi_ckpt.sh`: multiple-checkpoint experiment; see caveat below.
+- `run_files/run_POS_load_smoke.sh` and `run_files/run_POS_one_load_ckpt.sh`: checkpoint-load checks/templates; inspect paths before running.
+- `run_files/run_nanoGPT_POS.sh`: PyTorch baseline. Inspect its working-directory assumptions before copying paths.
+- `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
+- `loss.csv`: `step, loss, perplexity, accuracy`.
 
-## Recent Work / Experiment Context
+## How `main.py` Fits Together
 
-- New attention was added in stages: forward path, backward path, update-stats integration, and model-size accounting fixes. When changing attention, keep all four surfaces aligned: build/save/load, forward, backward, and batched replay.
-- LUT update statistics were added to understand whether tables actually receive broad row coverage. `--lut-update-stats-file path.npz` also writes summary and histogram CSVs.
-- Recent large POS experiments use `--new-attention`, `--POS-task`, 6 layers, 4 heads, `n_t=64`, `n_c=6`, context 32, dropout 0.2, word vocab from `nanoGPT_POS/data/wiki2/vocab_file_10_freq.txt`, and cached POS data in `nanoGPT_POS/.pos_cache`.
-- A recent single-seed run at `results/POS_new_attn/20260629-231508` reached about validation loss `0.398`, perplexity `1.49`, and accuracy `0.869` at step 99,000. This is a useful sanity target, not a guaranteed benchmark.
-- Multi-seed new-attention scripts currently vary seeds 42-45 and often use positional/QK dimensions around 5 in the script; check `config.txt` inside each result directory for exact executed flags.
+The file is intentionally monolithic and tightly coupled. Changes to a LUT or attention path normally affect several surfaces:
 
-## How To Run Safely
+- Argument normalization and validation: `configure_new_mha`, `configure_lut_comparison_mode`, `configure_weight_sharing`, and `configure_cpu_parallelism`.
+- Structures and scratch state: `LUT`, `AttentionHead`, `NewAttentionHead`, `Model`, `BatchElement`, and `SparseGradAccumulator`.
+- Construction and topology: `build_LUT_custom`, `build_Model`, and `_share_lut`.
+- Index caching: `cache_index_batch`, PE/QKPE caches, Python fallbacks, and Numba equivalents.
+- Forward/backward: old attention, soft attention, new attention, FFN/output heads, layer norm, and MHA O LUT.
+- Batch size 1 versus `--batch-size > 1`: direct updates versus sparse-gradient collection and `apply_averaged_gradients` replay.
+- State/reporting: `save_model`, `load_model`, model stats, hyperparameter printing, W&B config, LUT stats, and analysis scripts.
 
-Use the repo virtualenv when available:
+Never update only the fast Numba path. Keep the NumPy/Python fallback semantically identical; `--fp16` and environments without Numba may use it.
+
+### LUT representation
+
+Each `LUT` holds `S`, `a_arr`, `b_arr`, `bitmasks`, `trees`, and `comparisons_per_bit`.
+
+- `S` is `(physical_trees, 2**total_n_c, y_dim)`.
+- `a_arr,b_arr` are flattened raw pairs in bit-major order: `(logical_trees, n_c * comparisons_per_bit)`.
+- Each learned bit is the XOR parity of its consecutive raw pairs; backward chooses the raw pair with the smallest absolute margin, then flips its aggregate bit.
+- `trees` maps logical comparator slots to physical `S` trees; this is how Final sharing works.
+- `n_c` is the number of learned/data-dependent row bits. Tables that add positional bits use a larger `total_n_c`; Final uses `n_c + positional_dim`. Memory is exponential in this total.
+
+### Attention modes
+
+- Default hard attention: historical `AttentionHead.V`, indexed with input-comparison and positional bits.
+- `--soft-attention`: decomposed `Score` and `Value` LUTs with softmax weights. This is distinct from new attention.
+- `--new-attention`: each head has `Q`, `K`, `V`, and `Final`. Q/K produce `attn_qk_dim` vectors; Final indexes both the V side and Q+K+PE side.
+- `--new-MHA`: implies new attention. Each head emits `embedding_dim / num_heads`; outputs are concatenated and a layer-level `MHA_O` LUT maps them back to `embedding_dim`.
+
+New-attention causal pairs only use `j < i`; position zero has no attention contribution.
+
+### Batch and CPU behavior
+
+- Batch size 1 mutates `S` directly in backward.
+- Batch size greater than 1 uses `BatchElement` scratch models sharing weights, accumulates sparse gradients, and replays their average.
+- `--cpu-cores` is the budget. Zero-valued worker flags derive values from it.
+- `--num-workers` parallelizes batch elements; `--replay-workers` parallelizes sparse replay; `--numba-threads` is per worker/kernel.
+- `--head-workers` only parallelizes new-MHA heads for batch size 1. Values above 1 require `--new-MHA` and are rejected with batched training.
+- Cluster scripts also set BLAS/OpenMP/Numba thread variables. Avoid oversubscription.
+
+## Flag and Configuration Reference
+
+The parser in `main.py` is authoritative. These are the interactions agents most often need.
+
+### Data and task
+
+- `training_data`, `--validation-data`: training and validation input.
+- `--tokenizer word`, `--vocab-file`: standard setup for current POS experiments.
+- `--POS-task` / `--pos-task`: predicts 18 universal POS labels. Requires word tokenization and rejects `--factored-output`.
+- `--pos-cache-dir`: cache for spaCy-derived aligned labels. Current WikiText runs use `nanoGPT_POS/.pos_cache`.
+- `<unk>` word IDs still receive POS targets derived from original text; do not break tokenizer/spaCy alignment.
+
+### Shape and LUT capacity
+
+- `--context-size`, `--embedding-dim`, `--num-layers`, `--num-heads`: main model shape.
+- `--n-t`, `--n-c`: logical trees and learned row bits for normal LUTs.
+- `--attn_qk_dim`, `--attn_qk_n_c`, `--attn_qk_n_t`: new-attention Q/K width, bits, and tree count.
+- `--fp16`: float16 `S` tables; saves memory but may select slower fallbacks and changes numerics.
+- `--factored-output`: base-256 output split for large LM vocabularies; incompatible with POS.
+
+### Comparison construction
+
+- `--lut-comparison-mode random`: independently sampled distinct `a,b` pairs; default and common in recent full runs.
+- `no-overlap`: deterministic disjoint coordinate groups. It overrides `n_t` and `attn_qk_n_t` with the number of possible groups.
+- `overlap`: starts with disjoint groups and adds deterministic mixed groups to the requested tree count.
+- `--comparisons-per-bit K`: XOR aggregation for learned LUT bits. A learned bit is the parity of `K` random comparisons. Thus `a_arr/b_arr` have `n_c*K` raw comparisons while `S` retains `2**n_c` learned bins. `K>=1`; `K>1` requires random mode. Backward selects the closest raw comparison and flips its logical bit using `r_min // K`. `K=1` is exactly legacy-compatible for seeded pair generation, indexing, input gradients, and `S` updates.
+
+The QKPE side has separate direct/fixed logic and is not multiplied by `--comparisons-per-bit`; aggregation applies to learned LUT comparison construction, including Final's V side.
+
+### New-attention and PE ablations
+
+- `--new-attention`: enables Q/K/V/Final attention.
+- `--PE-only`: requires new attention; Q/K contributions are zeroed for a PE+V+Final ablation.
+- `--freeze-PE`: skips positional-encoding gradient updates after initialization/load.
+- `--PE-init-scale S`: nonnegative scale used for frozen new-attention PE magnitudes.
+- `--qkpe-direct-sign`: requires new attention and `positional_dim <= attn_qk_dim`; bit `c` uses `qkpe[c] > 0` instead of an `a,b` comparison.
+- `--normalize-qk`: requires new attention; normalizes Q+K per pair before adding raw PE. Target std is `PE_init_scale/sqrt(3)` for frozen PE, otherwise `1/sqrt(3)`.
+- `--qk-norm-eps`: positive variance epsilon. Normalization needs at least two relevant QK dimensions.
+
+### New MHA and Final sharing
+
+- `--new-MHA` / `--new-mha`: implies new attention, rejects soft attention, and requires `embedding_dim % num_heads == 0`.
+- Head/V/Final output width is `mha_head_dim = embedding_dim // num_heads`; commit `b05d064` fixed these value dimensions. Preserve them in scratch state, kernels, save/load, and stats.
+- `--weight-sharing N`: new attention only. Shares physical `Final.S` trees, not Q/K/V, FFN, output, or MHA O. It requires `1 <= N <= n_t` and divisibility. There are still `n_t` logical comparator slots; `trees` repeats `N` physical IDs, making `final_n_t=N` and `final_share_m=n_t/N`.
+- Checkpoint shapes depend on architecture, dimensions, sharing, bits, and comparison aggregation. Load with the same structural command.
+
+### Optimization and regularization
+
+- `--warmup-steps`: positive linear warmup length.
+- `--max-learning-rate`: positive peak LR. Default is the legacy-compatible `1/sqrt(4001)`.
+- `--lr-scheduler inverse-sqrt`: `max_lr * (warmup_steps/step)**inverse_sqrt_alpha` after warmup.
+- `--inverse-sqrt-alpha`: nonnegative, default 0.5; one experiment used 0.32.
+- `--lr-scheduler cosine`: cosine decay across remaining `max_steps`.
+- `--cosine-min-lr-ratio`: final/max LR ratio in `[0,1]`, default 0.01.
+- `--layernorm`: pre-norm before attention and FFN.
+- `--dropout`: residual-delta dropout during training only.
+- `--seed`: seeds Python and NumPy before model/data construction; always set it for comparisons.
+
+### Validation, checkpoints, statistics, and W&B
+
+- `--testing-length`: validation snippets per evaluation.
+- `--validation-interval`: also controls periodic model saves and base-stat refreshes.
+- `--loss-file`: overwritten at startup; give every run a unique path.
+- `--save-model`: NumPy adds `.npz` if omitted; saves periodically and at the end.
+- `--load-model`: weights only. It does not resume step, LR schedule, RNG, or loss logging.
+- `--save-multiple-checkpoints`: saves step 0 and step-tagged validations. Its introducing commit says “not sure it works”; verify outputs before relying on resume/analysis semantics.
+- `--lut-update-stats-file X.npz`: also emits `X_summary.csv`, `X_histogram.csv`, coordinate NPZ/summary, and `j` NPZ/summary/top CSVs.
+- `--lut-update-stats-snapshot-steps 1000,10000,...`: positive 1-based cumulative snapshots; steps beyond `max_steps` never fire.
+- `--wandb` plus project/entity/name/group/tags/mode/log interval: logs serializable args, train/validation metrics, and LR. Keep names aligned with the actual command.
+
+## Experiment Ledger
+
+This describes what commits and saved `config.txt` files show was attempted. It does not infer conclusions from run names alone; use loss files, stdout, W&B, and generated analyses for outcomes.
+
+### Baselines and POS pipeline
+
+- The branch inherited old hard attention, soft attention, LayerNorm/dropout, fp16, factored output, and batch parallelism.
+- POS work added word inputs, spaCy universal-POS targets, cache reuse, correct `<unk>` alignment, inference, accuracy, and a token-majority baseline.
+- `results/POS/` contains old-attention single- and multi-seed runs. Multi-seed scripts use seeds 42-45.
+- `run_nanoGPT_POS.sh`, `infer_gpt_pos.py`, and `pos_majority_baseline.py` provide transformer and empirical baselines.
+
+### New attention
+
+- Commits `7433e31`, `1775307`, and `6fd1cc0` progressed from initial forward work to separated Q/K/V/Final and complete backward/replay support.
+- Follow-ups integrated new tables into model-size reporting and update stats.
+- Common full POS shape: context 32, embedding 64, 6 layers, 4 heads, `n_t=64`, `n_c=6`, positional/QK dim 5, dropout 0.2, seed 42. Runs also varied 10 layers, 4/8/16 heads, and `n_t` 16/32/64/128.
+- `results/POS_new_attn/20260629-231508` is a historical sanity reference: existing notes record validation loss about 0.398, perplexity 1.49, and accuracy 0.869 near step 99,000. It is not a guaranteed benchmark.
+
+### Update coverage and row behavior
+
+- `20260802-...stats...` runs varied `n_t` 16/32/64, random/overlap/no-overlap comparisons, direct-sign QKPE, PE-only, frozen PE, and frozen PE+PE-only.
+- Instrumentation grew from row counts/histograms to `j` distributions, cumulative snapshots, per-coordinate counts, and KL divergence from uniform.
+- Multiple-checkpoint work supports comparing initial/intermediate/final `S` rows.
+
+### PE and QK variants
+
+- Direct-sign QKPE, deterministic overlap/no-overlap layouts, PE-only, frozen PE, and sign-pattern PE initialization were tested.
+- QK normalization was run at least in `results/POS_new_attn/20260806-102506`. Do not trust later run names that say “norm”; confirm `--normalize-qk` in `config.txt`.
+
+### Final sharing, MHA, schedules, and XOR aggregation
+
+- Final sharing was tried with `n_t=64, weight-sharing=8` and `n_t=128, weight-sharing=16`; later MHA runs use sharing 8 or 16.
+- New MHA runs cover 4, 8, and 16 heads, usually with frozen PE, direct-sign QKPE, random comparisons, and Final sharing.
+- Scheduler experiments varied warmup 1000/2000, cosine versus inverse sqrt, peak LR (notably 0.01), and inverse-sqrt exponent 0.32 versus 0.5.
+- Later runs varied `n_c`/`attn_qk_n_c` through 6, 7, 8, and 9. Some W&B names say `WS_16` while the command says `--weight-sharing 8`; trust `config.txt`.
+- XOR aggregation was implemented in `adce4de`. The focused comparison suite verifies exact legacy behavior at `--comparisons-per-bit 1`, while fan-in 2 smoke runs cover old hard, soft, and new attention.
+
+## Analysis and Inference Tools
+
+- `plot_lut_update_histograms.py STATS`: plots row counts and discovers matching `j`/coordinate stats and snapshots.
+- `analyze_lut_hot_rows.py STATS`: reports frequently updated rows and decoded row structure.
+- `compare_lut_table_stats.py RUN_A RUN_B`: compares coverage summaries.
+- `compare_lut_checkpoint_rows.py CKPT...`: compares changed rows across first-last, first-all, or consecutive checkpoints.
+- `analyze_lut_model_tables.py MODEL.npz`: learned-table distributions and similarity.
+- `analyze_multiseed_metrics.py RUN_DIR`: aggregates seed loss CSVs.
+- `infer_lut_pos.py RUN_DIR --once 'text'` or `--infer-ambiguate`: LUT POS inference.
+- `infer_gpt_pos.py CHECKPOINT_DIR`: baseline inference.
+- `pos_majority_baseline.py`: empirical majority-POS baseline.
+- `comp_txt_pos.py`: binary-token/POS-cache alignment check.
+
+Compatibility warning: `infer_lut_pos.py` has its own reduced parser and currently lacks newer structural flags including `--new-MHA`, `--weight-sharing`, frozen/normalized PE, and `--comparisons-per-bit`. It cannot correctly reconstruct checkpoints using those flags until updated. Add every new structural flag to inference reconstruction.
+
+## Running Experiments Safely
 
 ```bash
 cd /cs/labs/roys/yuval.rubin/LUT/LUT
 source .venv/bin/activate
 ```
 
-Small POS smoke run:
+Run scripts should create timestamped directories, redirect temp/W&B state there, save the exact shell-escaped command in `config.txt`, and link SLURM output. Preserve old configs as provenance; copy a script for a new experiment.
+
+Before a long run:
+
+1. Align directory, W&B name/tags, resource count, and actual flags.
+2. Run parser/tests and a tiny smoke first.
+3. Use unique loss/model/stats paths.
+4. Check printed normalized hyperparameters; no-overlap rewrites counts and new MHA derives dimensions/workers.
+5. Confirm the first validation/checkpoint/stat output before scaling.
+
+Minimal POS/new-attention smoke:
 
 ```bash
 python main.py nanoGPT_POS/data/wiki2/train_original_10_freq.txt \
@@ -57,18 +222,37 @@ python main.py nanoGPT_POS/data/wiki2/train_original_10_freq.txt \
   --vocab-file nanoGPT_POS/data/wiki2/vocab_file_10_freq.txt \
   --tokenizer word --POS-task --new-attention \
   --context-size 8 --embedding-dim 16 --num-layers 1 --num-heads 1 \
-  --n-t 4 --n-c 4 --attn_qk_dim 4 --attn_qk_n_c 4 --attn_qk_n_t 4 \
-  --testing-length 5 --validation-interval 5 --max-steps 6 \
-  --loss-file /tmp/lut_smoke_loss.csv --seed 42 --cpu-cores 1
+  --n-t 2 --n-c 3 --attn_qk_dim 4 --attn_qk_n_c 3 --attn_qk_n_t 2 --comparisons-per-bit 1 \
+  --testing-length 2 --validation-interval 2 --max-steps 3 \
+  --warmup-steps 2 --loss-file /tmp/lut_pos_smoke.csv \
+  --seed 42 --cpu-cores 1
 ```
 
-For SLURM runs, prefer editing a copy of an existing `run_files/*.sh` script and make sure result paths, W&B names, and `config.txt` capture the full command.
+This needs local data/vocab, dependencies, and POS cache or spaCy model. First Numba compilation may dominate a tiny run.
 
-## Cautions For Future Agents
+## Validation Expectations
 
-- `main.py` is long but tightly coupled. Avoid broad refactors unless asked.
-- If adding/changing CLI flags, update the hyperparameter printout and W&B config behavior.
-- If changing model state, update both `save_model` and `load_model`.
-- If changing attention table indexing, also update stats collection and analysis scripts that infer LUT names.
-- Preserve existing experiment outputs and checkpoints; they are research artifacts.
-- `rg` may not be installed on the cluster; use `grep`/`find` as fallback.
+Use the smallest relevant checks first:
+
+```bash
+python -m py_compile main.py
+python test_vectorize.py
+python test_lut_update_stats.py
+python test_new_mha.py
+python test_compare_lut_checkpoint_rows.py
+python -m pytest -q test_xor_comparisons.py
+```
+
+Several are executable assertion scripts rather than pytest tests; `test_xor_comparisons.py` requires pytest. `test_prange.py` is a performance probe and can be expensive. Numerical/parallel changes should compare Numba/fallback, batch-1/replay, forward/backward/`S` updates, save/load, model stats, and seeded single-/multi-thread behavior.
+
+## Rules for Future Changes
+
+- Preserve uncommitted work and research artifacts. Never clean results, checkpoints, caches, or W&B directories unless explicitly asked.
+- Do not edit historical run configs; make a new script/config.
+- Structural flags must reach parser validation, printed/W&B config, run config, inference reconstruction, save/load compatibility, model stats, batch scratch state, and tests.
+- New LUT names must reach update stats and analysis-tool discovery.
+- Row-index changes require auditing every `jbar` flip, `r_min`, Python fallback, Numba kernel, sparse replay path, and analysis decoder.
+- Shared-tree updates must avoid races between logical slots mapped to one physical tree.
+- A checkpoint does not store a complete executable configuration; load it with matching structural flags.
+- Keep POS token/label alignment intact; never retokenize independently and guess positions.
+- The README CLI table predates many flags. Prefer `main.py --help`, this file, and saved configs.
