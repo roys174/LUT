@@ -37,6 +37,7 @@ DEFAULT_WARMUP_STEPS = 4000
 DEFAULT_MAX_LEARNING_RATE = 1.0 / math.sqrt(DEFAULT_WARMUP_STEPS + 1)
 DEFAULT_INVERSE_SQRT_ALPHA = 0.5
 DEFAULT_COSINE_MIN_LR_RATIO = 0.01
+COSINE_DISTANCE_EPS = np.float32(1e-8)
 learning_rate = 0.0
 UNK_TOKEN_ID = 0
 IGNORE_INDEX = -1
@@ -49,17 +50,22 @@ IGNORE_INDEX = -1
 def get_learning_rate(step, args):
     """Return the learning rate for a zero-based training step."""
     if step < args.warmup_steps:
-        return args.max_learning_rate * step / args.warmup_steps
+        rate = args.max_learning_rate * step / args.warmup_steps
+    elif args.lr_scheduler == 'inverse-sqrt':
+        rate = args.max_learning_rate * (args.warmup_steps / step) ** args.inverse_sqrt_alpha
+    else:  # cosine
+        decay_steps = max(1, args.max_steps - args.warmup_steps)
+        progress = min(1.0, (step - args.warmup_steps) / decay_steps)
+        min_learning_rate = args.max_learning_rate * args.cosine_min_lr_ratio
+        rate = min_learning_rate + 0.5 * (args.max_learning_rate - min_learning_rate) * (
+            1.0 + math.cos(math.pi * progress))
 
-    if args.lr_scheduler == 'inverse-sqrt':
-        return args.max_learning_rate * (args.warmup_steps / step) ** args.inverse_sqrt_alpha
-
-    # else cosine
-    decay_steps = max(1, args.max_steps - args.warmup_steps)
-    progress = min(1.0, (step - args.warmup_steps) / decay_steps)
-    min_learning_rate = args.max_learning_rate * args.cosine_min_lr_ratio
-    return min_learning_rate + 0.5 * (args.max_learning_rate - min_learning_rate) * (
-        1.0 + math.cos(math.pi * progress))
+    if getattr(args, 'halve_lr_at_20k_40k', False):
+        if step > 20_000:
+            rate *= 0.5
+        if step > 40_000:
+            rate *= 0.5
+    return rate
 
 def softmax(x, size, temperature):
     max_val = np.max(x[:size])
@@ -75,6 +81,10 @@ def random_vector(size, scale):
 def sample(probabilities, n):
     cumsum = np.cumsum(probabilities[:n])
     return min(int(np.searchsorted(cumsum, random.random())), n - 1)
+
+
+def use_cosine_distance_selection(args):
+    return getattr(args, 'gradient_pair_selection', 'closest') == 'cosine-distance'
 
 
 def configure_cpu_parallelism(args, parser):
@@ -4401,6 +4411,8 @@ def main():
                         help=f'Inverse-sqrt decay exponent after warmup (default: {DEFAULT_INVERSE_SQRT_ALPHA:g})')
     parser.add_argument('--cosine-min-lr-ratio', type=float, default=DEFAULT_COSINE_MIN_LR_RATIO,
                         help=f'Cosine final LR as a fraction of max LR (default: {DEFAULT_COSINE_MIN_LR_RATIO:g})')
+    parser.add_argument('--halve-lr-at-20k-40k', action='store_true',
+                        help='Halve the scheduled learning rate after step 20,000 and again after step 40,000')
     parser.add_argument('--validation-interval', type=int, default=10000)
     parser.add_argument('--temperature', type=float, default=0.4)
     parser.add_argument('--loss-file', type=str, default='loss.csv')
@@ -4578,6 +4590,7 @@ def main():
     print(f"  max_steps         = {args.max_steps}")
     print(f"  warmup_steps      = {args.warmup_steps}")
     print(f"  max_learning_rate = {args.max_learning_rate}")
+    print(f"  halve_lr_at_20k_40k = {args.halve_lr_at_20k_40k}")
     print(f"  lr_scheduler      = {args.lr_scheduler}")
     if args.lr_scheduler == 'cosine':
         print(f"  cosine_min_lr_ratio = {args.cosine_min_lr_ratio}")
