@@ -17,7 +17,10 @@ sys.modules.setdefault('tiktoken', TiktokenStub())
 import main as main_module
 from main import (
     LUT,
+    _attention_composite_backward_cosine,
+    _select_margin_candidate_python,
     _lut_backward_python,
+    select_lut_gradient_pairs,
     _lut_load,
     _lut_save,
     build_LUT,
@@ -170,6 +173,188 @@ def test_backward_flips_aggregate_bit_and_updates_only_closest_pair():
     assert x_grad[0, 4] == pytest.approx(expected_value)
     assert x_grad[0, 5] == pytest.approx(-expected_value)
     assert np.count_nonzero(x_grad) == 2
+
+
+def make_selector_lut():
+    lut = LUT(1)
+    lut.y_dim = 2
+    lut.S = np.zeros((1, 4, 2), dtype=np.float32)
+    lut.trees = np.array([0], dtype=np.int32)
+    lut.a_arr = np.array([[0, 2]], dtype=np.int32)
+    lut.b_arr = np.array([[1, 3]], dtype=np.int32)
+    lut.bitmasks = np.array([1, 2], dtype=np.int32)
+    lut.comparisons_per_bit = 1
+    return lut
+
+
+@pytest.mark.parametrize('use_numba', [False, True])
+def test_cosine_distance_can_choose_farther_better_aligned_pair(monkeypatch, use_numba):
+    if use_numba and not main_module.HAS_NUMBA:
+        pytest.skip('Numba is unavailable')
+    monkeypatch.setattr(main_module, 'HAS_NUMBA', use_numba)
+    lut = make_selector_lut()
+    lut.S[0, 1] = np.array([1.0, 0.0], dtype=np.float32)
+    lut.S[0, 2] = np.array([0.0, 1.0], dtype=np.float32)
+    x = np.array([[0.1, 0.0, 1.0, 0.0]], dtype=np.float32)
+    grad = np.array([[0.0, 1.0]], dtype=np.float32)
+
+    selected_r, selected_u = select_lut_gradient_pairs(
+        lut, np.array([[0]], dtype=np.int32),
+        np.array([[0]], dtype=np.int32),
+        np.array([[0.1]], dtype=np.float32),
+        grad, x, lut.y_dim,
+        SimpleNamespace(gradient_pair_selection='cosine-distance'))
+
+    np.testing.assert_array_equal(selected_r, np.array([[1]], dtype=np.int32))
+    np.testing.assert_array_equal(selected_u, np.array([[1.0]], dtype=np.float32))
+
+
+def test_cosine_distance_falls_back_to_closest_without_cosine_signal():
+    lut = make_selector_lut()
+    lut.S[0, 1] = np.array([1.0, 0.0], dtype=np.float32)
+    lut.S[0, 2] = np.array([2.0, 0.0], dtype=np.float32)
+    x = np.array([[1.0, 0.0, 0.1, 0.0]], dtype=np.float32)
+    grad = np.array([[0.0, 1.0]], dtype=np.float32)
+
+    selected_r, selected_u = select_lut_gradient_pairs(
+        lut, np.array([[0]], dtype=np.int32),
+        np.array([[1]], dtype=np.int32),
+        np.array([[0.1]], dtype=np.float32),
+        grad, x, lut.y_dim,
+        SimpleNamespace(gradient_pair_selection='cosine-distance'))
+
+    assert selected_r[0, 0] == 1
+    assert selected_u[0, 0] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize('zero_kind', ['gradient', 'delta'])
+def test_cosine_distance_zero_norm_falls_back_to_closest(zero_kind):
+    lut = make_selector_lut()
+    if zero_kind == 'gradient':
+        lut.S[0, 1] = np.array([1.0, 0.0], dtype=np.float32)
+        lut.S[0, 2] = np.array([0.0, 1.0], dtype=np.float32)
+        grad = np.zeros((1, 2), dtype=np.float32)
+    else:
+        grad = np.array([[0.0, 1.0]], dtype=np.float32)
+    x = np.array([[1.0, 0.0, 0.1, 0.0]], dtype=np.float32)
+
+    selected_r, selected_u = select_lut_gradient_pairs(
+        lut, np.array([[0]], dtype=np.int32),
+        np.array([[1]], dtype=np.int32),
+        np.array([[0.1]], dtype=np.float32),
+        grad, x, lut.y_dim,
+        SimpleNamespace(gradient_pair_selection='cosine-distance'))
+
+    assert selected_r[0, 0] == 1
+    assert selected_u[0, 0] == pytest.approx(0.1)
+
+
+def test_cosine_distance_fp16_uses_equivalent_python_selector(monkeypatch):
+    monkeypatch.setattr(main_module, 'HAS_NUMBA', True)
+    lut = make_selector_lut()
+    lut.S = lut.S.astype(np.float16)
+    lut.S[0, 1] = np.array([1.0, 0.0], dtype=np.float16)
+    lut.S[0, 2] = np.array([0.0, 1.0], dtype=np.float16)
+    x = np.array([[0.1, 0.0, 1.0, 0.0]], dtype=np.float32)
+    grad = np.array([[0.0, 1.0]], dtype=np.float32)
+
+    selected_r, selected_u = select_lut_gradient_pairs(
+        lut, np.array([[0]], dtype=np.int32),
+        np.array([[0]], dtype=np.int32),
+        np.array([[0.1]], dtype=np.float32),
+        grad, x, lut.y_dim,
+        SimpleNamespace(gradient_pair_selection='cosine-distance'))
+
+    assert selected_r[0, 0] == 1
+    assert selected_u[0, 0] == pytest.approx(1.0)
+
+
+def test_cosine_distance_tie_breaks_by_index_and_preserves_signed_dot():
+    S = np.zeros((1, 4, 2), dtype=np.float32)
+    S[0, 1] = np.array([0.0, 1.0], dtype=np.float32)
+    S[0, 2] = np.array([0.0, -1.0], dtype=np.float32)
+    margins = np.array([0.5, 0.5], dtype=np.float32)
+    bits = np.array([0, 1], dtype=np.int32)
+
+    winner, _, _, gi = _select_margin_candidate_python(
+        S, 0, 0, np.array([0.0, 1.0], dtype=np.float32),
+        margins, bits, 1)
+    assert winner == 0
+    assert gi == pytest.approx(1.0)
+
+    winner, _, _, gi = _select_margin_candidate_python(
+        S, 0, 0, np.array([0.0, -1.0], dtype=np.float32),
+        margins, bits, 1)
+    assert winner == 0
+    assert gi == pytest.approx(-1.0)
+
+
+def test_cosine_distance_xor_candidate_flips_aggregate_bit():
+    S = np.zeros((1, 4, 2), dtype=np.float32)
+    S[0, 1] = np.array([1.0, 0.0], dtype=np.float32)
+    S[0, 2] = np.array([0.0, 1.0], dtype=np.float32)
+    margins = np.array([0.1, 0.2, 0.7, 0.5], dtype=np.float32)
+    bits = np.arange(4, dtype=np.int32) // 2
+
+    winner, _, jbar, _ = _select_margin_candidate_python(
+        S, 0, 0, np.array([0.0, 1.0], dtype=np.float32),
+        margins, bits, 0)
+
+    assert winner == 3
+    assert jbar == 2
+
+
+def test_attention_cosine_selector_pools_qk_and_preserves_pe_gate():
+    lut = LUT(1)
+    lut.y_dim = 2
+    lut.S = np.zeros((1, 8, 2), dtype=np.float32)
+    lut.trees = np.array([0], dtype=np.int32)
+    lut.a_arr = np.array([[0]], dtype=np.int32)
+    lut.b_arr = np.array([[1]], dtype=np.int32)
+    lut.bitmasks = np.array([1], dtype=np.int32)
+    lut.comparisons_per_bit = 1
+    # Q flips bit 2 and is orthogonal; K flips bit 1 and is aligned.
+    lut.S[0, 4] = np.array([1.0, 0.0], dtype=np.float32)
+    lut.S[0, 2] = np.array([0.0, 1.0], dtype=np.float32)
+    # PE flips bit 0 and is eligible under the legacy closest-margin gate.
+    lut.S[0, 1] = np.array([0.0, 2.0], dtype=np.float32)
+
+    args = SimpleNamespace(
+        context_size=2, n_t=1, positional_dim=1, shift_qk=2)
+    input_values = np.array([
+        [1.0, 0.0],
+        [0.1, 0.0],
+    ], dtype=np.float32)
+    j_v = np.zeros((2, 1), dtype=np.int32)
+    r_v = np.zeros((2, 1), dtype=np.int32)
+    u_v = np.array([[1.0], [0.1]], dtype=np.float32)
+    j_pe = np.zeros((2, 1), dtype=np.int32)
+    r_pe = np.zeros((2, 1), dtype=np.int32)
+    u_pe = np.array([[0.0], [0.05]], dtype=np.float32)
+    PE = np.zeros((2, 1, 1), dtype=np.float32)
+    PE[1, 0, 0] = 0.05
+    pair_grads = np.zeros((2, 2, 2), dtype=np.float32)
+    pair_grads[1, 0] = np.array([0.0, 1.0], dtype=np.float32)
+    x_grad = np.zeros_like(input_values)
+    pe_grad = np.zeros_like(PE)
+
+    old_lr = main_module.learning_rate
+    main_module.learning_rate = 0.0
+    try:
+        _attention_composite_backward_cosine(
+            lut, input_values, j_v, r_v, u_v,
+            j_pe, r_pe, u_pe, PE, pair_grads,
+            x_grad, pe_grad, args,
+            skip_s_update=True, freeze_pe=False)
+    finally:
+        main_module.learning_rate = old_lr
+
+    # The farther K comparison wins on cosine fit; Q remains untouched.
+    assert np.any(x_grad[0] != 0.0)
+    np.testing.assert_array_equal(x_grad[1], np.zeros(2, dtype=np.float32))
+    # PE remains an independent branch and is updated because its cached
+    # closest margin passes the original PE-vs-Q/K eligibility gate.
+    assert pe_grad[1, 0, 0] != 0.0
 
 
 @pytest.mark.parametrize('value', [0, -1])

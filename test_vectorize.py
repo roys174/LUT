@@ -1238,6 +1238,54 @@ class TestQKPEDirectSign:
         np.testing.assert_array_equal(pe_grad[:, 2], np.zeros(args.context_size, dtype=np.float32))
 
 
+    def test_cosine_distance_selects_final_v_and_qkpe_independently(self):
+        args = make_qkpe_direct_model_args(pe_only=True)
+        args.n_c = 2
+        args.shift_qk = args.n_c + args.positional_dim
+        args.gradient_pair_selection = 'cosine-distance'
+        model = Model(args)
+        build_Model(model, args)
+        head = model.head[0][0]
+
+        head.Final.a_arr[:] = np.array([[0, 1]], dtype=np.int32)
+        head.Final.b_arr[:] = np.array([[2, 2]], dtype=np.int32)
+        head._v_embed.fill(0.0)
+        head._v_embed[0] = np.array([0.1, 1.0, 0.0], dtype=np.float32)
+        head._final_v_j.fill(0)
+        head._final_v_j[0, 0] = 3
+        head._final_v_r_min.fill(0)
+        head._final_v_u_min.fill(0.1)
+
+        head.Positional_encoding.fill(0.0)
+        head.Positional_encoding[1] = np.array([0.1, 1.0, 0.0], dtype=np.float32)
+        head._qkpe_j.fill(0)
+        head._qkpe_j[0, 0] = 3
+        head._qkpe_r_min.fill(0)
+        head._qkpe_u_min.fill(0.1)
+
+        j_bin = 15
+        head.Final.S.fill(0.0)
+        head.Final.S[0, j_bin ^ (1 << 2)] = np.array([1.0, 0.0, 0.0])
+        head.Final.S[0, j_bin ^ (1 << 3)] = np.array([0.0, 1.0, 0.0])
+        head.Final.S[0, j_bin ^ (1 << 0)] = np.array([1.0, 0.0, 0.0])
+        head.Final.S[0, j_bin ^ (1 << 1)] = np.array([0.0, 1.0, 0.0])
+
+        x = np.zeros((args.context_size, args.embedding_dim), dtype=np.float32)
+        x_grad = np.zeros_like(x)
+        y_grad = np.zeros_like(x)
+        y_grad[1, 1] = 1.0
+        v_grad = np.zeros_like(x)
+        pe_grad = np.zeros_like(x)
+        new_attention_backward(
+            head, x_grad, y_grad, args, skip_s_update=True,
+            v_grad_out=v_grad, pe_grad_out=pe_grad, input_values=x)
+
+        assert v_grad[0, 1] != 0.0
+        assert v_grad[0, 0] == 0.0
+        assert pe_grad[1, 1] != 0.0
+        assert pe_grad[1, 0] == 0.0
+
+
 class TestQKPENormalization:
     def test_normalize_vector_matches_target_stats_and_backward_finite_diff(self):
         vec = np.array([0.8, -1.2, 0.3, 2.0], dtype=np.float32)

@@ -926,20 +926,24 @@ class StandardOutputHead:
             self.output[:] = 0.0
             self.output[:, :lut.y_dim] += _f32(lut.S[lut.trees, self._j]).sum(axis=1)
 
-    def backward(self, x_grad, args, skip_s_update=False, update_stats=None, stats_name='output'):
+    def backward(self, x_grad, args, skip_s_update=False, update_stats=None,
+                 stats_name='output', input_values=None):
         global learning_rate
         lut = self.unembedder
         if update_stats is not None and not skip_s_update:
             update_stats.record_simple(stats_name, lut, self._j)
             update_stats.record_simple_coords(stats_name, lut, self.output)
+        selected_r, selected_u = select_lut_gradient_pairs(
+            lut, self._j, self._r_min, self._u_min, self.output,
+            input_values, lut.y_dim, args)
         if HAS_NUMBA and lut.S.dtype == np.float32:
             if skip_s_update:
-                _lut_backward_kernel_noupdate(lut.S, lut.trees, self._j, self._r_min, self._u_min,
+                _lut_backward_kernel_noupdate(lut.S, lut.trees, self._j, selected_r, selected_u,
                                               self.output, x_grad, lut.a_arr, lut.b_arr,
                                               lut.y_dim, args.context_size, args.n_t,
                                               lut.comparisons_per_bit)
             else:
-                _lut_backward_kernel(lut.S, lut.trees, self._j, self._r_min, self._u_min,
+                _lut_backward_kernel(lut.S, lut.trees, self._j, selected_r, selected_u,
                                       self.output, x_grad, lut.a_arr, lut.b_arr,
                                       lut.y_dim, args.context_size, args.n_t,
                                       lut.comparisons_per_bit,
@@ -948,15 +952,16 @@ class StandardOutputHead:
             trees = lut.trees
             for pos in range(args.context_size):
                 j_bins = self._j[pos]
-                jbar_bins = j_bins ^ (1 << (self._r_min[pos] // lut.comparisons_per_bit))
+                jbar_bins = j_bins ^ (1 << (selected_r[pos] // lut.comparisons_per_bit))
                 S_j = _f32(lut.S[trees, j_bins])
                 S_jbar = _f32(lut.S[trees, jbar_bins])
                 gi = ((S_jbar - S_j) * self.output[pos, :lut.y_dim]).sum(axis=1)
-                sign_u = np.where(self._u_min[pos] > 0, 1.0, -1.0)
-                v = gi * (-0.5 * sign_u / (1 + np.abs(self._u_min[pos]))**2)
+                sign_u = np.where(selected_u[pos] > 0, 1.0, -1.0)
+                v = gi * (-0.5 * sign_u / (1 + np.abs(selected_u[pos]))**2)
                 n = x_grad.shape[1]
-                idx_a = lut.a_arr[trees, self._r_min[pos]]
-                idx_b = lut.b_arr[trees, self._r_min[pos]]
+                logical_trees = np.arange(args.n_t)
+                idx_a = lut.a_arr[logical_trees, selected_r[pos]]
+                idx_b = lut.b_arr[logical_trees, selected_r[pos]]
                 x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
                 x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
                 if not skip_s_update:
@@ -1091,7 +1096,8 @@ class FactoredOutputHead:
             self.output_hi[:, :self.unembedder_hi.y_dim] += _f32(self.unembedder_hi.S[self.unembedder_hi.trees, self._hi_j]).sum(axis=1)
             self.output_lo[:, :self.unembedder_lo.y_dim] += _f32(self.unembedder_lo.S[self.unembedder_lo.trees, self._lo_j]).sum(axis=1)
 
-    def backward(self, x_grad, args, skip_s_update=False, update_stats=None, stats_prefix='output'):
+    def backward(self, x_grad, args, skip_s_update=False, update_stats=None,
+                 stats_prefix='output', input_values=None):
         global learning_rate
         for stats_suffix, lut, j, r_min, u_min, output in [
             ('hi', self.unembedder_hi, self._hi_j, self._hi_r_min, self._hi_u_min, self.output_hi),
@@ -1100,14 +1106,16 @@ class FactoredOutputHead:
             if update_stats is not None and not skip_s_update:
                 update_stats.record_simple(f'{stats_prefix}_{stats_suffix}', lut, j)
                 update_stats.record_simple_coords(f'{stats_prefix}_{stats_suffix}', lut, output)
+            selected_r, selected_u = select_lut_gradient_pairs(
+                lut, j, r_min, u_min, output, input_values, lut.y_dim, args)
             if HAS_NUMBA and lut.S.dtype == np.float32:
                 if skip_s_update:
-                    _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
+                    _lut_backward_kernel_noupdate(lut.S, lut.trees, j, selected_r, selected_u,
                                                   output, x_grad, lut.a_arr, lut.b_arr,
                                                   lut.y_dim, args.context_size, args.n_t,
                                                   lut.comparisons_per_bit)
                 else:
-                    _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
+                    _lut_backward_kernel(lut.S, lut.trees, j, selected_r, selected_u,
                                           output, x_grad, lut.a_arr, lut.b_arr,
                                           lut.y_dim, args.context_size, args.n_t,
                                           lut.comparisons_per_bit,
@@ -1116,15 +1124,16 @@ class FactoredOutputHead:
                 trees = lut.trees
                 for pos in range(args.context_size):
                     j_bins = j[pos]
-                    jbar_bins = j_bins ^ (1 << (r_min[pos] // lut.comparisons_per_bit))
+                    jbar_bins = j_bins ^ (1 << (selected_r[pos] // lut.comparisons_per_bit))
                     S_j = _f32(lut.S[trees, j_bins])
                     S_jbar = _f32(lut.S[trees, jbar_bins])
                     gi = ((S_jbar - S_j) * output[pos, :lut.y_dim]).sum(axis=1)
-                    sign_u = np.where(u_min[pos] > 0, 1.0, -1.0)
-                    v = gi * (-0.5 * sign_u / (1 + np.abs(u_min[pos]))**2)
+                    sign_u = np.where(selected_u[pos] > 0, 1.0, -1.0)
+                    v = gi * (-0.5 * sign_u / (1 + np.abs(selected_u[pos]))**2)
                     n = x_grad.shape[1]
-                    idx_a = lut.a_arr[trees, r_min[pos]]
-                    idx_b = lut.b_arr[trees, r_min[pos]]
+                    logical_trees = np.arange(args.n_t)
+                    idx_a = lut.a_arr[logical_trees, selected_r[pos]]
+                    idx_b = lut.b_arr[logical_trees, selected_r[pos]]
                     x_grad[pos] += np.bincount(idx_a, weights=v, minlength=n)
                     x_grad[pos] -= np.bincount(idx_b, weights=v, minlength=n)
                     if not skip_s_update:
@@ -1181,7 +1190,8 @@ class FactoredOutputHead:
 
 
 class Model:
-    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
+    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf',
+                 '_attn_inputs', '_ffn_inputs', 'FFN',
                  '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
                  'MHA_O', '_mha_concat', '_mha_o_j', '_mha_o_r_min',
                  '_mha_o_u_min', '_mha_o_grad',
@@ -1202,6 +1212,11 @@ class Model:
         self.tokens = np.zeros(CS + 1, dtype=np.int32)
         self.z = np.zeros((CS, EMBEDDING_DIM), dtype=np.float32)
         self._x_buf = np.zeros_like(self.z)
+        cache_inputs = use_cosine_distance_selection(args)
+        self._attn_inputs = ([np.zeros_like(self.z) for _ in range(NUM_LAYERS)]
+                             if cache_inputs else None)
+        self._ffn_inputs = ([np.zeros_like(self.z) for _ in range(NUM_LAYERS)]
+                            if cache_inputs else None)
 
         self.FFN = [LUT(N_T) for _ in range(NUM_LAYERS)]
         self._ffn_j = [np.zeros((CS, N_T), dtype=np.int32) for _ in range(NUM_LAYERS)]
@@ -1366,7 +1381,8 @@ def _share_lut(dst, src):
 
 class BatchElement:
     """Per-sequence scratch space that duck-types as Model, sharing S tables."""
-    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf', 'FFN',
+    __slots__ = ['Token_embedder', 'tokens', 'z', '_x_buf',
+                 '_attn_inputs', '_ffn_inputs', 'FFN',
                  '_ffn_j', '_ffn_r_min', '_ffn_u_min', 'head', 'output_head',
                  'MHA_O', '_mha_concat', '_mha_o_j', '_mha_o_r_min',
                  '_mha_o_u_min', '_mha_o_grad',
@@ -1396,6 +1412,11 @@ class BatchElement:
         self.tokens = np.zeros(CS + 1, dtype=np.int32)
         self.z = np.zeros((CS, ED), dtype=np.float32)
         self._x_buf = np.zeros_like(self.z)
+        cache_inputs = use_cosine_distance_selection(args)
+        self._attn_inputs = ([np.zeros_like(self.z) for _ in range(NL)]
+                             if cache_inputs else None)
+        self._ffn_inputs = ([np.zeros_like(self.z) for _ in range(NL)]
+                            if cache_inputs else None)
         self._ffn_j = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
         self._ffn_r_min = [np.zeros((CS, NT), dtype=np.int32) for _ in range(NL)]
         self._ffn_u_min = [np.zeros((CS, NT), dtype=np.float32) for _ in range(NL)]
@@ -1547,6 +1568,33 @@ def cache_PE_index_batch(u_batch, j_out, r_min_out, u_min_out, args):
 def _f32(arr):
     """Cast to float32 if needed (no-op if already float32)."""
     return arr if arr.dtype == np.float32 else arr.astype(np.float32)
+
+
+def select_lut_gradient_pairs(lut, j, r_min, u_min, grad, input_values,
+                              y_dim, args):
+    """Return legacy or cosine-distance-selected raw comparison caches."""
+    if not use_cosine_distance_selection(args):
+        return r_min, u_min
+    if input_values is None:
+        raise ValueError('cosine-distance gradient selection requires the exact LUT input')
+
+    selected_r = np.empty_like(r_min)
+    selected_u = np.empty_like(u_min)
+    CS, N_T = j.shape
+    if (HAS_NUMBA and lut.S.dtype == np.float32
+            and input_values.dtype == np.float32 and grad.dtype == np.float32):
+        _select_lut_pairs_kernel(
+            lut.S, lut.trees, j, grad, input_values,
+            lut.a_arr, lut.b_arr, y_dim, CS, N_T,
+            lut.comparisons_per_bit, r_min, selected_r, selected_u)
+    else:
+        for pos in range(CS):
+            for t in range(N_T):
+                selected_r[pos, t], selected_u[pos, t] = _select_lut_pair_python(
+                    lut.S, int(lut.trees[t]), int(j[pos, t]), grad[pos],
+                    input_values[pos], lut.a_arr[t], lut.b_arr[t], y_dim,
+                    lut.comparisons_per_bit, int(r_min[pos, t]))
+    return selected_r, selected_u
 
 
 def _normalize_vector_to_target(vec, target_std, eps):
@@ -2312,6 +2360,134 @@ def _lut_forward_kernel(S, trees, j, output, CS, N_T, y_dim):
             acc += S[trees[t], j[pos, t], d]
         output[pos, d] = acc
 
+
+@njit(inline='always')
+def _select_lut_pair_numba(S, tree, j_bin, grad, x, a_row, b_row,
+                           y_dim, comparisons_per_bit, fallback_r):
+    """Choose one raw comparison by cosine fit times inverse margin."""
+    grad_sq = np.float32(0.0)
+    for d in range(y_dim):
+        grad_sq += grad[d] * grad[d]
+
+    best_r = np.int32(-1)
+    best_score = np.float32(-1.0)
+    best_abs_u = np.float32(1e38)
+    if grad_sq > np.float32(0.0):
+        for r in range(a_row.shape[0]):
+            jbar = j_bin ^ (1 << (r // comparisons_per_bit))
+            dot = np.float32(0.0)
+            delta_sq = np.float32(0.0)
+            for d in range(y_dim):
+                delta = np.float32(S[tree, jbar, d]) - np.float32(S[tree, j_bin, d])
+                dot += delta * grad[d]
+                delta_sq += delta * delta
+            if delta_sq == np.float32(0.0) or dot == np.float32(0.0):
+                continue
+            u = x[a_row[r]] - x[b_row[r]]
+            abs_u = abs(u)
+            cosine = abs(dot) / np.sqrt(delta_sq * grad_sq)
+            score = cosine / (abs_u + COSINE_DISTANCE_EPS)
+            if (score > best_score
+                    or (score == best_score and abs_u < best_abs_u)
+                    or (score == best_score and abs_u == best_abs_u
+                        and (best_r < 0 or r < best_r))):
+                best_r = np.int32(r)
+                best_score = score
+                best_abs_u = abs_u
+
+    if best_r < 0:
+        best_r = np.int32(fallback_r)
+    u = x[a_row[best_r]] - x[b_row[best_r]]
+    return best_r, u
+
+
+def _select_lut_pair_python(S, tree, j_bin, grad, x, a_row, b_row,
+                            y_dim, comparisons_per_bit, fallback_r):
+    """Python/fp16 equivalent of _select_lut_pair_numba."""
+    grad32 = _f32(np.asarray(grad[:y_dim]))
+    grad_sq = np.float32(np.dot(grad32, grad32))
+    best_r = -1
+    best_score = np.float32(-1.0)
+    best_abs_u = np.float32(np.inf)
+    if grad_sq > np.float32(0.0):
+        S_j = _f32(S[tree, j_bin, :y_dim])
+        for r in range(a_row.shape[0]):
+            jbar = j_bin ^ (1 << (r // comparisons_per_bit))
+            delta = _f32(S[tree, jbar, :y_dim]) - S_j
+            delta_sq = np.float32(np.dot(delta, delta))
+            dot = np.float32(np.dot(delta, grad32))
+            if delta_sq == np.float32(0.0) or dot == np.float32(0.0):
+                continue
+            u = np.float32(x[a_row[r]] - x[b_row[r]])
+            abs_u = np.float32(abs(u))
+            cosine = np.float32(abs(dot) / np.sqrt(delta_sq * grad_sq))
+            score = np.float32(cosine / (abs_u + COSINE_DISTANCE_EPS))
+            if (score > best_score
+                    or (score == best_score and abs_u < best_abs_u)
+                    or (score == best_score and abs_u == best_abs_u
+                        and (best_r < 0 or r < best_r))):
+                best_r = r
+                best_score = score
+                best_abs_u = abs_u
+    if best_r < 0:
+        best_r = int(fallback_r)
+    return best_r, np.float32(x[a_row[best_r]] - x[b_row[best_r]])
+
+
+def _select_margin_candidate_python(S, tree, j_bin, grad, margins,
+                                    flip_bits, fallback_index):
+    """Select among arbitrary row-bit candidates for composite LUT indices."""
+    grad32 = _f32(np.asarray(grad))
+    grad_sq = np.float32(np.dot(grad32, grad32))
+    best = -1
+    best_score = np.float32(-1.0)
+    best_abs_u = np.float32(np.inf)
+    if grad_sq > np.float32(0.0):
+        S_j = _f32(S[tree, j_bin, :grad32.shape[0]])
+        for candidate in range(len(margins)):
+            jbar = j_bin ^ (1 << int(flip_bits[candidate]))
+            delta = _f32(S[tree, jbar, :grad32.shape[0]]) - S_j
+            delta_sq = np.float32(np.dot(delta, delta))
+            dot = np.float32(np.dot(delta, grad32))
+            if delta_sq == np.float32(0.0) or dot == np.float32(0.0):
+                continue
+            abs_u = np.float32(abs(margins[candidate]))
+            cosine = np.float32(abs(dot) / np.sqrt(delta_sq * grad_sq))
+            score = np.float32(cosine / (abs_u + COSINE_DISTANCE_EPS))
+            if (score > best_score
+                    or (score == best_score and abs_u < best_abs_u)
+                    or (score == best_score and abs_u == best_abs_u
+                        and (best < 0 or candidate < best))):
+                best = candidate
+                best_score = score
+                best_abs_u = abs_u
+    if best < 0:
+        best = int(fallback_index)
+    bit = int(flip_bits[best])
+    jbar = j_bin ^ (1 << bit)
+    delta = (
+        _f32(S[tree, jbar, :grad32.shape[0]])
+        - _f32(S[tree, j_bin, :grad32.shape[0]])
+    )
+    gi = np.float32(np.dot(delta, grad32))
+    return best, np.float32(margins[best]), jbar, gi
+
+
+@njit(parallel=True)
+def _select_lut_pairs_kernel(S, trees, j, grad, x, a_arr, b_arr,
+                             y_dim, CS, N_T, comparisons_per_bit,
+                             fallback_r, selected_r, selected_u):
+    for work in prange(CS * N_T):
+        pos = work // N_T
+        t = work - pos * N_T
+        r, u = _select_lut_pair_numba(
+            S, trees[t], j[pos, t], grad[pos], x[pos],
+            a_arr[t], b_arr[t], y_dim, comparisons_per_bit,
+            fallback_r[pos, t])
+        selected_r[pos, t] = r
+        selected_u[pos, t] = u
+
+
 @njit(parallel=True)
 def _lut_backward_kernel(S, trees, j, r_min, u_min, grad, x_grad, a_arr, b_arr,
                           y_dim, CS, N_T, comparisons_per_bit, lr):
@@ -3059,22 +3235,26 @@ def _lut_forward_add(lut, x, j, r_min, u_min, y, args):
         y[:, :lut.y_dim] += _f32(lut.S[lut.trees, j]).sum(axis=1)
 
 
-def _lut_backward_to_input(lut, j, r_min, u_min, grad, x_grad, args, skip_s_update=False):
+def _lut_backward_to_input(lut, j, r_min, u_min, grad, x_grad, args,
+                           skip_s_update=False, input_values=None):
+    r_min, u_min = select_lut_gradient_pairs(
+        lut, j, r_min, u_min, grad, input_values, lut.y_dim, args)
+    N_T = j.shape[1]
     if HAS_NUMBA and lut.S.dtype == np.float32:
         if skip_s_update:
             _lut_backward_kernel_noupdate(lut.S, lut.trees, j, r_min, u_min,
                                           grad, x_grad, lut.a_arr, lut.b_arr,
-                                          lut.y_dim, args.context_size, args.n_t,
+                                          lut.y_dim, args.context_size, N_T,
                                           lut.comparisons_per_bit)
         else:
             _lut_backward_kernel(lut.S, lut.trees, j, r_min, u_min,
                                  grad, x_grad, lut.a_arr, lut.b_arr,
-                                 lut.y_dim, args.context_size, args.n_t,
+                                 lut.y_dim, args.context_size, N_T,
                                  lut.comparisons_per_bit,
                                  np.float32(learning_rate))
     else:
         _lut_backward_python(lut, j, r_min, u_min, grad, x_grad,
-                             lut.y_dim, args.context_size, args.n_t, skip_s_update)
+                             lut.y_dim, args.context_size, N_T, skip_s_update)
 
 
 def _lut_backward_python(lut, j, r_min, u_min, grad, x_grad, y_dim, CS, N_T, skip_s_update):
@@ -3102,7 +3282,7 @@ def _lut_backward_python(lut, j, r_min, u_min, grad, x_grad, y_dim, CS, N_T, ski
 def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                            pe_grad_out=None, q_grad_out=None, k_grad_out=None,
                            v_grad_out=None, update_stats=None,
-                           stats_prefix='attention'):
+                           stats_prefix='attention', input_values=None):
     global learning_rate
     CS = args.context_size
     N_T = args.n_t
@@ -3132,6 +3312,7 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     lutFinal = head.Final
     treesFinal = lutFinal.trees
     y_dim = lutFinal.y_dim
+    cosine_selection = use_cosine_distance_selection(args)
 
     if update_stats is not None and not skip_s_update:
         if not pe_only:
@@ -3146,7 +3327,8 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
     if (HAS_NUMBA and lutFinal.S.dtype == np.float32
             and lutQ.S.dtype == np.float32
             and lutK.S.dtype == np.float32
-            and lutV.S.dtype == np.float32):
+            and lutV.S.dtype == np.float32
+            and not cosine_selection):
         _new_attention_final_backward_kernel(
             lutFinal.S,
             head._final_v_j, head._final_v_r_min, head._final_v_u_min,
@@ -3172,10 +3354,27 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                     j_bin = (int(head._final_v_j[tok_j, t]) << POSITIONAL_DIM) | int(head._qkpe_j[pair_idx, t])
                     S_j = _f32(lutFinal.S[tree, j_bin])
 
-                    r_v = int(head._final_v_r_min[tok_j, t])
-                    jbar_v = j_bin ^ (1 << (r_v // lutFinal.comparisons_per_bit + POSITIONAL_DIM))
-                    gi_v = ((_f32(lutFinal.S[tree, jbar_v]) - S_j) * y_g).sum()
-                    u_v = float(head._final_v_u_min[tok_j, t])
+                    if cosine_selection:
+                        v_margins = (
+                            head._v_embed[tok_j, lutFinal.a_arr[t]]
+                            - head._v_embed[tok_j, lutFinal.b_arr[t]]
+                        )
+                        v_bits = (
+                            np.arange(v_margins.size) // lutFinal.comparisons_per_bit
+                            + POSITIONAL_DIM
+                        )
+                        r_v, u_v, jbar_v, gi_v = _select_margin_candidate_python(
+                            lutFinal.S, tree, j_bin, y_g, v_margins, v_bits,
+                            int(head._final_v_r_min[tok_j, t]))
+                    else:
+                        r_v = int(head._final_v_r_min[tok_j, t])
+                        jbar_v = j_bin ^ (
+                            1 << (r_v // lutFinal.comparisons_per_bit + POSITIONAL_DIM)
+                        )
+                        gi_v = (
+                            (_f32(lutFinal.S[tree, jbar_v]) - S_j) * y_g
+                        ).sum()
+                        u_v = float(head._final_v_u_min[tok_j, t])
                     sign_v = 1.0 if u_v > 0.0 else -1.0
                     delta_v = gi_v * (-0.5 * sign_v / (1.0 + abs(u_v)) ** 2)
                     a_v = int(lutFinal.a_arr[t, r_v])
@@ -3183,10 +3382,38 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
                     v_grad[tok_j, a_v] += delta_v
                     v_grad[tok_j, b_v] -= delta_v
 
-                    r_qkpe = int(head._qkpe_r_min[pair_idx, t])
-                    jbar_qkpe = j_bin ^ (1 << r_qkpe)
-                    gi_qkpe = ((_f32(lutFinal.S[tree, jbar_qkpe]) - S_j) * y_g).sum()
-                    u_qkpe = float(head._qkpe_u_min[pair_idx, t])
+                    if cosine_selection:
+                        if normalize_qk:
+                            qk_vec = qk_norm_target_std * (
+                                head._q_embed[tok_i] + head._k_embed[tok_j]
+                                - head._qk_mean[pair_idx]
+                            ) * head._qk_inv_std[pair_idx]
+                        elif pe_only:
+                            qk_vec = np.zeros(QD, dtype=np.float32)
+                        else:
+                            qk_vec = head._q_embed[tok_i] + head._k_embed[tok_j]
+                        combined = qk_vec + head.Positional_encoding[pe_pos]
+                        if qkpe_direct_sign:
+                            qkpe_margins = combined[:POSITIONAL_DIM]
+                        else:
+                            qkpe_margins = (
+                                combined[head._qkpe_a_arr[t]]
+                                - combined[head._qkpe_b_arr[t]]
+                            )
+                        qkpe_bits = np.arange(POSITIONAL_DIM)
+                        r_qkpe, u_qkpe, jbar_qkpe, gi_qkpe = (
+                            _select_margin_candidate_python(
+                                lutFinal.S, tree, j_bin, y_g,
+                                qkpe_margins, qkpe_bits,
+                                int(head._qkpe_r_min[pair_idx, t]))
+                        )
+                    else:
+                        r_qkpe = int(head._qkpe_r_min[pair_idx, t])
+                        jbar_qkpe = j_bin ^ (1 << r_qkpe)
+                        gi_qkpe = (
+                            (_f32(lutFinal.S[tree, jbar_qkpe]) - S_j) * y_g
+                        ).sum()
+                        u_qkpe = float(head._qkpe_u_min[pair_idx, t])
                     sign_qkpe = 1.0 if u_qkpe > 0.0 else -1.0
                     delta_qkpe = gi_qkpe * (-0.5 * sign_qkpe / (1.0 + abs(u_qkpe)) ** 2)
                     if normalize_qk:
@@ -3246,61 +3473,106 @@ def new_attention_backward(head, x_grad, y_grad, args, skip_s_update=False,
         update_stats.record_simple_coords(f'{stats_prefix}_V', lutV, v_grad)
 
     if not pe_only:
-        if HAS_NUMBA and lutQ.S.dtype == np.float32:
-            if skip_s_update:
-                _lut_backward_kernel_noupdate(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
-                                              q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
-                                              QD, CS, Q_N_T,
-                                              lutQ.comparisons_per_bit)
-            else:
-                _lut_backward_kernel(lutQ.S, lutQ.trees, head._q_j, head._q_r_min, head._q_u_min,
-                                     q_grad, x_grad, lutQ.a_arr, lutQ.b_arr,
-                                     QD, CS, Q_N_T, lutQ.comparisons_per_bit,
-                                     np.float32(learning_rate))
-        else:
-            _lut_backward_python(lutQ, head._q_j, head._q_r_min, head._q_u_min,
-                                 q_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+        _lut_backward_to_input(
+            lutQ, head._q_j, head._q_r_min, head._q_u_min,
+            q_grad, x_grad, args, skip_s_update=skip_s_update,
+            input_values=input_values)
+        _lut_backward_to_input(
+            lutK, head._k_j, head._k_r_min, head._k_u_min,
+            k_grad, x_grad, args, skip_s_update=skip_s_update,
+            input_values=input_values)
 
-        if HAS_NUMBA and lutK.S.dtype == np.float32:
-            if skip_s_update:
-                _lut_backward_kernel_noupdate(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
-                                              k_grad, x_grad, lutK.a_arr, lutK.b_arr,
-                                              QD, CS, Q_N_T,
-                                              lutK.comparisons_per_bit)
-            else:
-                _lut_backward_kernel(lutK.S, lutK.trees, head._k_j, head._k_r_min, head._k_u_min,
-                                     k_grad, x_grad, lutK.a_arr, lutK.b_arr,
-                                     QD, CS, Q_N_T, lutK.comparisons_per_bit,
-                                     np.float32(learning_rate))
-        else:
-            _lut_backward_python(lutK, head._k_j, head._k_r_min, head._k_u_min,
-                                 k_grad, x_grad, QD, CS, Q_N_T, skip_s_update)
+    _lut_backward_to_input(
+        lutV, head._val_j, head._val_r_min, head._val_u_min,
+        v_grad, x_grad, args, skip_s_update=skip_s_update,
+        input_values=input_values)
 
-    v_y_dim = lutV.y_dim
-    if HAS_NUMBA and lutV.S.dtype == np.float32:
-        if skip_s_update:
-            _lut_backward_kernel_noupdate(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
-                                          v_grad, x_grad, lutV.a_arr, lutV.b_arr,
-                                          v_y_dim, CS, N_T,
-                                          lutV.comparisons_per_bit)
-        else:
-            _lut_backward_kernel(lutV.S, lutV.trees, head._val_j, head._val_r_min, head._val_u_min,
-                                 v_grad, x_grad, lutV.a_arr, lutV.b_arr,
-                                 v_y_dim, CS, N_T, lutV.comparisons_per_bit,
-                                 np.float32(learning_rate))
-    else:
-        _lut_backward_python(lutV, head._val_j, head._val_r_min, head._val_u_min,
-                             v_grad, x_grad, v_y_dim, CS, N_T, skip_s_update)
+
+def _attention_composite_backward_cosine(
+        lut, input_values, all_jV, all_rV, all_uV,
+        all_jPE, all_rPE, all_uPE, PE, pair_grads,
+        x_grad, pos_grad, args, skip_s_update, freeze_pe):
+    """Cosine-distance backward for Q/K-composed attention LUT rows."""
+    if input_values is None:
+        raise ValueError('cosine-distance gradient selection requires the exact attention input')
+    CS = args.context_size
+    N_T = args.n_t
+    pd = args.positional_dim
+    shift_qk = args.shift_qk
+    comparisons_per_bit = lut.comparisons_per_bit
+    raw_n_c = lut.a_arr.shape[1]
+    q_bits = np.arange(raw_n_c) // comparisons_per_bit + shift_qk
+    k_bits = np.arange(raw_n_c) // comparisons_per_bit + pd
+    learned_bits = np.concatenate((q_bits, k_bits))
+    pe_bits = np.arange(pd)
+
+    for pos in range(1, CS):
+        for pos1 in range(pos):
+            pe_pos = pos - pos1
+            grad = pair_grads[pos, pos1, :lut.y_dim]
+            for t in range(N_T):
+                tree = int(lut.trees[t])
+                j_bin = (
+                    (int(all_jV[pos, t]) << shift_qk)
+                    | (int(all_jV[pos1, t]) << pd)
+                    | int(all_jPE[pe_pos, t])
+                )
+                q_margins = (
+                    input_values[pos, lut.a_arr[t]]
+                    - input_values[pos, lut.b_arr[t]]
+                )
+                k_margins = (
+                    input_values[pos1, lut.a_arr[t]]
+                    - input_values[pos1, lut.b_arr[t]]
+                )
+                learned_margins = np.concatenate((q_margins, k_margins))
+                q_was_closer = abs(all_uV[pos, t]) < abs(all_uV[pos1, t])
+                fallback = (
+                    int(all_rV[pos, t]) if q_was_closer
+                    else raw_n_c + int(all_rV[pos1, t])
+                )
+                winner, u, _, gi = _select_margin_candidate_python(
+                    lut.S, tree, j_bin, grad, learned_margins,
+                    learned_bits, fallback)
+                if winner < raw_n_c:
+                    target_pos = pos
+                    r = winner
+                else:
+                    target_pos = pos1
+                    r = winner - raw_n_c
+                sign_u = 1.0 if u > 0.0 else -1.0
+                value = gi * (-0.5 * sign_u / (1.0 + abs(u)) ** 2)
+                x_grad[target_pos, lut.a_arr[t, r]] += value
+                x_grad[target_pos, lut.b_arr[t, r]] -= value
+
+                pe_is_eligible = (
+                    not freeze_pe
+                    and abs(all_uPE[pe_pos, t]) < abs(all_uV[pos, t])
+                    and abs(all_uPE[pe_pos, t]) < abs(all_uV[pos1, t])
+                )
+                if pe_is_eligible:
+                    pe_margins = PE[pe_pos, t, :pd]
+                    pe_r, pe_u, _, pe_gi = _select_margin_candidate_python(
+                        lut.S, tree, j_bin, grad, pe_margins, pe_bits,
+                        int(all_rPE[pe_pos, t]))
+                    pe_sign = 1.0 if pe_u > 0.0 else -1.0
+                    pos_grad[pe_pos, t, pe_r] += (
+                        pe_gi * (-0.5 * pe_sign / (1.0 + abs(pe_u)) ** 2)
+                    )
+
+                if not skip_s_update:
+                    lut.S[tree, j_bin, :lut.y_dim] -= learning_rate * grad
 
 
 def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_out=None,
                        score_grad_out=None, val_grad_out=None, update_stats=None,
-                       stats_prefix='attention'):
+                       stats_prefix='attention', input_values=None):
     global learning_rate
     CS = args.context_size
     N_T = args.n_t
     POSITIONAL_DIM = args.positional_dim
     freeze_pe = getattr(args, 'freeze_PE', False)
+    cosine_selection = use_cosine_distance_selection(args)
 
     if getattr(args, 'soft_attention', False):
         shift_qk = args.shift_qk
@@ -3313,13 +3585,21 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
             record_attention_update_rows(update_stats, f'{stats_prefix}_Score',
                                          score_lut, head._v_j, head._pe_j, args)
 
-        if HAS_NUMBA and score_lut.S.dtype == np.float32:
-            val_grad   = val_grad_out   if val_grad_out   is not None else np.zeros((CS, ED),              dtype=np.float32)
+        val_grad = (val_grad_out if val_grad_out is not None
+                    else np.zeros((CS, ED), dtype=np.float32))
+        val_grad[:] = (
+            _f32(head._attn_w)[:, :, np.newaxis] * y_grad[:, np.newaxis, :]
+        ).sum(axis=0)
+        val_r, val_u = select_lut_gradient_pairs(
+            val_lut, head._val_j, head._val_r_min, head._val_u_min,
+            val_grad, input_values, val_lut.y_dim, args)
+
+        if HAS_NUMBA and score_lut.S.dtype == np.float32 and not cosine_selection:
             score_grad = score_grad_out if score_grad_out is not None else np.zeros((CS, CS),              dtype=np.float32)
             pos_grad   = pe_grad_out    if pe_grad_out    is not None else np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
 
             _soft_attn_backward_value_kernel(
-                val_lut.S, head._val_j, head._val_r_min, head._val_u_min,
+                val_lut.S, head._val_j, val_r, val_u,
                 head._attn_w, y_grad, val_grad, x_grad,
                 val_lut.a_arr, val_lut.b_arr,
                 CS, N_T, ED, val_lut.comparisons_per_bit, np.float32(learning_rate), skip_s_update)
@@ -3344,18 +3624,17 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
             score_trees = score_lut.trees
 
             # --- Value path ---
-            val_grad = (_f32(head._attn_w)[:, :, np.newaxis] * y_grad[:, np.newaxis, :]).sum(axis=0)
-
-            jbar_val = head._val_j ^ (1 << (head._val_r_min // val_lut.comparisons_per_bit))
+            jbar_val = head._val_j ^ (1 << (val_r // val_lut.comparisons_per_bit))
             S_j_val    = _f32(val_lut.S[val_trees, head._val_j])
             S_jbar_val = _f32(val_lut.S[val_trees, jbar_val])
             gi_val = ((S_jbar_val - S_j_val) * val_grad[:, np.newaxis, :]).sum(axis=2)
-            sign_u_val = np.where(head._val_u_min > 0, 1.0, -1.0)
-            v_val = gi_val * (-0.5 * sign_u_val / (1 + np.abs(head._val_u_min))**2)
+            sign_u_val = np.where(val_u > 0, 1.0, -1.0)
+            v_val = gi_val * (-0.5 * sign_u_val / (1 + np.abs(val_u))**2)
 
             pos_idx = np.arange(CS)[:, np.newaxis]
-            idx_a_val = val_lut.a_arr[val_trees, head._val_r_min]
-            idx_b_val = val_lut.b_arr[val_trees, head._val_r_min]
+            logical_trees = np.broadcast_to(np.arange(N_T), val_r.shape)
+            idx_a_val = val_lut.a_arr[logical_trees, val_r]
+            idx_b_val = val_lut.b_arr[logical_trees, val_r]
             flat_a_val = (pos_idx * ED + idx_a_val).ravel()
             flat_b_val = (pos_idx * ED + idx_b_val).ravel()
             flat_size = x_grad.size
@@ -3375,6 +3654,27 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
             score_grad = head._attn_w * (a - baseline)
 
             pos_grad = np.zeros((CS, N_T, POSITIONAL_DIM), dtype=np.float32)
+            if cosine_selection:
+                pair_grads = score_grad[:, :, np.newaxis].astype(np.float32)
+                _attention_composite_backward_cosine(
+                    score_lut, input_values,
+                    head._v_j, head._v_r_min, head._v_u_min,
+                    head._pe_j, head._pe_r_min, head._pe_u_min,
+                    head.Positional_encoding, pair_grads,
+                    x_grad, pos_grad, args, skip_s_update, freeze_pe)
+                if score_grad_out is not None:
+                    score_grad_out[:] = score_grad
+                if update_stats is not None and not skip_s_update:
+                    update_stats.record_simple_coords(
+                        f'{stats_prefix}_Value', val_lut, val_grad)
+                    update_stats.record_attention_scalar_coords(
+                        f'{stats_prefix}_Score', score_lut, score_grad, args)
+                if pe_grad_out is not None:
+                    pe_grad_out += pos_grad
+                elif not freeze_pe:
+                    head.Positional_encoding -= learning_rate * pos_grad
+                return
+
 
             for pos in range(1, CS):
                 for pos1 in range(pos):
@@ -3455,6 +3755,22 @@ def attention_backward(head, x_grad, y_grad, args, skip_s_update=False, pe_grad_
     all_jPE = head._pe_j      # (CS, N_T)
     all_rPE = head._pe_r_min  # (CS, N_T)
     all_uPE = head._pe_u_min  # (CS, N_T)
+
+    if cosine_selection:
+        pair_grads = np.zeros((CS, CS, y_dim), dtype=np.float32)
+        for pos in range(1, CS):
+            pair_grads[pos, :pos] = y_grad[pos, :y_dim]
+        _attention_composite_backward_cosine(
+            lut, input_values,
+            all_jV, all_rV, all_uV,
+            all_jPE, all_rPE, all_uPE,
+            head.Positional_encoding, pair_grads,
+            x_grad, pos_grad, args, skip_s_update, freeze_pe)
+        if pe_grad_out is not None:
+            pe_grad_out += pos_grad
+        elif not freeze_pe:
+            head.Positional_encoding -= learning_rate * pos_grad
+        return
 
     if HAS_NUMBA and lut.S.dtype == np.float32:
         if skip_s_update:
@@ -3582,6 +3898,8 @@ def model_forward(m, args, training=True, head_pool=None):
                 layernorm_forward(m.z, m.ln_attn_gamma[l], m.ln_attn_beta[l])
         else:
             np.copyto(m._x_buf, m.z)
+        if m._attn_inputs is not None:
+            np.copyto(m._attn_inputs[l], m._x_buf)
 
         z_pre_attn = m.z.copy() if (dr > 0.0 and training) else None
         if getattr(args, 'new_MHA', False):
@@ -3621,6 +3939,8 @@ def model_forward(m, args, training=True, head_pool=None):
             ffn_input = m._ln_ffn_buf
         else:
             ffn_input = m.z
+        if m._ffn_inputs is not None:
+            np.copyto(m._ffn_inputs[l], ffn_input)
 
         z_pre_ffn = m.z.copy() if (dr > 0.0 and training) else None
         cache_index_batch(lut, ffn_input, m._ffn_j[l], m._ffn_r_min[l], m._ffn_u_min[l])
@@ -3650,10 +3970,12 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
 
     if args.factored_output:
         m.output_head.backward(x_grad, args, skip_s_update=skip_s,
-                               update_stats=update_stats, stats_prefix='output')
+                               update_stats=update_stats, stats_prefix='output',
+                               input_values=m.z)
     else:
         m.output_head.backward(x_grad, args, skip_s_update=skip_s,
-                               update_stats=update_stats, stats_name='output')
+                               update_stats=update_stats, stats_name='output',
+                               input_values=m.z)
 
     for l in range(NUM_LAYERS - 1, -1, -1):
         # FFN backward
@@ -3671,20 +3993,25 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
 
         x_before_ffn = x_grad.copy() if use_ln else None
 
+        selected_r, selected_u = select_lut_gradient_pairs(
+            lut, j, r_min, u_min, y_grad,
+            m._ffn_inputs[l] if m._ffn_inputs is not None else None,
+            y_dim, args)
         # FFN backward uses batch-read semantics: read S for ALL positions
         # before any updates. This can't be fused into a per-position kernel
         # because positions share bins (2^n_c is small).
-        jbar = j ^ (1 << (r_min // lut.comparisons_per_bit))
+        jbar = j ^ (1 << (selected_r // lut.comparisons_per_bit))
         S_j = _f32(lut.S[trees, j])
         S_jbar = _f32(lut.S[trees, jbar])
         gi = ((S_jbar - S_j) * y_grad[:, np.newaxis, :y_dim]).sum(axis=2)
-        sign_u = np.where(u_min > 0, 1.0, -1.0)
-        v = gi * (-0.5 * sign_u / (1 + np.abs(u_min))**2)
+        sign_u = np.where(selected_u > 0, 1.0, -1.0)
+        v = gi * (-0.5 * sign_u / (1 + np.abs(selected_u))**2)
 
         ED = EMBEDDING_DIM
         pos_idx = np.arange(CS)[:, np.newaxis]
-        idx_a = lut.a_arr[trees, r_min]
-        idx_b = lut.b_arr[trees, r_min]
+        logical_trees = np.broadcast_to(np.arange(args.n_t), selected_r.shape)
+        idx_a = lut.a_arr[logical_trees, selected_r]
+        idx_b = lut.b_arr[logical_trees, selected_r]
         flat_a = (pos_idx * ED + idx_a).ravel()
         flat_b = (pos_idx * ED + idx_b).ravel()
         v_flat = v.ravel()
@@ -3725,6 +4052,8 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
 
         x_before_attn = x_grad.copy() if use_ln else None
 
+        attention_input = (m._attn_inputs[l] if m._attn_inputs is not None
+                           else None)
         soft = getattr(args, 'soft_attention', False)
         new_attn = getattr(args, 'new_attention', False)
         new_mha = getattr(args, 'new_MHA', False)
@@ -3739,7 +4068,8 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
                 update_stats.record_simple_coords(f'mha_o_{l}', o_lut, y_grad)
             _lut_backward_to_input(o_lut, m._mha_o_j[l], m._mha_o_r_min[l],
                                    m._mha_o_u_min[l], y_grad, o_grad, args,
-                                   skip_s_update=skip_s)
+                                   skip_s_update=skip_s,
+                                   input_values=m._mha_concat[l])
             head_dim = args.mha_head_dim
             for h in range(NUM_HEADS):
                 head_y_grad = o_grad[:, h * head_dim:(h + 1) * head_dim]
@@ -3751,11 +4081,13 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
                         pe_grad_out=grad_accum.pe_grads[l][h],
                         q_grad_out=grad_accum.new_attn_q_grads[l][h],
                         k_grad_out=grad_accum.new_attn_k_grads[l][h],
-                        v_grad_out=grad_accum.new_attn_v_grads[l][h])
+                        v_grad_out=grad_accum.new_attn_v_grads[l][h],
+                        input_values=attention_input)
                 else:
                     new_attention_backward(m.head[l][h], x_grad, head_y_grad, args,
                                            update_stats=update_stats,
-                                           stats_prefix=f'head_{l}_{h}')
+                                           stats_prefix=f'head_{l}_{h}',
+                                           input_values=attention_input)
         else:
             if grad_accum is not None and not soft:
                 # Save y_grad once per layer (shared across heads) for hard/new attention replay
@@ -3769,22 +4101,26 @@ def model_backward(m, args, grad_accum=None, update_stats=None):
                             pe_grad_out=grad_accum.pe_grads[l][h],
                             q_grad_out=grad_accum.new_attn_q_grads[l][h],
                             k_grad_out=grad_accum.new_attn_k_grads[l][h],
-                            v_grad_out=grad_accum.new_attn_v_grads[l][h])
+                            v_grad_out=grad_accum.new_attn_v_grads[l][h],
+                            input_values=attention_input)
                     else:
                         new_attention_backward(m.head[l][h], x_grad, y_grad, args,
                                                update_stats=update_stats,
-                                               stats_prefix=f'head_{l}_{h}')
+                                               stats_prefix=f'head_{l}_{h}',
+                                               input_values=attention_input)
                 elif grad_accum is not None:
                     attention_backward(m.head[l][h], x_grad, y_grad, args,
                                        skip_s_update=True,
                                        pe_grad_out=grad_accum.pe_grads[l][h],
                                        score_grad_out=grad_accum.attn_score_grads[l][h] if soft else None,
-                                       val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None)
+                                       val_grad_out=grad_accum.attn_val_grads[l][h] if soft else None,
+                                       input_values=attention_input)
                 else:
                     stats_prefix = f'head_{l}_{h}' if soft else f'head_{l}_{h}_V'
                     attention_backward(m.head[l][h], x_grad, y_grad, args,
                                        update_stats=update_stats,
-                                       stats_prefix=stats_prefix)
+                                       stats_prefix=stats_prefix,
+                                       input_values=attention_input)
 
         if use_ln:
             ln_attn_dx = x_grad - x_before_attn
@@ -4393,6 +4729,10 @@ def main():
                         help='Random pairwise comparisons XORed into each learned LUT bit (default: 1)')
     parser.add_argument('--weight-sharing', type=int, default=None,
                         help='With --new-attention, use N physical Final LUT trees shared by logical --n-t comparator slots')
+    parser.add_argument('--gradient-pair-selection',
+                        choices=['closest', 'cosine-distance'], default='closest',
+                        help='How LUT surrogate input gradients choose a comparison pair '
+                             '(default: closest)')
     parser.add_argument('--lut-comparison-mode', choices=['random', 'no-overlap', 'overlap'],
                         default='random',
                         help='How LUT a/b comparison indices are assigned (default: random)')
@@ -4568,6 +4908,7 @@ def main():
     print(f"  final_share_m     = {args.final_share_m}")
     print(f"  lut_comparison_mode = {args.lut_comparison_mode}")
     print(f"  comparisons_per_bit = {args.comparisons_per_bit}")
+    print(f"  gradient_pair_selection = {args.gradient_pair_selection}")
     print(f"  attn_qk_dim       = {args.attn_qk_dim}")
     print(f"  attn_qk_n_c       = {args.attn_qk_n_c}")
     print(f"  attn_qk_n_t       = {args.attn_qk_n_t}")
