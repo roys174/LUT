@@ -4,7 +4,7 @@ Read this before changing this directory, especially `main.py`. This is research
 
 ## Repository Purpose and Current State
 
-This is a NumPy/Numba lookup-table (LUT) language model derived from the SNN/LUT transformer idea. `main.py` is the active implementation and supports next-token language modeling and part-of-speech (POS) prediction. `nanoGPT_POS/` is the transformer POS baseline.
+This is a NumPy/Numba lookup-table (LUT) language model derived from the SNN/LUT transformer idea. `main.py` is the original implementation and supports next-token language modeling and part-of-speech (POS) prediction. `lut_torch/` is a PyTorch port of the current architecture that reproduces `main.py` exactly (see "The `lut_torch/` PyTorch Port"). `nanoGPT_POS/` is the transformer POS baseline.
 
 The active branch is ahead of `main` by a long experiment series. The progression was roughly:
 
@@ -21,8 +21,10 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 ## Start Here
 
 - `main.py`: model structures, LUT construction/indexing, Numba kernels, forward/backward, batching/replay, CLI, training, validation, checkpointing, update statistics, and W&B.
+- `lut_torch/`: the PyTorch port. Start at `lut_torch/functional.py` (the only custom autograd) and `lut_torch/modules.py`.
 - `word_tokenizer.py`: word vocabulary, tokenization, universal POS labels, spaCy alignment, and cached POS encoding.
 - `run_files/run_POS_one.sh`: newest single-run template; uses new MHA, scheduler control, frozen PE, direct-sign QKPE, and the legacy-equivalent `--comparisons-per-bit 1`. Its `--weight-sharing` line is currently commented out.
+- `run_files/torch_POS_run.sh`: the torch trainer (`python -m lut_torch.train`) at the same experiment shape. Note `run_files/` is gitignored, so these scripts are local-only.
 - `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
 - `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
 - `run_files/run_POS_one_PE_only.sh`: PE-only ablation.
@@ -31,6 +33,36 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 - `run_files/run_nanoGPT_POS.sh`: PyTorch baseline. Inspect its working-directory assumptions before copying paths.
 - `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
 - `loss.csv`: `step, loss, perplexity, accuracy`.
+
+## The `lut_torch/` PyTorch Port
+
+`lut_torch/` reimplements the `--new-attention` / `--new-MHA` architecture on PyTorch so
+that torch owns autograd, optimizers, schedulers and checkpointing. `main.py` is not
+modified and remains the reference implementation that the port is measured against.
+
+**`lut_torch/AGENTS.md` is the authoritative document for that codebase.** Read it before
+changing anything under `lut_torch/`. It covers the design (why a discrete lookup fits
+torch at all), the invariants that break silently (RNG draw order, loss scaling, sparse
+table gradients), how CPUs are used and how to benchmark them, the flag set, the parity
+contract, and the performance history. Do not duplicate that material here.
+
+In brief, for orientation only:
+
+- Only two gradients are custom: the table scatter-add (which is an embedding's backward,
+  returned sparse) and the input surrogate (which is exactly `dphi/du` for
+  `phi(u) = 0.5/(1+|u|)`). Both live in `lut_torch/functional.py`.
+- The custom step is defined over *margins*, not the layer input, so QK normalization, PE
+  routing and the Q/K/PE gradient scattering are ordinary torch that autograd derives.
+- A real batch dimension replaces `BatchElement`, `SparseGradAccumulator`,
+  `apply_averaged_gradients`, the `_replay_*` kernels and all four thread-pool flags.
+- Checkpoints are torch `state_dict` `.pt` files and resume fully; they are not `.npz` and
+  the `analyze_*` / `compare_*` / `infer_lut_pos.py` tools cannot read them.
+- Not ported (still in `main.py`): old hard attention, `--soft-attention`,
+  `--factored-output`, `--fp16`, `no-overlap`/`overlap` modes, `--halve-lr-at-20k-40k`,
+  `--save-multiple-checkpoints`, sampling, and `LUTUpdateStats`.
+
+Run scripts: `run_files/torch_POS_run.sh`. Tests: see "Validation Expectations" below.
+
 
 ## Cluster Sandbox and Command Execution — Read This Before Running Anything
 
@@ -271,6 +303,19 @@ python test_new_mha.py
 python test_compare_lut_checkpoint_rows.py
 python -m pytest -q test_xor_comparisons.py
 ```
+
+For the torch port:
+
+```bash
+.venv/bin/python test_torch_lut_primitive.py
+.venv/bin/python test_torch_parity.py
+.venv/bin/python test_torch_training.py
+```
+
+The venv has torch but no pytest, while the cluster python has pytest but no torch, so these
+three import `parametrize`/`run_all` from `lut_torch/_testing.py` and run under either
+(`python FILE` uses the shim runner; `python -m pytest FILE` uses real pytest). They import
+`main.py` to compare against it, so they need the venv.
 
 Several are executable assertion scripts rather than pytest tests; `test_xor_comparisons.py` requires pytest. `test_prange.py` is a performance probe and can be expensive. Numerical/parallel changes should compare Numba/fallback, batch-1/replay, forward/backward/`S` updates, save/load, model stats, and seeded single-/multi-thread behavior.
 
