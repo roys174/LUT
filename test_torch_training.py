@@ -231,7 +231,7 @@ def test_evaluate_matches_manual_scoring(pos_task):
     starts = np.arange(6)
     args = parse_args(['--validation-batch-size', '3'])
 
-    loss, acc = evaluate(model, dataset, starts, args, cfg)
+    loss, acc = evaluate(model, dataset, starts, args, cfg, torch.device('cpu'))
 
     total, correct, count = 0.0, 0, 0
     with torch.no_grad():

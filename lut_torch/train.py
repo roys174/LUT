@@ -23,6 +23,13 @@ import random
 import sys
 import time
 
+# Numba's 'default' resolution picks tbb on this build (bundled tbbpool.so, verified with
+# numba.threading_layer()) and falls back to workqueue gracefully where tbb isn't built,
+# rather than hard-failing the way pinning NUMBA_THREADING_LAYER=tbb would on a machine
+# without it. Either way it does not clash with torch's own intra-op pool. Must be set
+# before numba (imported lazily by lut_torch.kernels) JIT-compiles anything.
+os.environ.setdefault('NUMBA_THREADING_LAYER', 'default')
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,6 +37,7 @@ from tqdm import tqdm
 
 from .config import ConfigError, LutConfig
 from .data import IGNORE_INDEX, load_datasets
+from .kernels import KERNEL_BACKEND_MODES, set_kernel_backend, set_kernel_threads
 from .functional import (
     SELECTION_CLOSEST,
     SELECTION_MODES,
@@ -96,6 +104,12 @@ def build_parser():
                    help="Table-gradient representation. 'auto' uses dense once a table "
                         "is visited at least as many times as it has rows, which is the "
                         "usual case; force 'sparse' only if a dense gradient will not fit")
+    p.add_argument('--kernels', choices=list(KERNEL_BACKEND_MODES), default='auto',
+                   help="LUT execution backend for 'closest' selection on CPU float32. "
+                        "'auto' uses fused Numba kernels when importable (several times "
+                        "faster than the torch path at batch 1; see lut_torch/AGENTS.md, "
+                        "'Kernels'), falling back to torch otherwise. Numerically "
+                        "identical either way -- the parity suite runs both.")
     p.add_argument('--layernorm', action='store_true')
     p.add_argument('--dropout', type=float, default=0.0)
 
@@ -119,7 +133,15 @@ def build_parser():
                    default=DEFAULT_COSINE_MIN_LR_RATIO)
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--cpu-cores', type=int, default=1,
-                   help='torch intra-op thread count')
+                   help='torch intra-op thread count (ignored on GPU)')
+    p.add_argument('--device', default='cpu',
+                   help="'cpu', 'cuda', 'cuda:N', or 'auto' (cuda if available, else "
+                        "cpu). The fused-kernel backend (--kernels) only ever runs on "
+                        "CPU float32 -- lut_lookup falls back to the plain torch path "
+                        "automatically on GPU, so --kernels is simply ignored there. "
+                        "table_grad's dense path (index_add_) accumulates with atomics "
+                        "on CUDA, so gradients are not bit-reproducible run to run; the "
+                        "parity suite is CPU-only and unaffected.")
 
     # validation / logging / checkpoints
     p.add_argument('--testing-length', type=int, default=10000,
@@ -168,6 +190,18 @@ def validate_args(args, parser):
     if args.optimizer in ('adam', 'adamw') and args.table_grad == 'auto':
         print("note: --optimizer adam/adamw requires dense table gradients; "
               "--table-grad dense will be used")
+
+
+def resolve_device(args, parser):
+    """``--device`` -> a ``torch.device``, resolving 'auto' and validating availability."""
+    requested = args.device
+    if requested == 'auto':
+        requested = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(requested)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        parser.error(f"--device {args.device} requested but torch.cuda.is_available() "
+                     f"is False")
+    return device
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +281,9 @@ def save_checkpoint(path, model, cfg, optimizers, schedulers, step, args):
             'python': random.getstate(),
             'numpy': np.random.get_state(),
             'torch': torch.get_rng_state(),
+            # CUDA RNG feeds dropout on GPU; harmless (and unused) to save on a CPU run.
+            'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available()
+            else None,
         },
     }, checkpoint_path(path))
 
@@ -266,6 +303,8 @@ def load_checkpoint(path, model, optimizers, schedulers, reset_optimizer):
         random.setstate(rng['python'])
         np.random.set_state(rng['numpy'])
         torch.set_rng_state(rng['torch'])
+        if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng['torch_cuda'])
     step = int(ckpt['step'])
     print(f"Resumed from {checkpoint_path(path)} at step {step}")
     return step
@@ -276,7 +315,12 @@ def load_checkpoint(path, model, optimizers, schedulers, reset_optimizer):
 # ---------------------------------------------------------------------------
 
 def batch_loss(model, inputs, targets, vocab_size):
-    """Return ``(objective, mean_loss, correct, count)`` for one batch."""
+    """Return ``(objective, mean_loss, correct, count)`` for one batch.
+
+    ``inputs``/``targets`` must already be on the model's device -- moved by the caller,
+    once, rather than here, so a caller batching multiple chunks does not repeat the
+    host-to-device copy.
+    """
     logits = model(inputs)
     flat = logits.reshape(-1, vocab_size)
     flat_targets = targets.reshape(-1)
@@ -291,7 +335,7 @@ def batch_loss(model, inputs, targets, vocab_size):
 
 
 @torch.no_grad()
-def evaluate(model, dataset, starts, args, cfg):
+def evaluate(model, dataset, starts, args, cfg, device):
     """Validation loss / accuracy.
 
     POS scores every valid position; language modelling scores only the final position,
@@ -310,9 +354,9 @@ def evaluate(model, dataset, starts, args, cfg):
             keep = np.full_like(targets, IGNORE_INDEX)
             keep[:, -1] = targets[:, -1]
             targets = keep
-        logits = model(torch.from_numpy(inputs))
+        logits = model(torch.from_numpy(inputs).to(device))
         flat = logits.reshape(-1, cfg.vocab_size_output)
-        flat_targets = torch.from_numpy(targets).reshape(-1)
+        flat_targets = torch.from_numpy(targets).to(device).reshape(-1)
         valid = flat_targets != IGNORE_INDEX
         if not bool(valid.any()):
             continue
@@ -336,6 +380,14 @@ def main(argv=None):
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
     torch.set_num_threads(max(1, args.cpu_cores))
+    set_kernel_backend(args.kernels)
+    if args.kernels in ('auto', 'numba'):
+        try:
+            import numba
+            numba.set_num_threads(max(1, args.cpu_cores))
+            set_kernel_threads(max(1, args.cpu_cores))
+        except ImportError:
+            pass
 
     # Tokenizer and vocabulary sizes.
     if args.tokenizer == 'word':
@@ -362,7 +414,7 @@ def main(argv=None):
     for key in ('batch_size', 'optimizer', 'table_grad', 'momentum', 'weight_decay',
                 'max_steps',
                 'warmup_steps', 'max_learning_rate', 'lr_scheduler',
-                'inverse_sqrt_alpha', 'cosine_min_lr_ratio', 'seed', 'cpu_cores',
+                'inverse_sqrt_alpha', 'cosine_min_lr_ratio', 'seed', 'cpu_cores', 'kernels',
                 'testing_length', 'validation_interval', 'loss_file', 'save_model',
                 'load_model'):
         print(f"  {key:24s} = {getattr(args, key)}")
@@ -371,10 +423,12 @@ def main(argv=None):
     train_set, val_set = load_datasets(args, enc)
     val_starts = np.random.randint(0, val_set.length, size=args.testing_length)
 
-    model = LutModel(cfg)
+    device = resolve_device(args, parser)
+    model = LutModel(cfg).to(device)
     print(f"Trainable tables: {len(model.table_parameters())}, "
           f"table entries: {sum(p.numel() for p in model.table_parameters()):,}, "
-          f"dense parameters: {sum(p.numel() for p in model.dense_parameters()):,}")
+          f"dense parameters: {sum(p.numel() for p in model.dense_parameters()):,}, "
+          f"device: {device}")
 
     optimizers, schedulers = build_optimizers(model, args)
     start_step = 0
@@ -413,7 +467,7 @@ def main(argv=None):
         starts = np.random.randint(0, train_set.length, size=args.batch_size)
         inputs, targets = train_set.batch(starts)
         objective, mean_loss, _, _ = batch_loss(
-            model, torch.from_numpy(inputs), torch.from_numpy(targets),
+            model, torch.from_numpy(inputs).to(device), torch.from_numpy(targets).to(device),
             cfg.vocab_size_output)
 
         for opt in optimizers:
@@ -439,7 +493,7 @@ def main(argv=None):
 
         if step % args.validation_interval == 0:
             pbar.set_description('Validating')
-            val_loss, val_acc = evaluate(model, val_set, val_starts, args, cfg)
+            val_loss, val_acc = evaluate(model, val_set, val_starts, args, cfg, device)
             perplexity = math.exp(min(val_loss, 20.0)) if val_loss == val_loss \
                 else float('nan')
             last = {'loss': val_loss, 'ppl': perplexity, 'acc': val_acc}

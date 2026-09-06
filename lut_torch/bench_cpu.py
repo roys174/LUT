@@ -35,16 +35,27 @@ DEFAULT_SHAPE = dict(
 )
 
 
-def _time_steps(threads, batch, shape, target_seconds, min_steps, max_steps, seed=0):
+def _time_steps(threads, batch, shape, target_seconds, min_steps, max_steps, seed=0,
+                backend=None):
     """Time training steps in this process. Returns (seconds_per_step, steps)."""
     import numpy as np
     import torch
     import torch.nn.functional as F
 
     from .config import LutConfig
+    from .kernels import set_kernel_backend, set_kernel_threads
     from .modules import LutModel
 
     torch.set_num_threads(threads)
+    if backend is not None:
+        set_kernel_backend(backend)
+        if backend in ('auto', 'numba'):
+            try:
+                import numba
+                numba.set_num_threads(threads)
+                set_kernel_threads(threads)
+            except ImportError:
+                pass
     cfg = LutConfig(**shape)
 
     import random
@@ -149,6 +160,40 @@ def run_concurrency(args, shape):
     return results
 
 
+def run_backends(args, shape):
+    """torch path vs fused-Numba-kernel path, at the same threads x batch cells.
+
+    Answers the question the kernel work (lut_torch/PLAN_numba_kernels.md) was done to
+    answer: how much of the CPU wall-clock is framework dispatch overhead the kernels
+    remove, versus real work that scales with threads either way.
+    """
+    from .kernels import numba_available
+    if not numba_available():
+        print("\nBACKENDS: numba not importable, skipping")
+        return []
+
+    print(f"\n{'=' * 78}\nBACKENDS: torch vs fused Numba kernels, closest selection"
+          f"\n{'=' * 78}")
+    print(f"{'batch':>6} {'threads':>8} {'torch ms':>10} {'numba ms':>10} "
+          f"{'speedup':>8} {'torch seq/s':>12} {'numba seq/s':>12}")
+    results = []
+    for batch in args.batches:
+        for threads in args.threads:
+            t_ms, _ = _time_steps(threads, batch, shape, args.seconds,
+                                  args.min_steps, args.max_steps, backend='torch')
+            n_ms, _ = _time_steps(threads, batch, shape, args.seconds,
+                                  args.min_steps, args.max_steps, backend='numba')
+            speedup = t_ms / n_ms
+            print(f"{batch:>6} {threads:>8} {t_ms * 1000:>10.1f} {n_ms * 1000:>10.1f} "
+                  f"{speedup:>7.2f}x {batch / t_ms:>12.2f} {batch / n_ms:>12.2f}")
+            results.append(dict(experiment='backends', batch=batch, threads=threads,
+                                torch_ms_per_step=t_ms * 1000, numba_ms_per_step=n_ms * 1000,
+                                speedup=speedup, torch_seq_per_s=batch / t_ms,
+                                numba_seq_per_s=batch / n_ms))
+        print()
+    return results
+
+
 def csv_ints(text):
     return [int(part) for part in text.split(',') if part.strip()]
 
@@ -156,7 +201,7 @@ def csv_ints(text):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--experiment', choices=['grid', 'concurrency', 'both'],
+    p.add_argument('--experiment', choices=['grid', 'concurrency', 'backends', 'both'],
                    default='both')
     p.add_argument('--threads', type=csv_ints, default=[1, 2, 4, 8, 16, 20])
     p.add_argument('--batches', type=csv_ints, default=[1, 8, 32])
@@ -187,6 +232,8 @@ def main(argv=None):
         results += run_grid(args, shape)
     if args.experiment in ('concurrency', 'both'):
         results += run_concurrency(args, shape)
+    if args.experiment == 'backends':
+        results += run_backends(args, shape)
 
     if args.json_out:
         with open(args.json_out, 'w') as f:

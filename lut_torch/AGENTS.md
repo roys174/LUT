@@ -252,6 +252,9 @@ on the machine you will actually train on — a shared login node gives noisy nu
 - `--load-model` resumes properly (model + optimizer + scheduler + step + RNG).
   `--reset-optimizer` loads weights only.
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
+- `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. On GPU, batch size stops being a
+  CPU-thread-efficiency knob and becomes the whole story: batch >= 32 is close to free
+  there, batch 1 gets no benefit over CPU at all. `--kernels` is silently a no-op on GPU.
 
 **Not carried over** (still available in `main.py`): old hard attention, `--soft-attention`,
 `--factored-output`, `--fp16`, `no-overlap`/`overlap` comparison modes,
@@ -289,6 +292,53 @@ a non-zero gradient, so the comparison cannot pass vacuously.
 whole config matrix.** If you add a structural flag, it must reach `LutConfig.validate`, the
 `train.py` parser, the printed config, and `test_torch_parity.CONFIGS`.
 
+## Kernels
+
+`kernels.py` is a fused-Numba accelerator for `LUTFunction`, for `closest` selection on CPU
+float32 only. `cosine-distance` always stays on the torch path in `functional.py` — its
+selection depends on the upstream gradient, which the kernels do not implement.
+`--kernels {auto,numba,torch}` (default `auto`) picks the backend; `set_kernel_backend` is a
+module-level switch rather than a `lut_lookup` argument, deliberately, because adding an
+argument to `LUTFunction.apply` would shift the `needs_input_grad` offset `backward` indexes
+from (margins start at 7) — a change that fails silently as a wrong gradient, not a crash.
+
+There are exactly two call shapes (`kernels._layout`): a single unpaired group (Q/K/V/FFN/
+`MHA_O`/output) and the Final table's two groups (QKPE, unpaired and possibly tree-broadcast
+under `--qkpe-direct-sign`; V-side, paired via `pair_index`). Each kernel's `prange` axis is
+chosen so every iteration owns its output cells outright — see the docstring on each kernel
+for the specific argument. The paired-group backward (`_k_grad_paired`) is the one worth
+understanding: it parallelises over *source position*, not pair, using a CSR inverse of
+`pair_index` (`NewAttentionHead.final_pair_ptr`/`final_pair_list`, built once at construction)
+so that several pairs accumulating into one source position never race.
+
+Every kernel has a genuinely serial mirror (`_k_*_serial`), generated at import time from the
+parallel kernel's own source (`prange` → `range`, `parallel=True` dropped) rather than
+hand-duplicated, so there is exactly one body per kernel to keep correct. `_pick` chooses
+serial below `_SERIAL_BELOW_ITEMS` (4096 work items) and parallel, thread-capped by
+`_threads_for`, above it — a parallel kernel capped to one thread was still measured slower
+than a plain serial loop doing the same work (thread-pool dispatch has cost even at n=1).
+
+**`fastmath` is never used.** It reorders float reductions, which risks the bit-exact parity
+`test_torch_parity` exists to guarantee, and it measured no net win once the actual bottleneck
+(dispatch, not arithmetic) was fixed.
+
+**Honest performance note.** In isolation (a single Final-table call, tight loop, no
+surrounding model) the kernels measured 1.8-3.7x faster than the torch path, and that is the
+number the design work in this section was based on. Measured end-to-end, on this machine, at
+the production shape, batch 1, 16 threads: **no consistent net win** (torch and kernel
+backends land within a few percent of each other, run to run). Two things are true at once:
+the kernels genuinely reduce per-call CPU time (confirmed by direct instrumentation — the
+in-kernel time dropped as expected), and the *total* step time did not move, because at ~103
+LUT calls/step the constant per-call cost around each kernel invocation (marshaling to numpy,
+Python dispatch) is of the same order as what was saved, and this machine is a **shared,
+non-exclusive, frequency-scaled node** (`CPU(s) scaling MHz: 47%` in `lscpu`, load average
+observed 3-7 across unrelated jobs) whose measurement noise was, at one point, large enough to
+produce a completely different conclusion between two consecutive runs of the identical
+benchmark. Re-measure on an exclusive allocation before trusting either direction. The
+straightforward next lever, if this doesn't pan out, is Track B (batch the heads of a layer):
+it cuts the *call count* itself by `num_heads`x, which is the one thing every measurement
+here agrees is the actual constraint — see "If you need more speed" below.
+
 ## Performance history
 
 Head to head against `main.py` at the production shape, 16 threads, same host:
@@ -317,6 +367,16 @@ re-measure, and know what caused those:
 5. Unconditionally sparse table gradients — see "Table gradients". This one only showed up
    at batch 32 and cost 19x there, which is the argument for sweeping batch sizes when
    benchmarking rather than trusting a single point.
+6. The fused kernels (see "Kernels" above), first cut: every call ran numba's parallel
+   dispatch at the trainer's full configured thread count, which is fine for the Final table
+   (~16000 visits) but actively harmful for the small tables (~1000 visits) — a parallel
+   kernel capped to even one thread beats a genuinely serial kernel doing identical work, so
+   thread count alone cannot fix small calls. Fixed with `_pick`/`_SERIAL_BELOW_ITEMS`. Net
+   effect on this (shared, noisy) machine was still a wash end-to-end — see the honest note
+   above — which is itself the lesson: an isolated tight-loop microbenchmark of one call does
+   not establish what happens at ~103 calls/step interleaved with everything else the model
+   does, and does not survive a non-exclusive machine at all. Re-measure on real allocation
+   before acting on either number.
 
 ### If you need more speed
 
@@ -336,13 +396,63 @@ available as a last resort — CPU torch tensors are zero-copy `.numpy()`.
 
 ### GPU
 
-Not implemented, but the code is close to device-agnostic already: every runtime tensor
-takes its device from an existing one, and the fixed arrays are registered buffers that
-move with `.to()`. What is missing is a `--device` flag, `.to(device)` on each batch, and
-checking the optimizer paths on CUDA. Note `index_add_` on CUDA accumulates with atomics,
-so float ordering is non-deterministic and exact parity would need
-`torch.use_deterministic_algorithms(True)`. The tables are only ~139 MB at the production
-shape, so memory is not the obstacle; the launch floor above is.
+Implemented and measured on an RTX 2080 Ti (`--device {cpu,cuda,cuda:N,auto}` in
+`train.py`; `run_files/torch_POS_run_gpu.sh`). **No custom CUDA kernels** -- this is the
+plain torch autograd path; `lut_lookup` already falls back off the fused-kernel backend on
+any non-CPU tensor (`kernels.supported` checks `device.type`), so `--kernels` has no effect
+on GPU and isn't in the GPU run script.
+
+**Correctness first, since this matters more than speed:** built the same model on CPU and
+GPU from the same seed, ran one step of SGD with `table_grad=dense`, and compared. Forward
+logits were bit-exact; the loss and every parameter after the optimizer step agreed to
+~1e-6/1e-10 (float32 rounding from summation order, not a bug -- CUDA's `index_add_`
+accumulates with atomics, so exact reproducibility across runs on GPU isn't guaranteed the
+way it is on CPU; the parity suite stays CPU-only and is unaffected). A 300-step run at the
+production shape trained normally (perplexity 18.0 to 2.8, accuracy 5% to 66%), and
+checkpoint save/resume round-trips correctly (RNG state now includes
+`torch.cuda.get_rng_state_all()` alongside python/numpy/torch, so a resumed GPU run's
+dropout stream is reproducible too).
+
+**Performance -- this is the one number that actually matters**, production shape:
+
+| batch | ms/step | seq/s |
+|---|---|---|
+| 1 | 172.4 | 5.80 |
+| 8 | 173.1 | 46.21 |
+| 32 | 177.6 | **180.20** |
+| 128 | 435.9 | 293.63 |
+
+Batch 1/8/32 cost almost exactly the same wall-clock time -- that is the ~30,000-ATen-op
+kernel-launch floor from "If you need more speed" above, measured directly rather than
+estimated: a step launches the same number of tiny ops regardless of batch size, and at
+batch <= 32 those launches, not the arithmetic, are what the GPU spends its time on.
+**At batch 1, GPU is no faster than CPU** (5.80 seq/s here vs 6.65-6.70 seq/s CPU torch/numba
+at batch 1, 16 threads) -- both are dominated by the same kind of fixed per-step overhead,
+paid on different hardware. Once batch size clears that floor, throughput is close to free:
+batch 32 is **~15x the CPU torch path's own best batch-32 number** (180 vs 12.2 seq/s), with
+zero kernel work. This was a deliberate choice, not an oversight: batching further to close
+the batch-1 gap (custom `numba.cuda.jit` kernels mirroring `kernels.py`, mirrored per-call
+race-freedom arguments and all) was evaluated and set aside in favour of this result -- the
+effort-to-payoff ratio wasn't close if a large-enough batch is acceptable for the research
+question at hand. Revisit that path specifically if genuine batch-1 GPU throughput is later
+needed; the invariants and race-freedom design in `kernels.py`'s CPU kernels are the
+template to port from.
+
+**Setup:** `torch.cuda.is_available()` needs nothing beyond what's already in the venv
+(torch's own bundled CUDA runtime, `cu130`). No `nvidia-smi` in `PATH` on the tested node --
+`/dev/nvidia*` and `torch.cuda` are the reliable way to check. `numba.cuda.jit` (only
+relevant if the custom-kernel path above is revisited) is a different story: it needs
+`libnvvm.so` and `libdevice.10.bc`, which nothing in the venv ships. `pip install
+nvidia-cuda-nvcc-cu12==12.4.131` (not the `cu13` variant -- installed and current at time of
+writing) provides both, but two of numba 0.65.1's internal lookups need help finding them:
+`get_supported_ccs()` needs an *unversioned* `libcudart.so` next to the versioned one from
+torch's own CUDA runtime (`ln -s libcudart.so.13 libcudart.so` in
+`nvidia/cu13/lib/`), and the CUDA_HOME-based nvvm lookup's regex requires a *versioned*
+name where the cu12 pip package ships an unversioned one (`ln -s libnvvm.so libnvvm.so.4`
+in `nvidia/cuda_nvcc/nvvm/lib64/`). With `CUDA_HOME=.../nvidia/cuda_nvcc` and
+`LD_LIBRARY_PATH` including `nvidia/cu13/lib`, `from numba import cuda; cuda.is_available()`
+and a trivial `@cuda.jit` kernel both work. None of this is needed for the plain-torch GPU
+path above -- only for a future custom-kernel port.
 
 ## Rules for changes
 

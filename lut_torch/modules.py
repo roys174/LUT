@@ -136,6 +136,16 @@ class NewAttentionHead(nn.Module):
         self.register_buffer('tok_j', torch.tensor(tok_j))
         self.register_buffer('pe_pos', torch.tensor(tok_i - tok_j))
 
+        # CSR inverse of tok_j (pair -> source position), for the fused-kernel backend's
+        # per-source-position parallel backward (lut_torch.kernels._k_grad_paired). Built
+        # once here rather than per call; unused by the torch backward path.
+        tok_j_t = self.tok_j
+        order = torch.argsort(tok_j_t, stable=True)
+        counts = torch.bincount(tok_j_t, minlength=cfg.context_size)
+        pair_ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+        self.register_buffer('final_pair_ptr', pair_ptr)
+        self.register_buffer('final_pair_list', order)
+
     def qkpe_margins(self, x, selection, capture):
         """Margins for the positional/low bits of the Final row index."""
         cfg = self.cfg
@@ -167,7 +177,9 @@ class NewAttentionHead(nn.Module):
 
         groups = [
             LutGroup(n_bits=cfg.positional_dim, fan_in=1, bit_offset=0),
-            self.Final.group(bit_offset=cfg.positional_dim, pair_index=self.tok_j),
+            LutGroup(n_bits=self.Final.n_c, fan_in=self.Final.fan_in,
+                    bit_offset=cfg.positional_dim, pair_index=self.tok_j,
+                    pair_ptr=self.final_pair_ptr, pair_list=self.final_pair_list),
         ]
         entry = {} if capture is not None else None
         y_pairs = lut_lookup(self.Final.S_flat, self.Final.trees, self.Final.n_bins,

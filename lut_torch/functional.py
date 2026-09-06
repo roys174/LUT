@@ -41,6 +41,8 @@ from typing import NamedTuple, Optional
 import torch
 import torch.nn.functional as F
 
+from . import kernels as _kernels
+
 # Mirrors main.COSINE_DISTANCE_EPS.
 COSINE_DISTANCE_EPS = 1e-8
 
@@ -79,6 +81,11 @@ class LutGroup(NamedTuple):
     fan_in: int
     bit_offset: int
     pair_index: Optional[torch.Tensor] = None
+    # CSR inverse of pair_index (pairs mapping to each source position), built once at
+    # construction -- see NewAttentionHead and lut_torch.kernels._k_grad_paired. Unused
+    # by the torch backward path; only the fused-kernel backend reads these.
+    pair_ptr: Optional[torch.Tensor] = None
+    pair_list: Optional[torch.Tensor] = None
 
     @property
     def raw_count(self) -> int:
@@ -166,19 +173,24 @@ class LUTFunction(torch.autograd.Function):
     def forward(ctx, S_flat, trees, n_bins, groups, selection, table_grad, capture,
                 *margins):
         n_trees = trees.shape[0]
+        use_kernels = _kernels.supported(S_flat, trees, groups, margins, selection)
         with torch.no_grad():
-            j, fallback = _index_and_fallback(margins, groups, n_trees)
-            idx = trees.to(torch.int64) * n_bins + j
-            # embedding_bag sums the tree axis without materialising the
-            # (B, P, N_T, y_dim) gather that embedding(...).sum(-2) would.
-            y = F.embedding_bag(idx.reshape(-1, n_trees), S_flat, mode='sum').view(
-                *idx.shape[:-1], S_flat.shape[-1])
+            if use_kernels:
+                y, j, fallback = _kernels.forward(S_flat, trees, n_bins, groups, margins)
+            else:
+                j, fallback = _index_and_fallback(margins, groups, n_trees)
+                idx = trees.to(torch.int64) * n_bins + j
+                # embedding_bag sums the tree axis without materialising the
+                # (B, P, N_T, y_dim) gather that embedding(...).sum(-2) would.
+                y = F.embedding_bag(idx.reshape(-1, n_trees), S_flat, mode='sum').view(
+                    *idx.shape[:-1], S_flat.shape[-1])
 
         ctx.save_for_backward(S_flat, trees, j, *fallback, *margins)
         ctx.groups = groups
         ctx.n_bins = n_bins
         ctx.selection = selection
         ctx.table_grad = table_grad
+        ctx.use_kernels = use_kernels
 
         if capture is not None:
             capture['j'] = j
@@ -224,26 +236,32 @@ class LUTFunction(torch.autograd.Function):
 
         grad_margins = [None] * len(margins)
         if need_margins:
-            S_j = F.embedding(idx, S_flat)
-            grad_yt = grad_y.unsqueeze(-2)
-            grad_sq = (grad_y * grad_y).sum(dim=-1, keepdim=True) if cosine else None
-            # gi = (S[jbar] - S[j]) . g  is split so the S[j] half is contracted once for
-            # all groups, and each contraction is a batched mat-vec rather than an
-            # elementwise product plus reduction over a (B, P, N_T, y_dim) temporary.
-            grad_col = grad_y.unsqueeze(-1)
-            S_j_dot = torch.matmul(S_j, grad_col).squeeze(-1)
+            needs_grad = [ctx.needs_input_grad[7 + gi] for gi in range(n_groups)]
+            if ctx.use_kernels and not cosine:
+                grad_margins = _kernels.backward_closest(
+                    S_flat, trees64, n_bins, groups, margins, j, fallback, grad_y,
+                    needs_grad)
+            else:
+                S_j = F.embedding(idx, S_flat)
+                grad_yt = grad_y.unsqueeze(-2)
+                grad_sq = (grad_y * grad_y).sum(dim=-1, keepdim=True) if cosine else None
+                # gi = (S[jbar] - S[j]) . g  is split so the S[j] half is contracted once
+                # for all groups, and each contraction is a batched mat-vec rather than an
+                # elementwise product plus reduction over a (B, P, N_T, y_dim) temporary.
+                grad_col = grad_y.unsqueeze(-1)
+                S_j_dot = torch.matmul(S_j, grad_col).squeeze(-1)
 
-            for gi_idx, (group, margin) in enumerate(zip(groups, margins)):
-                if not ctx.needs_input_grad[7 + gi_idx]:
-                    continue
-                if cosine:
-                    grad_margins[gi_idx] = _cosine_group_grad(
-                        S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq, idx,
-                        margin, group, fallback[gi_idx])
-                else:
-                    grad_margins[gi_idx] = _closest_group_grad(
-                        S_flat, trees64, n_bins, j, S_j_dot, grad_col,
-                        margin, group, fallback[gi_idx])
+                for gi_idx, (group, margin) in enumerate(zip(groups, margins)):
+                    if not needs_grad[gi_idx]:
+                        continue
+                    if cosine:
+                        grad_margins[gi_idx] = _cosine_group_grad(
+                            S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq, idx,
+                            margin, group, fallback[gi_idx])
+                    else:
+                        grad_margins[gi_idx] = _closest_group_grad(
+                            S_flat, trees64, n_bins, j, S_j_dot, grad_col,
+                            margin, group, fallback[gi_idx])
 
         return (grad_S, None, None, None, None, None, None, *grad_margins)
 
