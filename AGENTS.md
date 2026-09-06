@@ -250,6 +250,7 @@ This describes what commits and saved `config.txt` files show was attempted. It 
 - `compare_lut_checkpoint_rows.py CKPT...`: compares changed rows across first-last, first-all, or consecutive checkpoints.
 - `analyze_lut_model_tables.py MODEL.npz`: learned-table distributions and similarity.
 - `analyze_multiseed_metrics.py RUN_DIR`: aggregates seed loss CSVs.
+- `compare_run_validation.py RUN_DIR...`: scores any mix of `main.py` `.npz` and `lut_torch` `.pt` checkpoints on one pinned validation window set, reading each run's structural flags from its `config.txt`. Use this before believing any accuracy or loss difference read off two runs' `loss.csv` — see "Comparing runs" below.
 - `infer_lut_pos.py RUN_DIR --once 'text'` or `--infer-ambiguate`: LUT POS inference.
 - `infer_gpt_pos.py CHECKPOINT_DIR`: baseline inference.
 - `pos_majority_baseline.py`: empirical majority-POS baseline.
@@ -290,6 +291,34 @@ python main.py nanoGPT_POS/data/wiki2/train_original_10_freq.txt \
 ```
 
 This needs local data/vocab, dependencies, and POS cache or spaCy model. First Numba compilation may dominate a tiny run.
+
+## Comparing Runs
+
+`loss.csv` from two runs is not directly comparable, and the difference this hides is
+larger than most of the differences experiments are launched to measure.
+
+Each run fixes its validation windows once at startup by sampling `--testing-length`
+random starts. At the historical setting of 100 windows that is only ~2,900 scored
+tokens, whose 95% sampling interval on accuracy is **+/-1.1 points**. Two window sets
+drawn independently differ enough in difficulty that the *same* checkpoint scored 0.9201
+on one and 0.9374 on the other — a 1.7-point spread with no model difference at all.
+This is what made the first `lut_torch` GPU run
+(`results/POS_torch_gpu/20260906-142646_torch_gpu_WS8_bs1_sgd`) look better than the
+`main.py` run it was ported from (`results/POS_new_attn/20260814-101642`); scored on the
+same 1,000 windows the two land at identical accuracy (0.928331 each, 29,134 tokens),
+agreeing on 95.7% of individual predictions with 579 tokens right each way.
+
+So:
+
+- Compare checkpoints with `compare_run_validation.py`, never two `loss.csv` tails.
+- Runs launched from `run_files/` now use `--testing-length 1000` (+/-0.35 points).
+  The torch scripts pair it with `--validation-batch-size 100`, which keeps the 10x
+  window count roughly free; `main.py` scores one window at a time and pays ~23s per
+  validation, so check the interval before adding validations to a long run.
+- Both trainers now draw the validation windows the same way (Python `random`), so at
+  the same seed they score the same snippets and build the same model. See invariant 1 in
+  `lut_torch/AGENTS.md`. Training snippet order and dropout masks still diverge, so the
+  runs themselves are not step-for-step identical.
 
 ## Validation Expectations
 

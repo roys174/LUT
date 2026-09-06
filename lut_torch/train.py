@@ -494,7 +494,16 @@ def main(argv=None):
     print('=' * 50)
 
     train_set, val_set = load_datasets(args, enc)
-    val_starts = np.random.randint(0, val_set.length, size=args.testing_length)
+    # Drawn exactly as main.load_training_data draws testing_input_data: Python's
+    # `random`, one inclusive randint per snippet. Two things depend on this. The
+    # validation windows themselves match main.py's at the same seed, so a torch run and
+    # a main.py run report accuracy over the *same* snippets -- with only a few thousand
+    # scored tokens, two independently drawn window sets differ in difficulty by more
+    # than the model differences usually under test. And because this consumes Python
+    # RNG rather than NumPy RNG, both streams are left where main.build_Model finds
+    # them, so construction below matches main.py's too.
+    val_starts = np.array([random.randint(0, val_set.length - 1)
+                           for _ in range(args.testing_length)], dtype=np.int64)
 
     model = LutModel(cfg).to(device)
     print(f"Trainable tables: {len(model.table_parameters())}, "

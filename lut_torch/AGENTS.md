@@ -105,6 +105,24 @@ These are the things that will not raise an error but will quietly change result
    interleaved in the original order. The loops look naïve on purpose — vectorising them
    changes the stream and breaks parity. `test_construction_matches` guards this.
 
+   That guarantee is only as good as the RNG state the builder is handed, and
+   `test_torch_parity.py` builds both models back to back with nothing drawn in between,
+   so it cannot see a divergence introduced *before* construction. `train.py` has exactly
+   one draw there: `val_starts`. It uses Python `random.randint` in a loop, matching
+   `main.load_training_data`'s `testing_input_data` (`main.py:4548`) draw for draw, so at
+   the same seed both trainers hand `build_Model`/`LutModel` the same Python *and* NumPy
+   streams and construct the same model. Switching it back to `np.random.randint` (as it
+   was before) offsets the NumPy stream by `--testing-length` draws and every table in
+   the model differs — with no error and no test failure, because the parity suite never
+   goes through `train.py`. Anything new that draws before the model is constructed has
+   to be mirrored in `main.py` or it breaks this the same silent way.
+
+   Two streams still diverge after construction and are *not* aligned: training snippet
+   starts (`main.py` draws with Python `random`, `train.py` with `np.random.randint`) and
+   dropout masks (NumPy vs torch). Two runs of the same config therefore still take
+   different paths; they just start from the same model and are scored on the same
+   windows.
+
 2. **Loss scaling.** `main.py` *reports* a mean over valid positions but its table gradient
    is the *sum* over positions (`compute_gradients` writes `softmax - onehot` with no
    `1/CS`), averaged over the batch (replay scales by `lr/bs`). So the backward objective
