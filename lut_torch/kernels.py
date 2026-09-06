@@ -139,6 +139,21 @@ def _np(t):
     return t.contiguous().numpy()
 
 
+def _tree_rows_np(trees, batch):
+    """``trees`` as a ``(batch, N_T)`` int64 array, whatever form the caller passed.
+
+    The kernels index ``trees[b, t]`` unconditionally so that one call can cover several
+    stacked tables (a layer's 8 attention heads folded into the batch axis; see
+    :func:`lut_torch.functional._tree_rows`). A plain ``(N_T,)`` map is broadcast to every
+    row -- the array is a few hundred bytes, so materialising it per call is free next to
+    branching inside the kernel on every element.
+    """
+    rows = trees.to(torch.int64)
+    if rows.dim() == 1:
+        rows = rows.unsqueeze(0).expand(batch, rows.shape[0])
+    return _np(rows)
+
+
 # =============================================================================
 # Kernels
 # =============================================================================
@@ -193,7 +208,7 @@ if njit is not None:
             for d in range(ydim):
                 y_out[b, p, d] = np.float32(0.0)
             for t in range(T):
-                row = trees[t] * n_bins + j[b, p, t]
+                row = trees[b, t] * n_bins + j[b, p, t]
                 for d in range(ydim):
                     y_out[b, p, d] += S[row, d]
 
@@ -227,7 +242,7 @@ if njit is not None:
             b = w // (P * T)
             p = (w // T) % P
             t = w % T
-            row = trees[t] * n_bins + j[b, p, t]
+            row = trees[b, t] * n_bins + j[b, p, t]
             acc = np.float32(0.0)
             for d in range(ydim):
                 acc += S[row, d] * grad_y[b, p, d]
@@ -260,7 +275,7 @@ if njit is not None:
                 grad_u_out[b, p, t, c] = np.float32(0.0)
             rr = r[b, p, t]
             flip = 1 << (shift + rr // fan)
-            rowb = trees[t] * n_bins + (j[b, p, t] ^ flip)
+            rowb = trees[b, t] * n_bins + (j[b, p, t] ^ flip)
             gi = np.float32(0.0)
             for d in range(ydim):
                 gi += S[rowb, d] * grad_y[b, p, d]
@@ -286,7 +301,7 @@ if njit is not None:
             flip = 1 << (shift + rr // fan)
             tot = np.float32(0.0)
             for t in range(T):
-                rowb = trees[t] * n_bins + (j[b, p, t] ^ flip)
+                rowb = trees[b, t] * n_bins + (j[b, p, t] ^ flip)
                 gi = np.float32(0.0)
                 for d in range(ydim):
                     gi += S[rowb, d] * grad_y[b, p, d]
@@ -315,7 +330,7 @@ if njit is not None:
                 grad_u_out[b, pos, t, c] = np.float32(0.0)
             rr = r_src[b, pos, t]
             flip = 1 << (shift + rr // fan)
-            base = trees[t] * n_bins
+            base = trees[b, t] * n_bins
             tot = np.float32(0.0)
             for k in range(pair_ptr[pos], pair_ptr[pos + 1]):
                 p = pair_list[k]
@@ -414,8 +429,8 @@ def forward(S_flat, trees, n_bins, groups, margins):
     """
     layout = _layout(groups, margins)
     S_np = _np(S_flat)
-    trees_np = _np(trees.to(torch.int64))
-    n_trees = trees.shape[0]
+    n_trees = trees.shape[-1]
+    trees_np = _tree_rows_np(trees, margins[0].shape[0])
     # Largest work size across this call's kernels -- the bits/argmin passes are at most
     # as large as the combined (B, P, N_T) shape, so it alone decides serial-vs-parallel
     # and (when parallel) the thread cap.
@@ -470,7 +485,7 @@ def backward_closest(S_flat, trees, n_bins, groups, margins, j, fallback, grad_y
     paired accumulate-back-to-source.
     """
     S_np = _np(S_flat)
-    trees_np = _np(trees.to(torch.int64))
+    trees_np = _tree_rows_np(trees, j.shape[0])
     grad_y_np = _np(grad_y)
     j_np = _np(j)
     n_items = j.shape[0] * j.shape[1] * j.shape[2]

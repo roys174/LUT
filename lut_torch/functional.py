@@ -98,6 +98,19 @@ def _gather_pairs(margins: torch.Tensor, group: LutGroup) -> torch.Tensor:
     return margins.index_select(1, group.pair_index)
 
 
+def _tree_rows(trees: torch.Tensor) -> torch.Tensor:
+    """``trees`` shaped to broadcast against a ``(B, P, N_T)`` row index.
+
+    ``(N_T,)`` is the ordinary per-table map from logical comparator slot to physical tree.
+    ``(B, N_T)`` is the stacked form: row ``b`` carries its own table's rows, so a batch
+    axis that folds several independent tables together (the 8 attention heads of a layer,
+    see :class:`lut_torch.modules.StackedHeads`) addresses each one's own slab of a shared
+    ``S_flat`` without needing a separate call per table.
+    """
+    rows = trees.to(torch.int64)
+    return rows if rows.dim() == 1 else rows.unsqueeze(1)
+
+
 def _first_argmin(values: torch.Tensor) -> torch.Tensor:
     """Index of the first minimum along the last dim.
 
@@ -172,14 +185,14 @@ class LUTFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, S_flat, trees, n_bins, groups, selection, table_grad, capture,
                 *margins):
-        n_trees = trees.shape[0]
+        n_trees = trees.shape[-1]
         use_kernels = _kernels.supported(S_flat, trees, groups, margins, selection)
         with torch.no_grad():
             if use_kernels:
                 y, j, fallback = _kernels.forward(S_flat, trees, n_bins, groups, margins)
             else:
                 j, fallback = _index_and_fallback(margins, groups, n_trees)
-                idx = trees.to(torch.int64) * n_bins + j
+                idx = _tree_rows(trees) * n_bins + j
                 # embedding_bag sums the tree axis without materialising the
                 # (B, P, N_T, y_dim) gather that embedding(...).sum(-2) would.
                 y = F.embedding_bag(idx.reshape(-1, n_trees), S_flat, mode='sum').view(
@@ -206,7 +219,7 @@ class LUTFunction(torch.autograd.Function):
         groups = ctx.groups
         n_bins = ctx.n_bins
         cosine = ctx.selection == SELECTION_COSINE
-        trees64 = trees.to(torch.int64)
+        trees64 = _tree_rows(trees)
 
         grad_y = grad_y.contiguous()
         idx = trees64 * n_bins + j
@@ -238,8 +251,10 @@ class LUTFunction(torch.autograd.Function):
         if need_margins:
             needs_grad = [ctx.needs_input_grad[7 + gi] for gi in range(n_groups)]
             if ctx.use_kernels and not cosine:
+                # The raw map, not the broadcast-shaped ``trees64``: the kernels index
+                # ``trees[b, t]`` and normalise the shape themselves.
                 grad_margins = _kernels.backward_closest(
-                    S_flat, trees64, n_bins, groups, margins, j, fallback, grad_y,
+                    S_flat, trees, n_bins, groups, margins, j, fallback, grad_y,
                     needs_grad)
             else:
                 S_j = F.embedding(idx, S_flat)
@@ -400,8 +415,8 @@ def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None):
     surrogate gradient in backward.  Kept as a test oracle -- it cannot express
     ``cosine-distance``, whose selection depends on the upstream gradient.
     """
-    n_trees = trees.shape[0]
-    trees64 = trees.to(torch.int64)
+    n_trees = trees.shape[-1]
+    trees64 = _tree_rows(trees)
 
     with torch.no_grad():
         j, fallback = _index_and_fallback([m.detach() for m in margins], groups, n_trees)

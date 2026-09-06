@@ -252,9 +252,21 @@ on the machine you will actually train on — a shared login node gives noisy nu
 - `--load-model` resumes properly (model + optimizer + scheduler + step + RNG).
   `--reset-optimizer` loads weights only.
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
-- `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. On GPU, batch size stops being a
-  CPU-thread-efficiency knob and becomes the whole story: batch >= 32 is close to free
-  there, batch 1 gets no benefit over CPU at all. `--kernels` is silently a no-op on GPU.
+- `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. `--kernels` is silently a no-op on
+  GPU.
+- `--stack-heads {auto,on,off}` — run a layer's heads as 4 `lut_lookup` calls instead of
+  `4 * H` (`StackedHeads`). `auto` is on whenever `num_heads > 1`. 3.8x on GPU and 2.0x on
+  CPU at the production shape. **It changes the parameter layout**, so the state dict keys
+  differ; `--load-model` converts a per-head checkpoint automatically (`stacking.py`) and
+  says so, discarding optimizer state because the parameter grouping changed. The forward
+  is bit-identical to the unstacked path and single-layer gradients are too; deeper
+  gradients differ by 1-3 float32 ULP because fusing `H` per-head gathers reassociates the
+  scatter-add into the layer input. That is why the unstacked path still exists and why
+  `test_torch_parity.py` builds models unstacked.
+- `--cuda-graphs {auto,on,off}` — replay forward+backward from a single launch
+  (`graphs.py`). `auto` is on for `--device cuda`, a no-op on CPU. Numerically identical.
+  Forces `--table-grad dense`; refuses to combine with an explicit `--table-grad sparse`.
+  The optimizer and LR scheduler stay eager on purpose — see the module docstring.
 
 **Not carried over** (still available in `main.py`): old hard attention, `--soft-attention`,
 `--factored-output`, `--fp16`, `no-overlap`/`overlap` comparison modes,
@@ -267,6 +279,9 @@ on the machine you will actually train on — a shared login node gives noisy nu
 .venv/bin/python test_torch_lut_primitive.py
 .venv/bin/python test_torch_parity.py
 .venv/bin/python test_torch_training.py
+.venv/bin/python test_torch_kernels.py
+.venv/bin/python test_torch_stacking.py
+.venv/bin/python test_torch_graphs.py     # skips itself without a GPU
 ```
 
 The venv has torch but no pytest; the cluster python has pytest but no torch. The tests
@@ -279,6 +294,13 @@ import `parametrize`/`run_all` from `_testing.py` so they run under either
 | `test_torch_lut_primitive` | the primitive against `main.py`'s own kernels, plus `LUTFunction` vs `lut_lookup_reference` |
 | `test_torch_parity` | whole-model step equality with `main.py` across 17 configurations |
 | `test_torch_training` | batch equivalence, LR schedule vs `main.get_learning_rate`, checkpoint resume, evaluation |
+| `test_torch_kernels` | the fused Numba backend against the torch path, both layouts |
+| `test_torch_stacking` | stacked heads vs unstacked: exact forward, exact single-layer gradients, float32-epsilon bound deeper, call-count reduction, checkpoint conversion |
+| `test_torch_graphs` | CUDA-graph replay vs eager over *consecutive* steps, dropout redraw, and the zero_grad misuse guard. Skips itself without a GPU |
+
+`test_torch_stacking` is the reason stacking is safe to trust: parity pins unstacked
+against `main.py`, and stacking pins stacked against unstacked, so the guarantee carries
+across without rewriting the parity suite to understand a second parameter layout.
 
 ### The parity contract
 
@@ -389,10 +411,16 @@ with batch size — and it is the binding constraint:
 - On GPU it sets a kernel-launch floor of roughly 90-230 ms/step regardless of batch, which
   is what a port would have to beat.
 
-The two changes that would actually move it, in order: **batch the heads of a layer into
-one set of ops** (cuts the op count ~`num_heads`x, helps CPU and GPU alike), then
-`torch.compile` / CUDA graphs. A Numba kernel inside `LUTFunction.backward` remains
-available as a last resort — CPU torch tensors are zero-copy `.numpy()`.
+Both of the changes that move it are now implemented, and both attack the launch count
+rather than the arithmetic — see "GPU" below for the numbers:
+
+- **`--stack-heads`** runs a layer's heads as 4 `lut_lookup` calls instead of `4 * H`
+  (`StackedHeads` in `modules.py`). This is the one that also helps CPU.
+- **`--cuda-graphs`** replays the whole forward+backward from one launch (`graphs.py`).
+  GPU only, by construction.
+
+What is left after those is genuinely fused kernels; `lut_torch/PLAN_gpu_kernels.md` has
+the measured case for and against, and concludes with Triton rather than `numba.cuda`.
 
 ### GPU
 
@@ -413,30 +441,81 @@ checkpoint save/resume round-trips correctly (RNG state now includes
 `torch.cuda.get_rng_state_all()` alongside python/numpy/torch, so a resumed GPU run's
 dropout stream is reproducible too).
 
-**Performance -- this is the one number that actually matters**, production shape:
+Re-checked with `--stack-heads` and `--cuda-graphs` both on: a 1,500-step run at the
+production shape trained normally (perplexity 18.0 → 6.35 → 6.18, accuracy 5% → 52%),
+saved, and resumed cleanly — the graph is captured lazily on the first step *after* any
+checkpoint load, so resume re-captures against the restored weights rather than replaying
+a stale one (perplexity 3.39, accuracy 59% at the post-resume validation).
 
-| batch | ms/step | seq/s |
-|---|---|---|
-| 1 | 172.4 | 5.80 |
-| 8 | 173.1 | 46.21 |
-| 32 | 177.6 | **180.20** |
-| 128 | 435.9 | 293.63 |
+**Where the time went, before either optimisation** (profiler, production shape, batch 1):
 
-Batch 1/8/32 cost almost exactly the same wall-clock time -- that is the ~30,000-ATen-op
-kernel-launch floor from "If you need more speed" above, measured directly rather than
-estimated: a step launches the same number of tiny ops regardless of batch size, and at
-batch <= 32 those launches, not the arithmetic, are what the GPU spends its time on.
-**At batch 1, GPU is no faster than CPU** (5.80 seq/s here vs 6.65-6.70 seq/s CPU torch/numba
-at batch 1, 16 threads) -- both are dominated by the same kind of fixed per-step overhead,
-paid on different hardware. Once batch size clears that floor, throughput is close to free:
-batch 32 is **~15x the CPU torch path's own best batch-32 number** (180 vs 12.2 seq/s), with
-zero kernel work. This was a deliberate choice, not an oversight: batching further to close
-the batch-1 gap (custom `numba.cuda.jit` kernels mirroring `kernels.py`, mirrored per-call
-race-freedom arguments and all) was evaluated and set aside in favour of this result -- the
-effort-to-payoff ratio wasn't close if a large-enough batch is acceptable for the research
-question at hand. Revisit that path specifically if genuine batch-1 GPU throughput is later
-needed; the invariants and race-freedom design in `kernels.py`'s CPU kernels are the
-template to port from.
+```
+wall                         373 ms/step
+GPU busy                      94 ms/step      <-- 25% of wall
+CUDA kernel launches/step  29,214
+aten:: calls/step          59,029
+```
+
+Not compute-bound; **launch-bound twice over**. ~280 ms is Python + autograd + ATen
+dispatch + `cudaLaunchKernel` at ~12 us a launch, and the 94 ms of "GPU busy" is itself
+29,214 kernels at this card's ~3.2 us minimum kernel duration -- almost none of it
+arithmetic. Two scaling curves confirm it: cost was linear in head count (1/2/4/8 heads →
+63/107/182/370 ms) and flat in batch size (1/4/16 → 380/342/430 ms). Sixteen times the
+work for 13% more time.
+
+There is no missing parallelism *inside* a sample -- every `(position, tree)` is already
+an independent thread. There is just not enough of it at batch 1. Against this card's
+69,632 resident threads: a Q/K/V/FFN call is 1,024 work items (**1.5%** of the machine), a
+Final call 15,872 (22.8%). The fix is to make independent *tables* share a launch, which
+is what `--stack-heads` does (8 heads stacked: 8,192 and 126,976 items).
+
+**Measured end to end on the real trainer**, production shape, batch 1, 400 steps,
+steady-state rate:
+
+| | step/s | ms/step | speedup |
+|---|---|---|---|
+| neither | 2.92 | 342 | 1.0x |
+| `--stack-heads` only | 15.94 | 62.7 | 5.5x |
+| `--cuda-graphs` only | 10.04 | 99.6 | 3.4x |
+| **both** | **24.32** | **41.1** | **8.3x** |
+
+They are **not** multiplicative (5.5 x 3.4 would be 18.7x), because they overlap: both
+attack launch cost, just at different ends. Stacking removes ~8/9 of the launches; graphs
+remove the CPU price of whatever launches remain, so there is less left for them to remove
+once stacking has run. Adding graphs on top of stacking is a further 1.53x; adding stacking
+on top of graphs is a further 2.42x. Take both. Loss curves are identical across all four.
+
+Batch size still buys sequences/second but is no longer the only lever it was. For
+reference, the pre-optimisation batch scan was 172/173/178/436 ms/step at batch 1/8/32/128
+-- i.e. batch 32 was the only way to get value out of the card. It no longer is.
+
+**What is left, and would a bigger card help?** Under a graph the step breaks down as:
+
+| | forward | backward | optimizer | launches | launch floor |
+|---|---|---|---|---|---|
+| unstacked | 23.3 | 77.0 | 12.9 | 29,820 | 95 ms (**84%** of the step) |
+| stacked | 4.5 | 38.2 | 12.3 | 4,106 | 13 ms (**24%**) |
+
+(Measured with gradients zeroed inside the graph, which is why the totals are above the
+trainer's — the trainer uses the cheaper assign-on-first-backward path. The split is what
+matters here.)
+
+So stacking moved the model *out* of the launch-floor regime: 76% of a stacked step is now
+real memory-bound work, where before 84% was launch overhead. Two consequences:
+
+- **A faster card now helps, where before it barely would.** The bandwidth-bound 76%
+  scales with memory bandwidth (this card: 616 GB/s, and the optimizer alone moves ~3.7 GB
+  per step at ~300 GB/s effective). Scaling that part and halving the launch floor puts an
+  A100 at roughly 2-2.5x and an H100 at roughly 3-3.5x this card. That is an estimate from
+  the composition above, not a measurement — no second GPU was available to check it.
+  A bigger card also lifts the batch ceiling a long way (peak memory here is 1.94 GB of
+  11.3 GB).
+- **Fused kernels are still worth more than a bigger card**, and would make a bigger card
+  pay off better, since they cut both the remaining 4,106 launches and the intermediate
+  memory traffic. Backward is 3x forward and is the target.
+  `lut_torch/PLAN_gpu_kernels.md` argues for Triton (already installed, graph-capturable,
+  needs no `nvcc` — there is none on the node) over `numba.cuda.jit`. Its 10-18 ms estimate
+  predates stacking and should be re-derived before anyone commits to that work.
 
 **Setup:** `torch.cuda.is_available()` needs nothing beyond what's already in the venv
 (torch's own bundled CUDA runtime, `cu130`). No `nvidia-smi` in `PATH` on the tested node --

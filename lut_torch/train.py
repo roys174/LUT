@@ -37,6 +37,7 @@ from tqdm import tqdm
 
 from .config import ConfigError, LutConfig
 from .data import IGNORE_INDEX, load_datasets
+from .graphs import GraphedTrainStep
 from .kernels import KERNEL_BACKEND_MODES, set_kernel_backend, set_kernel_threads
 from .functional import (
     SELECTION_CLOSEST,
@@ -46,6 +47,7 @@ from .functional import (
     TABLE_GRAD_SPARSE,
 )
 from .modules import LutModel
+from .stacking import looks_unstacked, stack_state_dict
 
 DEFAULT_WARMUP_STEPS = 4000
 DEFAULT_MAX_LEARNING_RATE = 1.0 / math.sqrt(4001)
@@ -110,6 +112,15 @@ def build_parser():
                         "faster than the torch path at batch 1; see lut_torch/AGENTS.md, "
                         "'Kernels'), falling back to torch otherwise. Numerically "
                         "identical either way -- the parity suite runs both.")
+    p.add_argument('--stack-heads', dest='stack_heads_mode',
+                   choices=['auto', 'on', 'off'], default='auto',
+                   help="Run each layer's heads as 4 stacked LUT calls instead of 4*H "
+                        "separate ones (5.7x measured on the Final call at the production "
+                        "shape; see lut_torch/modules.py, StackedHeads). 'auto' enables it "
+                        "whenever there is more than one head. Bit-identical to the "
+                        "unstacked path, but it changes the checkpoint layout -- an "
+                        "unstacked checkpoint is converted on load, not the other way "
+                        "round.")
     p.add_argument('--layernorm', action='store_true')
     p.add_argument('--dropout', type=float, default=0.0)
 
@@ -142,6 +153,14 @@ def build_parser():
                         "table_grad's dense path (index_add_) accumulates with atomics "
                         "on CUDA, so gradients are not bit-reproducible run to run; the "
                         "parity suite is CPU-only and unaffected.")
+    p.add_argument('--cuda-graphs', choices=['auto', 'on', 'off'], default='auto',
+                   help="Replay forward+backward from a single CUDA-graph launch instead "
+                        "of ~29,000 kernel launches (3.4x measured at the production POS "
+                        "shape, batch 1; see lut_torch/graphs.py). 'auto' enables it on "
+                        "CUDA and is a no-op on CPU. Numerically identical -- capture "
+                        "changes which CPU work happens, not which kernels run. Requires "
+                        "--table-grad dense (sparse COO tensors cannot be captured), "
+                        "which is selected automatically unless you asked for sparse.")
 
     # validation / logging / checkpoints
     p.add_argument('--testing-length', type=int, default=10000,
@@ -202,6 +221,28 @@ def resolve_device(args, parser):
         parser.error(f"--device {args.device} requested but torch.cuda.is_available() "
                      f"is False")
     return device
+
+
+def resolve_cuda_graphs(args, device, parser):
+    """Whether to capture the step into a CUDA graph, forcing the settings it needs.
+
+    Must run before :class:`LutConfig` is built, because enabling graphs pins
+    ``table_grad`` to dense and the config carries that into the model.
+    """
+    if args.cuda_graphs == 'off':
+        return False
+    if device.type != 'cuda':
+        if args.cuda_graphs == 'on':
+            parser.error('--cuda-graphs on requires --device cuda')
+        return False
+    if args.table_grad == TABLE_GRAD_SPARSE:
+        # Sparse COO gradients allocate per step and cannot be captured. Refuse rather
+        # than silently overriding an explicit request.
+        if args.cuda_graphs == 'on':
+            parser.error('--cuda-graphs on is incompatible with --table-grad sparse')
+        return False
+    args.table_grad = TABLE_GRAD_DENSE
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -288,23 +329,45 @@ def save_checkpoint(path, model, cfg, optimizers, schedulers, step, args):
     }, checkpoint_path(path))
 
 
+def _restore_rng(rng):
+    if not rng:
+        return
+    random.setstate(rng['python'])
+    np.random.set_state(rng['numpy'])
+    torch.set_rng_state(rng['torch'])
+    if rng.get('torch_cuda') is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng['torch_cuda'])
+
+
 def load_checkpoint(path, model, optimizers, schedulers, reset_optimizer):
     ckpt = torch.load(checkpoint_path(path), map_location='cpu', weights_only=False)
-    model.load_state_dict(ckpt['model'])
+    state = ckpt['model']
+    converted = looks_unstacked(state, model)
+    if converted:
+        # A run started before --stack-heads (or with it off) wrote one table per head;
+        # fold them into this model's slabs so the run can be resumed rather than
+        # restarted. Optimizer state is dropped below: it is indexed by parameter, and
+        # 4*H tables have just become 3.
+        state = stack_state_dict(state, model)
+        print('Converted a per-head checkpoint into the stacked head layout')
+    model.load_state_dict(state)
+    if converted and not reset_optimizer:
+        print('  optimizer state discarded (parameter grouping changed); '
+              'step, schedule and RNG are kept')
+        for sched, sched_state in zip(schedulers, ckpt['schedulers']):
+            sched.load_state_dict(sched_state)
+        _restore_rng(ckpt.get('rng'))
+        step = int(ckpt['step'])
+        print(f"Resumed from {checkpoint_path(path)} at step {step}")
+        return step
     if reset_optimizer:
         print(f"Loaded weights from {checkpoint_path(path)} (optimizer state reset)")
         return 0
     for opt, state in zip(optimizers, ckpt['optimizers']):
         opt.load_state_dict(state)
-    for sched, state in zip(schedulers, ckpt['schedulers']):
-        sched.load_state_dict(state)
-    rng = ckpt.get('rng')
-    if rng:
-        random.setstate(rng['python'])
-        np.random.set_state(rng['numpy'])
-        torch.set_rng_state(rng['torch'])
-        if rng.get('torch_cuda') is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng['torch_cuda'])
+    for sched, sched_state in zip(schedulers, ckpt['schedulers']):
+        sched.load_state_dict(sched_state)
+    _restore_rng(ckpt.get('rng'))
     step = int(ckpt['step'])
     print(f"Resumed from {checkpoint_path(path)} at step {step}")
     return step
@@ -402,6 +465,15 @@ def main(argv=None):
     if args.POS_task and args.tokenizer != 'word':
         parser.error('--POS-task requires --tokenizer word')
 
+    # Device and the graph decision both come before the config: enabling graphs pins
+    # table_grad to dense, and LutConfig carries that setting into the model.
+    device = resolve_device(args, parser)
+    use_graphs = resolve_cuda_graphs(args, device, parser)
+    # A single head has nothing to stack, so 'auto' leaves it alone rather than paying
+    # for the reshapes that make the stacked layout work.
+    args.stack_heads = (args.stack_heads_mode == 'on'
+                        or (args.stack_heads_mode == 'auto' and args.num_heads > 1))
+
     try:
         cfg = LutConfig.from_namespace(args)
     except ConfigError as exc:
@@ -415,6 +487,7 @@ def main(argv=None):
                 'max_steps',
                 'warmup_steps', 'max_learning_rate', 'lr_scheduler',
                 'inverse_sqrt_alpha', 'cosine_min_lr_ratio', 'seed', 'cpu_cores', 'kernels',
+                'device', 'cuda_graphs',
                 'testing_length', 'validation_interval', 'loss_file', 'save_model',
                 'load_model'):
         print(f"  {key:24s} = {getattr(args, key)}")
@@ -423,12 +496,11 @@ def main(argv=None):
     train_set, val_set = load_datasets(args, enc)
     val_starts = np.random.randint(0, val_set.length, size=args.testing_length)
 
-    device = resolve_device(args, parser)
     model = LutModel(cfg).to(device)
     print(f"Trainable tables: {len(model.table_parameters())}, "
           f"table entries: {sum(p.numel() for p in model.table_parameters()):,}, "
           f"dense parameters: {sum(p.numel() for p in model.dense_parameters()):,}, "
-          f"device: {device}")
+          f"device: {device}, cuda graphs: {'on' if use_graphs else 'off'}")
 
     optimizers, schedulers = build_optimizers(model, args)
     start_step = 0
@@ -462,17 +534,37 @@ def main(argv=None):
     ema_alpha = 0.02
     last = {}
 
+    # The graph is captured on the first real batch, after any checkpoint has been
+    # loaded, so it records the shapes and parameters the run actually uses.
+    graphed = None
+
     pbar = tqdm(range(start_step, args.max_steps), desc='Training', unit='step')
     for step in pbar:
         starts = np.random.randint(0, train_set.length, size=args.batch_size)
         inputs, targets = train_set.batch(starts)
-        objective, mean_loss, _, _ = batch_loss(
-            model, torch.from_numpy(inputs).to(device), torch.from_numpy(targets).to(device),
-            cfg.vocab_size_output)
+        inputs = torch.from_numpy(inputs).to(device)
+        targets = torch.from_numpy(targets).to(device)
 
-        for opt in optimizers:
-            opt.zero_grad(set_to_none=True)
-        (objective / args.batch_size).backward()
+        if use_graphs:
+            if graphed is None:
+                graphed = GraphedTrainStep(model, inputs, targets, cfg.vocab_size_output,
+                                           IGNORE_INDEX, args.batch_size)
+                tqdm.write('Captured forward+backward into a CUDA graph')
+            # No zero_grad: every replay overwrites .grad in place (see graphs.py).
+            mean_loss, _, _ = graphed.run(inputs, targets)
+            if step == start_step + 1:
+                # One check, after a full replay + opt.step() cycle has run: catches a
+                # future edit that reintroduces zero_grad(set_to_none=True) here, which
+                # would otherwise show up only as a run that trains at full speed and
+                # learns nothing.
+                graphed.assert_grads_intact()
+        else:
+            objective, mean_loss, _, _ = batch_loss(model, inputs, targets,
+                                                    cfg.vocab_size_output)
+            for opt in optimizers:
+                opt.zero_grad(set_to_none=True)
+            (objective / args.batch_size).backward()
+
         for opt in optimizers:
             opt.step()
         for sched in schedulers:

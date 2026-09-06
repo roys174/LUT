@@ -192,6 +192,237 @@ class NewAttentionHead(nn.Module):
         return out.index_add_(1, self.tok_i, y_pairs)
 
 
+class StackedHeads(nn.Module):
+    """All of a layer's attention heads, executed as 4 LUT calls instead of ``4 * H``.
+
+    The heads of a layer are mutually independent and read the same ``x``; Q and K on top
+    of that have identical shapes.  Running them as separate :class:`NewAttentionHead`
+    modules therefore costs ``H`` times the *calls* for the same work, and at batch 1 this
+    model is bound by call count, not work.  Measured on an RTX 2080 Ti at the production
+    POS shape: 8 separate Final calls cost 15.07 ms while one call with 8x the rows costs
+    2.63 ms, and a single-head call already costs 2.46 ms -- eight times the work for 7%
+    more time.  A single small LUT call occupies 1.5% of the card's 69,632 resident
+    threads, so the machine is idle waiting for launches, not busy.
+
+    The stacking axis is folded into the *batch* dimension, and each stacked table gets its
+    own slab of one shared ``S_flat``; which slab is selected by the per-row tree map that
+    :func:`lut_torch.functional._tree_rows` accepts.  Nothing else about the computation
+    changes, so the **forward is bit-identical** to the unstacked path -- including the
+    order in which head outputs are summed back into the residual stream, which
+    :class:`LutLayer` deliberately keeps sequential for exactly that reason.
+
+    The backward is bit-identical too *except* for the gradient that flows back into the
+    layer's input.  Unstacked, ``u = x[a] - x[b]`` is ``H`` separate gathers whose
+    backwards are ``H`` separate scatter-adds into ``x.grad``; stacked, it is one gather
+    and one scatter-add covering every head, so the same terms are summed in a different
+    order.  Float32 addition is not associative, so layers *below* the top see a
+    difference of 1-3 ULP (measured: 0.0 at one layer, 2.1e-7 relative at two, 3.2e-7 at
+    three).  That is the same class of reassociation as changing a thread count, it does
+    not compound with depth, and closing it would mean giving up the fused gather -- the
+    interleaving of per-head V/Q/K gathers cannot be reproduced once the heads share a
+    call.  ``test_torch_stacking.py`` pins both halves of this: exact forward, exact
+    single-layer gradients, and a float32-epsilon bound on deeper ones.
+
+    Construction goes through real :class:`NewAttentionHead` objects and then stacks their
+    buffers.  That is not laziness: it is the only way to guarantee the RNG draw order
+    still matches ``main.build_Model`` head by head, which is what
+    ``test_torch_parity.py`` rests on.  The per-head tables are all-zero at construction,
+    so nothing but small index buffers is copied.
+    """
+
+    def __init__(self, cfg, layer_index, frozen_pe=None):
+        super().__init__()
+        self.cfg = cfg
+        heads = [NewAttentionHead(cfg, f'head_{layer_index}_{h}', frozen_pe)
+                 for h in range(cfg.num_heads)]
+        self.head_names = [h.name for h in heads]
+        H = cfg.num_heads
+
+        def stack(attr, mods):
+            return torch.stack([getattr(m, attr) for m in mods])
+
+        # Q and K share a shape, so they stack into one table of 2H slots: slots [0, H)
+        # are the Q heads and [H, 2H) the K heads.
+        qk = [h.Q for h in heads] + [h.K for h in heads]
+        self._add_stack('qk', qk, cfg.attn_qk_dim)
+        self._add_stack('v', [h.V for h in heads], cfg.head_value_dim)
+        self._add_stack('final', [h.Final for h in heads], cfg.head_value_dim)
+
+        self.positional_encoding = nn.Parameter(
+            torch.stack([h.positional_encoding.detach() for h in heads]),
+            requires_grad=not cfg.freeze_PE)
+        self.register_buffer('qkpe_a', stack('qkpe_a', heads))
+        self.register_buffer('qkpe_b', stack('qkpe_b', heads))
+
+        first = heads[0]
+        for name in ('tok_i', 'tok_j', 'pe_pos', 'final_pair_ptr', 'final_pair_list'):
+            self.register_buffer(name, getattr(first, name).clone())
+        self.n_pairs = self.tok_i.shape[0]
+
+    def _add_stack(self, prefix, tables, y_dim):
+        """Register one stacked table: flat parameter, flat a/b indices, offset tree map."""
+        n_slots = len(tables)
+        first = tables[0]
+        rows_per_slot = first.s_n_t * first.n_bins
+        setattr(self, f'{prefix}_n_bins', first.n_bins)
+        setattr(self, f'{prefix}_n_c', first.n_c)
+        setattr(self, f'{prefix}_fan_in', first.fan_in)
+        setattr(self, f'{prefix}_n_t', first.n_t)
+        setattr(self, f'{prefix}_slots', n_slots)
+        self.register_parameter(
+            f'{prefix}_S_flat',
+            nn.Parameter(torch.zeros(n_slots * rows_per_slot, y_dim)))
+        # a/b flattened to a single index vector so the margins are one index_select
+        # rather than one per slot; the (slot, tree, raw) structure is restored by a view.
+        self.register_buffer(f'{prefix}_a',
+                             torch.stack([t.a_arr for t in tables]))
+        self.register_buffer(f'{prefix}_b',
+                             torch.stack([t.b_arr for t in tables]))
+        # Each slot's rows sit at slot * rows_per_slot, so the tree map carries the offset
+        # and one call addresses every slot's own table.
+        offsets = (torch.arange(n_slots, dtype=torch.int64).unsqueeze(1)
+                   * first.s_n_t)
+        self.register_buffer(f'{prefix}_trees',
+                             torch.stack([t.trees for t in tables]) + offsets)
+
+    def _slot_trees(self, prefix, batch):
+        """The stacked tree map replicated over the batch, as ``(batch * slots, N_T)``."""
+        trees = getattr(self, f'{prefix}_trees')
+        slots, n_t = trees.shape
+        return trees.unsqueeze(0).expand(batch, slots, n_t).reshape(batch * slots, n_t)
+
+    def _shared_margins(self, prefix, x):
+        """``u = x[a] - x[b]`` for every slot, from an input all slots share.
+
+        Returns ``(B * slots, P, N_T, R)``.  One ``index_select`` covers every slot; the
+        permute that follows moves the slot axis next to the batch so the fold is
+        ``b * slots + s``.
+        """
+        a = getattr(self, f'{prefix}_a')
+        b = getattr(self, f'{prefix}_b')
+        slots, n_t, raw = a.shape
+        flat_a, flat_b = a.reshape(-1), b.reshape(-1)
+        u = x.index_select(-1, flat_a) - x.index_select(-1, flat_b)
+        u = u.view(*x.shape[:-1], slots, n_t, raw)
+        return u.permute(0, 2, 1, 3, 4).reshape(x.shape[0] * slots, x.shape[1], n_t, raw)
+
+    def _per_slot_margins(self, prefix, x):
+        """``u = x[a] - x[b]`` where both the input and the indices are per slot.
+
+        ``x`` is ``(B, slots, P, D)`` -- the Final table's V input.  Returns
+        ``(B * slots, P, N_T, R)``; no permute is needed, the slot axis is already in
+        place.
+        """
+        a = getattr(self, f'{prefix}_a')
+        b = getattr(self, f'{prefix}_b')
+        slots, n_t, raw = a.shape
+        B, _, P, _ = x.shape
+        shape = (B, slots, P, n_t * raw)
+        ua = x.gather(-1, a.reshape(1, slots, 1, -1).expand(shape))
+        ub = x.gather(-1, b.reshape(1, slots, 1, -1).expand(shape))
+        return (ua - ub).view(B * slots, P, n_t, raw)
+
+    def _lookup(self, prefix, margins, groups, batch, capture, names):
+        table_grad = self.cfg.table_grad
+        entry = {} if capture is not None else None
+        y = lut_lookup(getattr(self, f'{prefix}_S_flat'), self._slot_trees(prefix, batch),
+                       getattr(self, f'{prefix}_n_bins'), groups, margins,
+                       selection=self.cfg.gradient_pair_selection,
+                       table_grad=table_grad, capture=entry)
+        if capture is not None:
+            self._split_capture(entry, capture, names, batch, len(names))
+        return y
+
+    def _split_capture(self, entry, capture, names, batch, slots):
+        """Re-expose a stacked call's ``j``/``r`` per slot, under the unstacked names.
+
+        The slab offset lives in the tree map, not in ``j``, so a slot's rows are exactly
+        the unstacked model's -- a plain reshape and select recovers them.
+        """
+        j = entry['j'].view(batch, slots, *entry['j'].shape[1:])
+        for slot, name in enumerate(names):
+            capture[name] = {
+                'j': j[:, slot],
+                'r_closest': [r.view(batch, slots, *r.shape[1:])[:, slot]
+                              for r in entry['r_closest']],
+            }
+
+    def forward(self, x, selection, capture=None):
+        cfg = self.cfg
+        B, CS, _ = x.shape
+        H = cfg.num_heads
+
+        # --- V, and Q/K together: three stacked calls covering 3H tables -------------
+        v_margins = self._shared_margins('v', x)
+        v = self._lookup('v', [v_margins],
+                         [LutGroup(n_bits=self.v_n_c, fan_in=self.v_fan_in,
+                                   bit_offset=0)],
+                         B, capture, [f'{n}_V' for n in self.head_names])
+        v = v.view(B, H, CS, cfg.head_value_dim)
+
+        if cfg.PE_only:
+            qkpe = self._pe_only_margins(x, B)
+        else:
+            qk_margins = self._shared_margins('qk', x)
+            qk = self._lookup('qk', [qk_margins],
+                              [LutGroup(n_bits=self.qk_n_c, fan_in=self.qk_fan_in,
+                                        bit_offset=0)],
+                              B, capture,
+                              [f'{n}_Q' for n in self.head_names]
+                              + [f'{n}_K' for n in self.head_names])
+            qk = qk.view(B, 2 * H, CS, cfg.attn_qk_dim)
+            qkpe = self._qkpe_margins(qk[:, :H], qk[:, H:], B)
+
+        # --- Final: one call covering all H heads -----------------------------------
+        final_margins = self._per_slot_margins('final', v)
+        groups = [
+            LutGroup(n_bits=cfg.positional_dim, fan_in=1, bit_offset=0),
+            LutGroup(n_bits=self.final_n_c, fan_in=self.final_fan_in,
+                     bit_offset=cfg.positional_dim, pair_index=self.tok_j,
+                     pair_ptr=self.final_pair_ptr, pair_list=self.final_pair_list),
+        ]
+        y_pairs = self._lookup('final', [qkpe, final_margins], groups, B, capture,
+                               [f'{n}_Final' for n in self.head_names])
+        y_pairs = y_pairs.view(B, H, self.n_pairs, cfg.head_value_dim)
+
+        out = x.new_zeros(B, H, CS, cfg.head_value_dim)
+        return out.index_add_(2, self.tok_i, y_pairs)
+
+    def _pe(self, active):
+        return self.positional_encoding.index_select(1, self.pe_pos)[..., :active]
+
+    def _pe_only_margins(self, x, batch):
+        cfg = self.cfg
+        combined = self._pe(cfg.qkpe_active_dim).unsqueeze(0).expand(
+            batch, -1, -1, -1)
+        return self._finish_qkpe(combined, batch)
+
+    def _qkpe_margins(self, q, k, batch):
+        cfg = self.cfg
+        active = cfg.qkpe_active_dim
+        qk = q.index_select(2, self.tok_i) + k.index_select(2, self.tok_j)
+        qk = qk[..., :active]
+        if cfg.normalize_qk:
+            qk = normalize_to_target(qk, cfg.qk_norm_target_std, cfg.qk_norm_eps)
+        return self._finish_qkpe(qk + self._pe(active), batch)
+
+    def _finish_qkpe(self, combined, batch):
+        """``combined`` is ``(B, H, n_pairs, active)`` -> margins ``(B*H, n_pairs, T, R)``."""
+        cfg = self.cfg
+        H = cfg.num_heads
+        if cfg.qkpe_direct_sign:
+            # Bit c is sign(combined[c]); the margin is shared by every tree, so the tree
+            # axis stays at size 1 and the lookup broadcasts it.
+            out = combined[..., :cfg.positional_dim].unsqueeze(-2)
+            return out.reshape(batch * H, self.n_pairs, 1, cfg.positional_dim)
+        a, b = self.qkpe_a, self.qkpe_b
+        slots, n_t, raw = a.shape
+        shape = combined.shape[:-1] + (n_t * raw,)
+        ua = combined.gather(-1, a.reshape(1, slots, 1, -1).expand(shape))
+        ub = combined.gather(-1, b.reshape(1, slots, 1, -1).expand(shape))
+        return (ua - ub).reshape(batch * H, self.n_pairs, n_t, raw)
+
+
 class LutLayer(nn.Module):
     """Pre-norm attention block plus pre-norm FFN block, both residual."""
 
@@ -208,10 +439,14 @@ class LutLayer(nn.Module):
                                   cfg.num_heads * cfg.head_value_dim)
         else:
             self.mha_o = None
-        self.heads = nn.ModuleList([
-            NewAttentionHead(cfg, f'head_{index}_{h}', frozen_pe)
-            for h in range(cfg.num_heads)
-        ])
+        self.stacked = cfg.stack_heads
+        if self.stacked:
+            self.heads = StackedHeads(cfg, index, frozen_pe)
+        else:
+            self.heads = nn.ModuleList([
+                NewAttentionHead(cfg, f'head_{index}_{h}', frozen_pe)
+                for h in range(cfg.num_heads)
+            ])
 
         self.ln_attn_gamma = nn.Parameter(torch.ones(ed))
         self.ln_attn_beta = nn.Parameter(torch.zeros(ed))
@@ -230,7 +465,21 @@ class LutLayer(nn.Module):
         x = (F.layer_norm(z, (ed,), self.ln_attn_gamma, self.ln_attn_beta, eps=1e-5)
              if cfg.layernorm else z)
         z_pre = z
-        if cfg.new_MHA:
+        if self.stacked:
+            # (B, H, CS, head_value_dim) -- one call per table role, not per head.
+            per_head = self.heads(x, selection, capture)
+            if cfg.new_MHA:
+                z = z + self.mha_o(
+                    per_head.permute(0, 2, 1, 3).reshape(*x.shape[:2], -1),
+                    selection, capture, cfg.table_grad)
+            else:
+                # Added one head at a time, in head order, rather than as a single
+                # `per_head.sum(1)`: float32 addition is not associative, and keeping the
+                # sequence identical to the unstacked path is what makes stacking
+                # bit-exact rather than merely close (test_torch_stacking.py).
+                for h in range(cfg.num_heads):
+                    z = z + per_head[:, h]
+        elif cfg.new_MHA:
             concat = torch.cat([h(x, selection, capture) for h in self.heads], dim=-1)
             z = z + self.mha_o(concat, selection, capture, cfg.table_grad)
         else:
@@ -282,8 +531,18 @@ class LutModel(nn.Module):
         return self.output_head(z, selection, capture, self.cfg.table_grad)
 
     def table_parameters(self):
-        """The sparse-gradient table parameters (``S``), for optimizer grouping."""
-        return [m.S_flat for m in self.modules() if isinstance(m, LUTTable)]
+        """The table parameters (``S``), for optimizer grouping.
+
+        A :class:`StackedHeads` block holds one table per role covering all its heads, so
+        it contributes three parameters where the unstacked path contributes ``4 * H``.
+        """
+        out = []
+        for module in self.modules():
+            if isinstance(module, LUTTable):
+                out.append(module.S_flat)
+            elif isinstance(module, StackedHeads):
+                out.extend([module.qk_S_flat, module.v_S_flat, module.final_S_flat])
+        return out
 
     def dense_parameters(self):
         """Everything else that trains: positional encodings and LayerNorm affines."""

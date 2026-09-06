@@ -47,6 +47,12 @@ class LutConfig:
     # --- architecture ---
     new_MHA: bool = False
     weight_sharing: Optional[int] = None
+    # Run a layer's heads as 4 stacked LUT calls instead of 4*H separate ones. Purely a
+    # performance choice -- bit-identical either way (test_torch_stacking.py) -- but it
+    # changes the parameter layout, so it defaults off and the trainer turns it on. The
+    # test suites that reach into per-head modules (test_torch_parity.py above all) build
+    # models unstacked and are the reason this is not simply always on.
+    stack_heads: bool = False
 
     # --- PE / QK ablations ---
     PE_only: bool = False
