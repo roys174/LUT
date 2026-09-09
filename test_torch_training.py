@@ -22,9 +22,11 @@ from lut_torch.config import LutConfig
 from lut_torch.data import IGNORE_INDEX, SnippetDataset
 from lut_torch.modules import LutModel
 from lut_torch.train import (
+    best_model_path,
     build_optimizers,
     build_parser,
     checkpoint_path,
+    derive_schedule,
     evaluate,
     load_checkpoint,
     lr_lambda_factory,
@@ -144,6 +146,123 @@ def test_schedule_matches_main(scheduler, alpha):
             f'step {step}: {opt.param_groups[0]["lr"]} != {expected}'
         opt.step()          # no-op (no gradients), but keeps the documented order
         sched.step()
+
+
+# ---------------------------------------------------------------------------
+# Epoch budget
+# ---------------------------------------------------------------------------
+
+class _Corpus:
+    """Stands in for SnippetDataset: derive_schedule only reads `.length`."""
+
+    def __init__(self, length):
+        self.length = length
+
+
+class _Parser:
+    def error(self, message):          # argparse's contract: never returns
+        raise AssertionError(message)
+
+
+def _derived(length, extra):
+    args = parse_args(extra)
+    derive_schedule(args, _Corpus(length), _Parser())
+    return args
+
+
+@parametrize('batch', [1, 8, 32])
+def test_epoch_budget_equalises_data_across_batch_sizes(batch):
+    """Every batch size must see the same tokens, which --max-steps cannot deliver."""
+    length = 2_156_877
+    args = _derived(length, ['--batch-size', str(batch), '--epochs', '10',
+                             '--context-size', '32'])
+    # max_steps is a ceil, so the budget is met or just cleared, never undercut, and
+    # never by more than the one step the rounding can add.
+    assert 0.0 <= args.epochs_run - 10.0 < 1.0 / args.steps_per_epoch
+    seen = args.max_steps * args.tokens_per_step
+    assert abs(seen / length - 10.0) < 0.01, seen
+
+
+def test_warmup_frac_holds_warmup_tokens_and_depth_constant():
+    """Without the floor, the fraction is what makes warmup mean the same thing."""
+    tokens, depths = [], []
+    for batch in (1, 8, 32):
+        args = _derived(2_156_877, ['--batch-size', str(batch), '--epochs', '10',
+                                    '--context-size', '32', '--warmup-frac', '0.0015',
+                                    '--warmup-min-steps', '1'])
+        tokens.append(args.warmup_steps * args.tokens_per_step)
+        depths.append(args.lr_decay_depth)
+    # Warmup lands on a whole number of steps, so the token counts agree only to within
+    # one step of the largest batch -- 3% here, against the 32x spread a fixed count
+    # would give.
+    assert max(tokens) / min(tokens) < 1.05, tokens
+    assert max(depths) / min(depths) < 1.05, depths
+
+
+def test_warmup_min_steps_is_a_floor_only():
+    """The floor may raise warmup on a short run; it must never lower it on a long one."""
+    long_run = _derived(2_156_877, ['--batch-size', '1', '--epochs', '10',
+                                    '--context-size', '32', '--warmup-frac', '0.0015',
+                                    '--warmup-min-steps', '200'])
+    short_run = _derived(2_156_877, ['--batch-size', '32', '--epochs', '10',
+                                     '--context-size', '32', '--warmup-frac', '0.0015',
+                                     '--warmup-min-steps', '200'])
+    assert long_run.warmup_steps == 1011        # the fraction wins
+    assert short_run.warmup_steps == 200        # the floor wins
+
+
+@parametrize('mode,expected',
+             [('none', 0.01), ('linear', 0.32), ('sqrt', 0.01 * 32 ** 0.5)])
+def test_lr_batch_scaling(mode, expected):
+    args = _derived(2_156_877, ['--batch-size', '32', '--epochs', '10',
+                                '--context-size', '32', '--max-learning-rate', '0.01',
+                                '--lr-batch-scaling', mode])
+    assert abs(args.max_learning_rate - expected) < 1e-9
+    assert args.base_learning_rate == 0.01      # the quoted value is preserved
+
+
+def test_reference_batch_size_leaves_that_batch_alone():
+    args = _derived(2_156_877, ['--batch-size', '1', '--epochs', '10',
+                                '--context-size', '32', '--max-learning-rate', '0.01',
+                                '--lr-batch-scaling', 'linear'])
+    assert args.max_learning_rate == 0.01
+
+
+@parametrize('batch', [1, 8, 32])
+def test_epoch_cadence_gives_every_run_the_same_points(batch):
+    args = _derived(2_156_877, ['--batch-size', str(batch), '--epochs', '10',
+                                '--context-size', '32',
+                                '--validation-interval-epochs', '0.1'])
+    assert 98 <= args.max_steps // args.validation_interval <= 102
+
+
+# ---------------------------------------------------------------------------
+# LR cooldown
+# ---------------------------------------------------------------------------
+
+def test_cooldown_reaches_zero_and_is_monotonic_in_the_tail():
+    args = parse_args(['--warmup-steps', '10', '--max-steps', '1000',
+                       '--lr-cooldown-frac', '0.2'])
+    factor = lr_lambda_factory(args)
+    assert factor(args.max_steps) == 0.0
+    tail = [factor(s) for s in range(800, 1001, 20)]
+    assert all(a > b for a, b in zip(tail, tail[1:])), tail
+    # Untouched before the cooldown begins.
+    plain = lr_lambda_factory(parse_args(['--warmup-steps', '10', '--max-steps', '1000']))
+    assert all(abs(factor(s) - plain(s)) < 1e-12 for s in range(0, 800))
+
+
+def test_cooldown_min_ratio_is_the_floor():
+    args = parse_args(['--warmup-steps', '10', '--max-steps', '1000',
+                       '--lr-cooldown-frac', '0.5', '--lr-cooldown-min-ratio', '0.1'])
+    factor = lr_lambda_factory(args)
+    plain = lr_lambda_factory(parse_args(['--warmup-steps', '10', '--max-steps', '1000']))
+    assert abs(factor(args.max_steps) - 0.1 * plain(args.max_steps)) < 1e-12
+
+
+def test_best_model_path_is_a_sibling():
+    assert checkpoint_path(best_model_path('out/model')) == 'out/model_best.pt'
+    assert checkpoint_path(best_model_path('out/model.pt')) == 'out/model_best.pt'
 
 
 # ---------------------------------------------------------------------------

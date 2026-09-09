@@ -281,6 +281,38 @@ on the machine you will actually train on — a shared login node gives noisy nu
   gradients differ by 1-3 float32 ULP because fusing `H` per-head gathers reassociates the
   scatter-add into the layer input. That is why the unstacked path still exists and why
   `test_torch_parity.py` builds models unstacked.
+- `--epochs` — budget the run in passes over the training tokens; `max_steps` is derived
+  per batch size in `derive_schedule` (`ceil(epochs * positions / (batch * CS))`). A step
+  count is not comparable across batch sizes: 200k steps is 3 passes over the POS corpus
+  at batch 1 and 96 at batch 32, and because the objective is a batch *mean*, 32x the
+  total parameter travel to go with it. Any batch-size comparison budgeted in steps is
+  measuring those two things instead.
+- `--lr-batch-scaling {none,linear,sqrt}` — the other half of `--epochs`. At a fixed epoch
+  budget, batch B takes 1/B as many steps of the same size, so leaving the LR alone turns
+  "same epochs" into "B times less optimisation" — the mirror image of the confound
+  `--epochs` removes. Total drift and the gradient-noise scale both go as `lr/B`, so
+  `linear` matches both at once. `--lr-reference-batch-size` (default 1) is the batch size
+  `--max-learning-rate` is quoted at, so batch-1 runs are unaffected by default.
+- `--lr-cooldown-frac` — linear ramp to `--lr-cooldown-min-ratio` over the tail of the run,
+  on top of whichever scheduler is chosen. `inverse-sqrt` never anneals: it approaches
+  `(warmup / max_steps) ** alpha` and stops, leaving real LR on for however long the run
+  continues past its optimum. At 0 the schedule is bit-identical to `main.get_learning_rate`
+  and `test_schedule_matches_main` covers that.
+- `--warmup-frac` / `--warmup-min-steps` — warmup as a fraction of `max_steps` rather than a
+  count. Under an `--epochs` budget the fraction holds warmup to the same number of *tokens*
+  at every batch size and the schedule to the same end depth (`frac ** alpha`); a fixed
+  count does neither once `max_steps` varies. `--warmup-min-steps` deliberately breaks the
+  depth match on short runs, where the fair fraction is a few dozen steps. The realised
+  depth is recorded per run as `lr_decay_depth`.
+- `--validation-interval-epochs` / `--wandb-log-points` — cadence measured against data
+  instead of the step counter, so curves from different batch sizes land on the same epoch
+  values and carry the same number of points. Without this, overlaying a batch-1 and a
+  batch-32 run compares points taken 32x apart in data, and W&B's point-counted smoothing
+  window smooths them by different amounts.
+- `--save-model` also writes `..._best.pt` at the best validation accuracy so far, and the
+  run's summary carries `val/best_acc` / `val/best_step` / `val/best_epoch`. The final
+  checkpoint is not the best one — under a fixed-step schedule these runs have peaked as
+  early as 18% in.
 - `--cuda-graphs {auto,on,off}` — replay forward+backward from a single launch
   (`graphs.py`). `auto` is on for `--device cuda`, a no-op on CPU. Numerically identical.
   Forces `--table-grad dense`; refuses to combine with an explicit `--table-grad sparse`.

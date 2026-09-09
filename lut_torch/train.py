@@ -53,6 +53,7 @@ DEFAULT_WARMUP_STEPS = 4000
 DEFAULT_MAX_LEARNING_RATE = 1.0 / math.sqrt(4001)
 DEFAULT_INVERSE_SQRT_ALPHA = 0.5
 DEFAULT_COSINE_MIN_LR_RATIO = 0.01
+LR_BATCH_SCALING_MODES = ('none', 'linear', 'sqrt')
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,13 @@ def build_parser():
     # optimization
     p.add_argument('--batch-size', type=int, default=1)
     p.add_argument('--max-steps', type=int, default=100000)
+    p.add_argument('--epochs', type=float, default=None,
+                   help='Budget the run in passes over the training tokens rather than '
+                        'in steps: max_steps = ceil(epochs * positions / (batch * CS)). '
+                        'A step count is not comparable across batch sizes -- 200k steps '
+                        'is 3 passes over this corpus at batch 1 and 96 at batch 32 -- '
+                        'so an epoch budget is what puts a batch-size sweep on one axis. '
+                        'Overrides --max-steps.')
     p.add_argument('--optimizer', choices=['sgd', 'adam', 'adamw'], default='sgd',
                    help='sgd reproduces main.py; adam/adamw use SparseAdam for tables')
     p.add_argument('--momentum', type=float, default=0.0,
@@ -134,6 +142,17 @@ def build_parser():
     p.add_argument('--weight-decay', type=float, default=0.0,
                    help='Applied to dense parameters only')
     p.add_argument('--warmup-steps', type=int, default=DEFAULT_WARMUP_STEPS)
+    p.add_argument('--warmup-frac', type=float, default=None,
+                   help='Warmup as a fraction of max_steps rather than a fixed count, '
+                        'floored at --warmup-min-steps. Under an --epochs budget the '
+                        'fraction is what holds warmup to the same number of *tokens* at '
+                        'every batch size, and holds the schedule to the same end depth '
+                        '(frac ** alpha). Overrides --warmup-steps.')
+    p.add_argument('--warmup-min-steps', type=int, default=200,
+                   help='Floor for --warmup-frac. A short run makes the fair fraction '
+                        'very small (32 steps at batch 32 on a 10-epoch budget), which '
+                        'is a coarse ramp into a scaled-up LR; the floor buys a smooth '
+                        'ramp at the cost of exact depth matching.')
     p.add_argument('--max-learning-rate', type=float,
                    default=DEFAULT_MAX_LEARNING_RATE)
     p.add_argument('--lr-scheduler', choices=['inverse-sqrt', 'cosine'],
@@ -142,6 +161,26 @@ def build_parser():
                    default=DEFAULT_INVERSE_SQRT_ALPHA)
     p.add_argument('--cosine-min-lr-ratio', type=float,
                    default=DEFAULT_COSINE_MIN_LR_RATIO)
+    p.add_argument('--lr-cooldown-frac', type=float, default=0.0,
+                   help='Linearly ramp the LR down to --lr-cooldown-min-ratio over the '
+                        'final fraction of the run (0 disables). inverse-sqrt never '
+                        'anneals -- it ends at (warmup/max_steps) ** alpha with real LR '
+                        'still on, and that tail is what turns a run continuing past its '
+                        'optimum into memorisation. Applied on top of either scheduler.')
+    p.add_argument('--lr-cooldown-min-ratio', type=float, default=0.0,
+                   help='Multiplier the cooldown ramps down to (0 = all the way off)')
+    p.add_argument('--lr-batch-scaling', choices=list(LR_BATCH_SCALING_MODES),
+                   default='none',
+                   help='Scale --max-learning-rate by batch_size / '
+                        '--lr-reference-batch-size. The objective is a batch *mean*, so '
+                        'at a fixed epoch budget a run at batch B takes 1/B as many '
+                        'steps of the same size: unscaled, "same epochs" quietly means '
+                        '"B times less optimisation". Total drift and the gradient-noise '
+                        'scale both go as lr/B, so "linear" matches both at once; '
+                        '"sqrt" is the cautious compromise.')
+    p.add_argument('--lr-reference-batch-size', type=int, default=1,
+                   help='Batch size --max-learning-rate is quoted at (see '
+                        '--lr-batch-scaling). The default of 1 leaves batch-1 runs alone')
     p.add_argument('--seed', type=int, default=None)
     p.add_argument('--cpu-cores', type=int, default=1,
                    help='torch intra-op thread count (ignored on GPU)')
@@ -166,6 +205,12 @@ def build_parser():
     p.add_argument('--testing-length', type=int, default=10000,
                    help='Validation snippets per evaluation')
     p.add_argument('--validation-interval', type=int, default=10000)
+    p.add_argument('--validation-interval-epochs', type=float, default=None,
+                   help='Validate every this many epochs instead of every N steps. A '
+                        'fixed step interval puts validation points at a different '
+                        'amount of data for every batch size, so the curves cannot be '
+                        'overlaid; an epoch interval lands them on identical epoch '
+                        'values. Overrides --validation-interval.')
     p.add_argument('--validation-batch-size', type=int, default=0,
                    help='0 uses --batch-size')
     p.add_argument('--loss-file', type=str, default='loss.csv')
@@ -186,6 +231,12 @@ def build_parser():
     p.add_argument('--wandb-mode', choices=['online', 'offline', 'disabled'],
                    default='online')
     p.add_argument('--wandb-log-interval', type=int, default=100)
+    p.add_argument('--wandb-log-points', type=int, default=0,
+                   help='Target number of train-metric points for the whole run '
+                        '(0 keeps --wandb-log-interval). Equalises curve density across '
+                        "batch sizes: W&B's smoothing window is measured in points, so "
+                        'runs logged at different densities smooth by different amounts '
+                        'and read as further apart than they are.')
     return p
 
 
@@ -200,6 +251,23 @@ def validate_args(args, parser):
         parser.error('--inverse-sqrt-alpha must be non-negative')
     if not 0.0 <= args.cosine_min_lr_ratio <= 1.0:
         parser.error('--cosine-min-lr-ratio must be in [0, 1]')
+    if args.epochs is not None and args.epochs <= 0.0:
+        parser.error('--epochs must be positive')
+    if args.warmup_frac is not None and not 0.0 < args.warmup_frac < 1.0:
+        parser.error('--warmup-frac must be in (0, 1)')
+    if args.warmup_min_steps < 1:
+        parser.error('--warmup-min-steps must be at least 1')
+    if not 0.0 <= args.lr_cooldown_frac <= 1.0:
+        parser.error('--lr-cooldown-frac must be in [0, 1]')
+    if not 0.0 <= args.lr_cooldown_min_ratio <= 1.0:
+        parser.error('--lr-cooldown-min-ratio must be in [0, 1]')
+    if args.lr_reference_batch_size < 1:
+        parser.error('--lr-reference-batch-size must be at least 1')
+    if (args.validation_interval_epochs is not None
+            and args.validation_interval_epochs <= 0.0):
+        parser.error('--validation-interval-epochs must be positive')
+    if args.wandb_log_points < 0:
+        parser.error('--wandb-log-points must be non-negative')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
     if args.validation_interval < 1:
@@ -250,17 +318,84 @@ def resolve_cuda_graphs(args, device, parser):
 # ---------------------------------------------------------------------------
 
 def lr_lambda_factory(args):
-    """Multiplier form of ``main.get_learning_rate`` (base LR is the peak LR)."""
+    """Multiplier form of ``main.get_learning_rate`` (base LR is the peak LR).
+
+    With ``--lr-cooldown-frac 0`` this is exactly ``main.get_learning_rate`` and the
+    parity test in ``test_torch_training.py`` holds. A non-zero cooldown multiplies the
+    tail by a linear ramp, which is the one thing inverse-sqrt cannot do on its own: it
+    approaches ``(warmup / max_steps) ** alpha`` and stops there, leaving real LR on for
+    however long the run continues past its optimum.
+    """
+    cooldown_steps = args.lr_cooldown_frac * args.max_steps
+
     def factor(step):
         if step < args.warmup_steps:
-            return step / args.warmup_steps
-        if args.lr_scheduler == 'inverse-sqrt':
-            return (args.warmup_steps / step) ** args.inverse_sqrt_alpha
-        decay_steps = max(1, args.max_steps - args.warmup_steps)
-        progress = min(1.0, (step - args.warmup_steps) / decay_steps)
-        return (args.cosine_min_lr_ratio + 0.5 * (1.0 - args.cosine_min_lr_ratio)
-                * (1.0 + math.cos(math.pi * progress)))
+            base = step / args.warmup_steps
+        elif args.lr_scheduler == 'inverse-sqrt':
+            base = (args.warmup_steps / step) ** args.inverse_sqrt_alpha
+        else:
+            decay_steps = max(1, args.max_steps - args.warmup_steps)
+            progress = min(1.0, (step - args.warmup_steps) / decay_steps)
+            base = (args.cosine_min_lr_ratio + 0.5 * (1.0 - args.cosine_min_lr_ratio)
+                    * (1.0 + math.cos(math.pi * progress)))
+        if cooldown_steps <= 0.0:
+            return base
+        remaining = max(0.0, args.max_steps - step)
+        ramp = min(1.0, remaining / cooldown_steps)
+        return base * (args.lr_cooldown_min_ratio
+                       + (1.0 - args.lr_cooldown_min_ratio) * ramp)
     return factor
+
+
+def derive_schedule(args, train_set, parser):
+    """Resolve the epoch budget into steps, and re-pace what used to be step-based.
+
+    ``--max-steps`` is not a budget you can compare across batch sizes. The objective is
+    a batch mean, so 200k steps is 3 passes over this corpus at batch 1 and 96 at batch
+    32 -- and, at the same LR, 32x the total parameter travel to go with it. Everything
+    here puts the runs back on one axis (data seen) and measures warmup, validation and
+    logging against that axis instead of against the step counter.
+
+    Called after ``load_datasets`` because every derivation needs the corpus length, and
+    before ``build_optimizers`` because it is what sets the peak LR.
+    """
+    args.train_positions = train_set.length
+    args.tokens_per_step = args.batch_size * args.context_size
+    args.steps_per_epoch = args.train_positions / args.tokens_per_step
+
+    if args.epochs is not None:
+        args.max_steps = max(1, math.ceil(args.epochs * args.steps_per_epoch))
+    args.epochs_run = args.max_steps / args.steps_per_epoch
+
+    if args.warmup_frac is not None:
+        args.warmup_steps = max(1, min(
+            args.max_steps,
+            max(args.warmup_min_steps, int(round(args.warmup_frac * args.max_steps)))))
+
+    args.base_learning_rate = args.max_learning_rate
+    args.lr_batch_scale = 1.0
+    if args.lr_batch_scaling != 'none':
+        ratio = args.batch_size / args.lr_reference_batch_size
+        args.lr_batch_scale = (ratio if args.lr_batch_scaling == 'linear'
+                               else math.sqrt(ratio))
+        args.max_learning_rate = args.base_learning_rate * args.lr_batch_scale
+
+    # Where the schedule lands before any cooldown. This is equal across batch sizes
+    # only while warmup tracks max_steps; --warmup-min-steps deliberately breaks that on
+    # short runs, so record the number rather than leaving it implicit in a run's config.
+    args.lr_decay_depth = (
+        (args.warmup_steps / args.max_steps) ** args.inverse_sqrt_alpha
+        if args.lr_scheduler == 'inverse-sqrt' else args.cosine_min_lr_ratio)
+
+    if args.validation_interval_epochs is not None:
+        args.validation_interval = max(
+            1, int(round(args.validation_interval_epochs * args.steps_per_epoch)))
+    if args.wandb_log_points:
+        args.wandb_log_interval = max(1, args.max_steps // args.wandb_log_points)
+
+    if args.warmup_steps >= args.max_steps:
+        parser.error(f'warmup ({args.warmup_steps:,} steps) must be shorter than the '
+                     f'run ({args.max_steps:,} steps)')
 
 
 def build_optimizers(model, args):
@@ -307,6 +442,11 @@ def build_optimizers(model, args):
 
 def checkpoint_path(path):
     return path if path.endswith('.pt') else path + '.pt'
+
+
+def best_model_path(path):
+    """Sibling of ``checkpoint_path`` for the best-val-accuracy copy."""
+    return (path[:-3] if path.endswith('.pt') else path) + '_best'
 
 
 def save_checkpoint(path, model, cfg, optimizers, schedulers, step, args):
@@ -483,17 +623,28 @@ def main(argv=None):
     print('Configuration:')
     for key, value in sorted(cfg.to_dict().items()):
         print(f"  {key:24s} = {value}")
+    # max_steps / warmup / LR / validation cadence are all derived from the corpus
+    # length below, so they are printed by the Schedule block rather than here.
     for key in ('batch_size', 'optimizer', 'table_grad', 'momentum', 'weight_decay',
-                'max_steps',
-                'warmup_steps', 'max_learning_rate', 'lr_scheduler',
-                'inverse_sqrt_alpha', 'cosine_min_lr_ratio', 'seed', 'cpu_cores', 'kernels',
-                'device', 'cuda_graphs',
-                'testing_length', 'validation_interval', 'loss_file', 'save_model',
-                'load_model'):
+                'lr_scheduler', 'inverse_sqrt_alpha', 'cosine_min_lr_ratio',
+                'seed', 'cpu_cores', 'kernels', 'device', 'cuda_graphs',
+                'testing_length', 'loss_file', 'save_model', 'load_model'):
         print(f"  {key:24s} = {getattr(args, key)}")
     print('=' * 50)
 
     train_set, val_set = load_datasets(args, enc)
+    derive_schedule(args, train_set, parser)
+
+    print('Schedule:')
+    for key in ('epochs_run', 'steps_per_epoch', 'tokens_per_step', 'max_steps',
+                'warmup_steps', 'base_learning_rate', 'lr_batch_scale',
+                'max_learning_rate', 'lr_decay_depth', 'lr_cooldown_frac',
+                'validation_interval', 'wandb_log_interval'):
+        value = getattr(args, key)
+        print(f"  {key:24s} = " + (f"{value:.6g}" if isinstance(value, float)
+                                   else f"{value:,}"))
+    print('=' * 50)
+
     # Drawn exactly as main.load_training_data draws testing_input_data: Python's
     # `random`, one inclusive randint per snippet. Two things depend on this. The
     # validation windows themselves match main.py's at the same seed, so a torch run and
@@ -535,8 +686,16 @@ def main(argv=None):
         wandb.define_metric('train/*', step_metric='step')
         wandb.define_metric('val/*', step_metric='step')
 
+    def epoch_at(s):
+        return s * args.tokens_per_step / args.train_positions
+
+    # The final checkpoint is not the best one. Under a fixed-step schedule these runs
+    # peaked as early as 18% in and then trained for another ten hours, so what landed
+    # on disk was never the model the run actually found; keep both.
+    best = {'acc': float('-inf'), 'loss': float('nan'), 'step': -1, 'epoch': 0.0}
+
     with open(args.loss_file, 'w') as f:
-        f.write('step, loss, perplexity, accuracy\n')
+        f.write('step, epoch, tokens, loss, perplexity, accuracy\n')
 
     model.train()
     ema_loss = None
@@ -586,6 +745,8 @@ def main(argv=None):
         if wandb_run is not None and step % args.wandb_log_interval == 0:
             wandb_run.log({
                 'step': step,
+                'epoch': epoch_at(step),
+                'tokens': step * args.tokens_per_step,
                 'train/loss': mean_loss,
                 'train/ema_loss': ema_loss,
                 'train/perplexity': math.exp(min(ema_loss, 20.0)),
@@ -600,17 +761,29 @@ def main(argv=None):
             last = {'loss': val_loss, 'ppl': perplexity, 'acc': val_acc}
 
             with open(args.loss_file, 'a') as f:
-                f.write(f"{step}, {val_loss:.6f}, {perplexity:.2f}, {val_acc:.6f}\n")
+                f.write(f"{step}, {epoch_at(step):.4f}, {step * args.tokens_per_step}, "
+                        f"{val_loss:.6f}, {perplexity:.2f}, {val_acc:.6f}\n")
             tqdm.write(f"\n--- step {step:,} | ppl={perplexity:.2f} | "
                        f"loss={val_loss:.3f} | acc={val_acc:.3f} ---")
+
+            improved = val_acc == val_acc and val_acc > best['acc']
+            if improved:
+                best.update(acc=val_acc, loss=val_loss, step=step, epoch=epoch_at(step))
 
             if args.save_model:
                 save_checkpoint(args.save_model, model, cfg, optimizers, schedulers,
                                 step, args)
                 tqdm.write(f"Saved checkpoint to {checkpoint_path(args.save_model)}")
+                if improved:
+                    save_checkpoint(best_model_path(args.save_model), model, cfg,
+                                    optimizers, schedulers, step, args)
+                    tqdm.write(f"  new best val accuracy {val_acc:.4f} -> "
+                               f"{checkpoint_path(best_model_path(args.save_model))}")
             if wandb_run is not None:
-                wandb_run.log({'step': step, 'val/loss': val_loss,
-                               'val/perplexity': perplexity, 'val/accuracy': val_acc})
+                wandb_run.log({'step': step, 'epoch': epoch_at(step),
+                               'tokens': step * args.tokens_per_step,
+                               'val/loss': val_loss, 'val/perplexity': perplexity,
+                               'val/accuracy': val_acc})
             pbar.set_description('Training')
 
         postfix = {'lr': f"{lr:.4f}",
@@ -624,7 +797,17 @@ def main(argv=None):
         save_checkpoint(args.save_model, model, cfg, optimizers, schedulers,
                         args.max_steps, args)
         print(f"Saved final checkpoint to {checkpoint_path(args.save_model)}")
+    if best['step'] >= 0:
+        print(f"Best val accuracy {best['acc']:.4f} at step {best['step']:,} "
+              f"(epoch {best['epoch']:.2f}), val loss {best['loss']:.4f}")
     if wandb_run is not None:
+        if best['step'] >= 0:
+            # In the summary, so a sweep table can be sorted by peak rather than by
+            # whatever the run happened to end on.
+            wandb_run.summary['val/best_acc'] = best['acc']
+            wandb_run.summary['val/best_loss'] = best['loss']
+            wandb_run.summary['val/best_step'] = best['step']
+            wandb_run.summary['val/best_epoch'] = best['epoch']
         wandb_run.finish()
 
 
