@@ -161,6 +161,16 @@ def build_parser():
                    default=DEFAULT_INVERSE_SQRT_ALPHA)
     p.add_argument('--cosine-min-lr-ratio', type=float,
                    default=DEFAULT_COSINE_MIN_LR_RATIO)
+    p.add_argument('--lr-decay-start', type=int, default=None,
+                   help='Step at which inverse-sqrt decay begins; the LR sits flat at '
+                        'the peak between --warmup-steps and here. Defaults to the '
+                        'warmup length, which is the schedule this project has always '
+                        'run. Decoupling the two matters because in (W/s)**alpha the '
+                        'warmup length also sets the height of the whole decay that '
+                        'follows: lengthening the ramp raises the LR at every later '
+                        'step, so no warmup comparison is interpretable while they are '
+                        'the same number. Must be >= the resolved warmup. inverse-sqrt '
+                        'only; ignored by cosine.')
     p.add_argument('--lr-cooldown-frac', type=float, default=0.0,
                    help='Linearly ramp the LR down to --lr-cooldown-min-ratio over the '
                         'final fraction of the run (0 disables). inverse-sqrt never '
@@ -216,6 +226,15 @@ def build_parser():
     p.add_argument('--loss-file', type=str, default='loss.csv')
     p.add_argument('--save-model', type=str, default=None,
                    help='Checkpoint path; .pt is appended if missing')
+    p.add_argument('--checkpoint-interval-validations', type=int, default=1,
+                   help='Write the periodic (resume) checkpoint every Nth validation '
+                        'rather than every one. The largest models here are 7.1 GB, and '
+                        'validating every 0.1 epochs over a 10-epoch budget means 100 '
+                        'writes -- roughly an hour of pure I/O on exactly the runs that '
+                        'are already the most expensive. The best-accuracy checkpoint is '
+                        'unaffected (it is written only when accuracy improves), and the '
+                        'final checkpoint is always written, so this trades resume '
+                        'granularity for time and nothing else.')
     p.add_argument('--load-model', type=str, default=None,
                    help='Resume from a checkpoint (model + optimizer + step + RNG)')
     p.add_argument('--reset-optimizer', action='store_true',
@@ -268,6 +287,8 @@ def validate_args(args, parser):
         parser.error('--validation-interval-epochs must be positive')
     if args.wandb_log_points < 0:
         parser.error('--wandb-log-points must be non-negative')
+    if args.checkpoint_interval_validations < 1:
+        parser.error('--checkpoint-interval-validations must be at least 1')
     if args.wandb_log_interval < 1:
         parser.error('--wandb-log-interval must be at least 1')
     if args.validation_interval < 1:
@@ -327,12 +348,16 @@ def lr_lambda_factory(args):
     however long the run continues past its optimum.
     """
     cooldown_steps = args.lr_cooldown_frac * args.max_steps
+    # t0 == warmup is the historical schedule: the min() never binds there, because
+    # (warmup/s)**alpha <= 1 for every s >= warmup, so this stays bit-identical by
+    # default and only opens a plateau when a later decay start is asked for.
+    decay_start = args.lr_decay_start or args.warmup_steps
 
     def factor(step):
         if step < args.warmup_steps:
             base = step / args.warmup_steps
         elif args.lr_scheduler == 'inverse-sqrt':
-            base = (args.warmup_steps / step) ** args.inverse_sqrt_alpha
+            base = min(1.0, (decay_start / step) ** args.inverse_sqrt_alpha)
         else:
             decay_steps = max(1, args.max_steps - args.warmup_steps)
             progress = min(1.0, (step - args.warmup_steps) / decay_steps)
@@ -383,8 +408,13 @@ def derive_schedule(args, train_set, parser):
     # Where the schedule lands before any cooldown. This is equal across batch sizes
     # only while warmup tracks max_steps; --warmup-min-steps deliberately breaks that on
     # short runs, so record the number rather than leaving it implicit in a run's config.
+    if args.lr_decay_start is not None and args.lr_decay_start < args.warmup_steps:
+        parser.error(f'--lr-decay-start ({args.lr_decay_start:,}) must be at least the '
+                     f'resolved warmup ({args.warmup_steps:,} steps); starting the decay '
+                     f'inside the ramp would step the LR down discontinuously')
+    args.lr_decay_start_resolved = args.lr_decay_start or args.warmup_steps
     args.lr_decay_depth = (
-        (args.warmup_steps / args.max_steps) ** args.inverse_sqrt_alpha
+        (args.lr_decay_start_resolved / args.max_steps) ** args.inverse_sqrt_alpha
         if args.lr_scheduler == 'inverse-sqrt' else args.cosine_min_lr_ratio)
 
     if args.validation_interval_epochs is not None:
@@ -637,7 +667,8 @@ def main(argv=None):
 
     print('Schedule:')
     for key in ('epochs_run', 'steps_per_epoch', 'tokens_per_step', 'max_steps',
-                'warmup_steps', 'base_learning_rate', 'lr_batch_scale',
+                'warmup_steps', 'lr_decay_start_resolved',
+                'base_learning_rate', 'lr_batch_scale',
                 'max_learning_rate', 'lr_decay_depth', 'lr_cooldown_frac',
                 'validation_interval', 'wandb_log_interval'):
         value = getattr(args, key)
@@ -693,6 +724,7 @@ def main(argv=None):
     # peaked as early as 18% in and then trained for another ten hours, so what landed
     # on disk was never the model the run actually found; keep both.
     best = {'acc': float('-inf'), 'loss': float('nan'), 'step': -1, 'epoch': 0.0}
+    validations = 0
 
     with open(args.loss_file, 'w') as f:
         f.write('step, epoch, tokens, loss, perplexity, accuracy\n')
@@ -766,14 +798,16 @@ def main(argv=None):
             tqdm.write(f"\n--- step {step:,} | ppl={perplexity:.2f} | "
                        f"loss={val_loss:.3f} | acc={val_acc:.3f} ---")
 
+            validations += 1
             improved = val_acc == val_acc and val_acc > best['acc']
             if improved:
                 best.update(acc=val_acc, loss=val_loss, step=step, epoch=epoch_at(step))
 
             if args.save_model:
-                save_checkpoint(args.save_model, model, cfg, optimizers, schedulers,
-                                step, args)
-                tqdm.write(f"Saved checkpoint to {checkpoint_path(args.save_model)}")
+                if validations % args.checkpoint_interval_validations == 0:
+                    save_checkpoint(args.save_model, model, cfg, optimizers, schedulers,
+                                    step, args)
+                    tqdm.write(f"Saved checkpoint to {checkpoint_path(args.save_model)}")
                 if improved:
                     save_checkpoint(best_model_path(args.save_model), model, cfg,
                                     optimizers, schedulers, step, args)

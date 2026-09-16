@@ -293,6 +293,16 @@ on the machine you will actually train on — a shared login node gives noisy nu
   `--epochs` removes. Total drift and the gradient-noise scale both go as `lr/B`, so
   `linear` matches both at once. `--lr-reference-batch-size` (default 1) is the batch size
   `--max-learning-rate` is quoted at, so batch-1 runs are unaffected by default.
+- `--lr-decay-start` (t0) — the step at which inverse-sqrt decay begins; the LR holds flat
+  at the peak from the end of warmup until here, so the schedule is ramp → hold → decay →
+  cooldown. It exists because `(W / s) ** alpha` puts the warmup length in the *decay* as
+  well as the ramp: lengthening the warmup raises the LR at every later step, which made
+  every warmup comparison in the LR probes uninterpretable (a short ramp "won" twice, both
+  times by being less exposed to a too-high LR). Defaults to the warmup length, where the
+  `min(1, ...)` never binds and the curve is bit-identical to what this project has always
+  run. Must be ≥ the resolved warmup — starting the decay inside the ramp would step the LR
+  down discontinuously, and `derive_schedule` refuses it. The depth reached before cooldown
+  is `(t0 / max_steps) ** alpha`, reported as `lr_decay_depth`.
 - `--lr-cooldown-frac` — linear ramp to `--lr-cooldown-min-ratio` over the tail of the run,
   on top of whichever scheduler is chosen. `inverse-sqrt` never anneals: it approaches
   `(warmup / max_steps) ** alpha` and stops, leaving real LR on for however long the run
@@ -322,6 +332,37 @@ on the machine you will actually train on — a shared login node gives noisy nu
 `--factored-output`, `--fp16`, `no-overlap`/`overlap` comparison modes,
 `--halve-lr-at-20k-40k`, `--save-multiple-checkpoints`, sampling/generation, and the
 `LUTUpdateStats` instrumentation.
+
+## Training recipe
+
+```
+--epochs 10                         # or 8 with --lr-cooldown-frac 0.25
+--lr-batch-scaling linear --lr-reference-batch-size 1
+--max-learning-rate 0.0025          # 0.00125 if budgeting 3 epochs
+--warmup-steps $(( 6400 / BATCH ))
+--lr-cooldown-frac 0.2
+--validation-interval-epochs 0.1
+--wandb-log-points 3000
+--checkpoint-interval-validations 10
+```
+
+Budget in epochs, never in steps -- `--max-steps` means 3 passes over this corpus at batch
+1 and 96 at batch 32. Scale the peak LR linearly with batch. Set warmup to `6400/batch`,
+which holds both warmup tokens and decay depth constant across batch sizes. Always keep a
+terminal cooldown, but do not tune its shape: having one is worth a great deal and its
+length, start and floor are all measurably irrelevant.
+
+Batch size is a speed knob, not an accuracy knob. Prefer `heads 4` over 8 -- 1.71x faster
+for no measurable gain.
+
+Before comparing two runs, know the noise floors: **0.0005** accuracy (0.0030 val loss)
+between jobs at an identical config and seed, and **0.0012-0.0031** between seeds, because
+`--seed` also draws the validation windows. Compare configurations within a seed. Val loss
+is the more sensitive metric; train loss says nothing useful about budget.
+
+Every number behind these choices, the experiments that produced them, the wrong turns,
+and what is still open are in `DECISIONS.md` at the repo root. Change these defaults only
+against that file.
 
 ## Testing
 

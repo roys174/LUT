@@ -252,12 +252,64 @@ def test_cooldown_reaches_zero_and_is_monotonic_in_the_tail():
     assert all(abs(factor(s) - plain(s)) < 1e-12 for s in range(0, 800))
 
 
+def test_decay_start_defaults_to_the_historical_schedule():
+    """t0 == warmup must leave the curve untouched, or every past run is reinterpreted."""
+    plain = lr_lambda_factory(parse_args(['--warmup-steps', '50', '--max-steps', '2000']))
+    same = lr_lambda_factory(parse_args(['--warmup-steps', '50', '--max-steps', '2000',
+                                         '--lr-decay-start', '50']))
+    assert all(abs(plain(s) - same(s)) < 1e-12 for s in range(2000))
+
+
+def test_decay_start_holds_the_peak_then_decays():
+    """The point of the knob: a flat stretch the warmup length no longer dictates."""
+    args = parse_args(['--warmup-steps', '50', '--max-steps', '2000',
+                       '--lr-decay-start', '500'])
+    factor = lr_lambda_factory(args)
+    assert abs(factor(50) - 1.0) < 1e-12          # ramp ends at the peak
+    assert all(abs(factor(s) - 1.0) < 1e-12 for s in range(50, 501))   # ...and holds
+    assert factor(1000) < 1.0                                          # ...then decays
+    assert factor(2000) < factor(1000)
+
+
+def test_decay_start_sets_depth_independently_of_the_ramp():
+    """Two ramps, one decay curve -- which is what makes a warmup comparison mean
+    something. Under the old coupling these two would differ everywhere after warmup."""
+    short = lr_lambda_factory(parse_args(['--warmup-steps', '20', '--max-steps', '2000',
+                                          '--lr-decay-start', '500']))
+    long = lr_lambda_factory(parse_args(['--warmup-steps', '200', '--max-steps', '2000',
+                                         '--lr-decay-start', '500']))
+    assert short(10) != long(10)                                    # ramps differ
+    assert all(abs(short(s) - long(s)) < 1e-12 for s in range(500, 2000))
+
+
+def test_decay_start_below_warmup_is_refused():
+    args = parse_args(['--warmup-steps', '200', '--epochs', '1', '--context-size', '32',
+                       '--batch-size', '32', '--lr-decay-start', '50'])
+    try:
+        derive_schedule(args, _Corpus(2_156_877), _Parser())
+    except AssertionError as exc:                  # _Parser.error raises AssertionError
+        assert 'lr-decay-start' in str(exc)
+    else:
+        raise AssertionError('expected derive_schedule to reject t0 < warmup')
+
+
 def test_cooldown_min_ratio_is_the_floor():
     args = parse_args(['--warmup-steps', '10', '--max-steps', '1000',
                        '--lr-cooldown-frac', '0.5', '--lr-cooldown-min-ratio', '0.1'])
     factor = lr_lambda_factory(args)
     plain = lr_lambda_factory(parse_args(['--warmup-steps', '10', '--max-steps', '1000']))
     assert abs(factor(args.max_steps) - 0.1 * plain(args.max_steps)) < 1e-12
+
+
+def test_checkpoint_interval_thins_only_the_periodic_save():
+    """The 7.1 GB models validate 100 times in a 10-epoch run; the periodic checkpoint
+    is the one that can be thinned, because the best copy is written only on
+    improvement and the final one is written after the loop either way."""
+    args = parse_args(['--checkpoint-interval-validations', '10'])
+    assert args.checkpoint_interval_validations == 10
+    kept = [v for v in range(1, 101) if v % args.checkpoint_interval_validations == 0]
+    assert kept == list(range(10, 101, 10))          # 10 writes instead of 100
+    assert parse_args([]).checkpoint_interval_validations == 1   # default unchanged
 
 
 def test_best_model_path_is_a_sibling():

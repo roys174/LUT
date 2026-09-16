@@ -242,6 +242,21 @@ This describes what commits and saved `config.txt` files show was attempted. It 
 - Later runs varied `n_c`/`attn_qk_n_c` through 6, 7, 8, and 9. Some W&B names say `WS_16` while the command says `--weight-sharing 8`; trust `config.txt`.
 - XOR aggregation was implemented in `adce4de`. The focused comparison suite verifies exact legacy behavior at `--comparisons-per-bit 1`, while fan-in 2 smoke runs cover old hard, soft, and new attention.
 
+### Epoch budgets, LR scaling, and the cooldown (torch port, Sep 2026)
+
+- The torch port's training schedule was retuned from scratch: budget in epochs rather
+  than steps, peak LR scaled linearly with batch, warmup `6400/batch`, and a terminal
+  cooldown. `lut_torch/AGENTS.md` ("Training recipe") has the settings; **`DECISIONS.md`
+  at the repo root has the measurements, the wrong turns, and what is still open.**
+- Outcome: `new-MHA=on` beats `new-MHA=off` by 0.010-0.017 with 3-7x fewer parameters,
+  and reaches 0.9454 in ~57 min where the old schedule reached 0.9445 in 3.30 h.
+  Differences *within* `new-MHA=on` are smaller than seed noise and are not a ranking.
+- Result trees: `POS_torch_gpu_sweep/` (first sweep, fixed 200k steps),
+  `POS_torch_lr_probe*/` and `POS_torch_exp{A,A2,B,C,D,E}/` (the tuning probes),
+  `POS_torch_gpu_sweep_v2_E10/` (the rerun). Each run's `config.txt` names its swept axis
+  under `swept_*` keys; trust those over directory names, and check for
+  `DUE TO PREEMPTION` in the sbatch output before reading a short run as a crash.
+
 ## Analysis and Inference Tools
 
 - `plot_lut_update_histograms.py STATS`: plots row counts and discovers matching `j`/coordinate stats and snapshots.
