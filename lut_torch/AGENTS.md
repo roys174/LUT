@@ -269,6 +269,41 @@ on the machine you will actually train on — a shared login node gives noisy nu
   outputs are summed into the residual with no `MHA_O` table, exactly as in `main.py`.
 - `--load-model` resumes properly (model + optimizer + scheduler + step + RNG).
   `--reset-optimizer` loads weights only.
+- `--output-code-dim D` / `--output-code {learned,binary}` — the output table emits `D`
+  numbers instead of one score per class, and a `(V, D)` code matrix `C` maps them to the
+  logits, so the table costs `n_t * 2**n_c * D` entries rather than `n_t * 2**n_c * V`. At
+  the default shape and POS's 18 classes that is 73,728 → 20,480 floats, which is not worth
+  having on its own; the flag exists because the same head at `V = 14,398` is 59M → 57k, and
+  POS is where the accuracy cost of the change can be measured cheaply.
+  Three things to know. **The logits are `y @ C.T` and that is not a relaxation**: scoring
+  class `k` by treating the `D` coordinates as independent bit comparisons,
+  `sum_b [c_kb log sigma(y_b) + (1-c_kb) log sigma(-y_b)]`, differs from `sum_b c_kb y_b`
+  only by a term independent of `k`, which the softmax cancels — so the "compare each
+  coordinate against zero" head *is* a linear readout, with no thresholding in the loss and
+  no surrogate needed for it (`test_torch_output_code.py`). **`binary` has minimum Hamming
+  distance 1** at `D = ceil(log2 V)`: neighbouring codewords differ in one coordinate, so a
+  single coordinate's sign decides between two classes. Widen `D` if that shows up as an
+  accuracy gap against `learned`. **It caps the logit matrix at rank `D`** — for an argmax
+  metric like POS accuracy that may cost nothing, but perplexity feels it directly, so
+  report validation loss alongside accuracy or the result will not extrapolate to full
+  vocabulary.
+- `--output-code-bias` — adds a per-class bias, `logits = y @ C.T + b`. Without it every
+  logit vector lies in `col(C)`, class priors included, and a frozen code cannot choose a
+  column space that accommodates them: `col(C_binary)` holds 20.8% of this corpus's
+  log-prior energy, less than a random D-dim subspace (27.9%). That is the leading
+  explanation for `binary`'s loss nearly doubling while its accuracy fell under a point —
+  ranking well but calibrating badly is what a missing prior looks like. Costs `V`
+  parameters. Requires `--output-code-dim`.
+- `--output-code-lr-scale` — multiplies the learning rate of `C` and `b` only. A token's
+  `y` is the sum of `n_t` table rows and every one receives the full `dL/dy`, so a step
+  moves the table's contribution to the output by roughly `n_t x` nominal while `C` and `b`
+  move by `1x`. At POS that asymmetry is cheap to ignore (`C` is 0.1% of the head); at a
+  full vocabulary `C` is about half of it (`V*D = 201,572` against a `16,384*14` table), so
+  the rule has to be right before the expensive run, and POS is the only place a
+  `y_dim = V` baseline exists to measure it against.
+  The flag has no `main.py` counterpart and so cannot enter `test_torch_parity.CONFIGS`;
+  what protects parity is that the code matrix is drawn last and only when the flag is set,
+  leaving every existing configuration bit-identical (`test_default_head_unchanged`).
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
 - `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. `--kernels` is silently a no-op on
   GPU.

@@ -10,11 +10,14 @@ QK normalisation, PE addition, direct-sign slicing and the Q/K/PE gradient routi
 ``main.new_attention_backward`` writes out by hand all fall out of autograd here.
 """
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import OUTPUT_CODE_BINARY
 from .comparisons import (
     build_random_comparison_arrays,
     causal_pair_indices,
@@ -28,6 +31,25 @@ from .functional import (
     lut_lookup,
     lut_lookup_reference,
 )
+
+
+def binary_code_matrix(n_classes, n_bits):
+    """The ``+-1`` binary expansion of ``0..n_classes-1``, as ``(n_classes, n_bits)``.
+
+    Bit ``b`` of class ``k`` becomes ``+1`` when set and ``-1`` when clear. Rows are
+    scaled by ``1/sqrt(n_bits)`` so they are unit-norm, which puts this code on the same
+    logit scale as the learned code's initialisation and makes the two comparable at a
+    shared learning rate.
+
+    Sign rather than ``0/1`` is not cosmetic: under a ``0/1`` code the readout can only
+    add evidence, never subtract it. The two differ by ``sum_b y_b``, a per-position
+    constant that cancels in the softmax, so they give the same distribution up to a
+    factor of two on the logits -- but only the ``+-1`` form keeps that factor from
+    depending on how many bits a class happens to have set.
+    """
+    codes = np.arange(n_classes, dtype=np.int64)[:, None]
+    bits = (codes >> np.arange(n_bits, dtype=np.int64)[None, :]) & 1
+    return torch.tensor((2 * bits - 1) / math.sqrt(n_bits), dtype=torch.float32)
 
 
 def normalize_to_target(vec, target_std, eps):
@@ -519,16 +541,52 @@ class LutModel(nn.Module):
         self.layers = nn.ModuleList([
             LutLayer(cfg, l, frozen_pe) for l in range(cfg.num_layers)
         ])
+        code_dim = cfg.output_code_dim
         self.output_head = LUTTable('output', cfg.n_t, cfg.n_c, cfg.comparisons_per_bit,
-                                    cfg.n_c, cfg.vocab_size_output, cfg.embedding_dim)
+                                    cfg.n_c,
+                                    cfg.vocab_size_output if code_dim is None
+                                    else code_dim,
+                                    cfg.embedding_dim)
+        # Drawn last, and only when a code is asked for, so every existing configuration
+        # leaves both RNG streams exactly where main.build_Model does.
+        if code_dim is None:
+            self.output_code = None
+        elif cfg.output_code == OUTPUT_CODE_BINARY:
+            self.register_buffer('output_code',
+                                 binary_code_matrix(cfg.vocab_size_output, code_dim))
+        else:
+            # Unit-norm rows in expectation, matching binary_code_matrix. C must not
+            # start at zero: y is zero at step 0 (S is), so dL/dC is zero too, and a
+            # zero C would leave dL/dy zero as well -- neither the code nor the table
+            # would ever receive a gradient.
+            code = np.random.randn(cfg.vocab_size_output, code_dim) / math.sqrt(code_dim)
+            self.output_code = nn.Parameter(torch.tensor(code, dtype=torch.float32))
+        # Zero-initialised, so it draws no RNG and starts the run as a no-op.
+        self.output_bias = (
+            nn.Parameter(torch.zeros(cfg.vocab_size_output))
+            if code_dim is not None and cfg.output_code_bias else None)
 
     def forward(self, tokens, capture=None):
-        """``tokens``: ``(B, context_size)`` int64. Returns logits ``(B, CS, vocab)``."""
+        """``tokens``: ``(B, context_size)`` int64. Returns logits ``(B, CS, vocab)``.
+
+        With ``output_code_dim`` set, the head emits ``D`` numbers per position and the
+        logits are ``y @ C.T``. That linear readout *is* the per-bit-likelihood decoder:
+        scoring class ``k`` by ``sum_b [c_kb log sigma(y_b) + (1-c_kb) log sigma(-y_b)]``
+        gives ``sum_b c_kb * y_b`` plus ``sum_b log sigma(-y_b)``, and the second term
+        does not depend on ``k``, so it cancels in the softmax. Treating the ``D``
+        coordinates as independent bit comparisons and taking cross-entropy over the
+        codewords is therefore exactly this matmul -- no sigmoids, and no straight-through
+        estimator for the thresholding, which only ever happens at argmax time.
+        """
         selection = self.cfg.gradient_pair_selection
         z = self.token_embedding[tokens]
         for layer in self.layers:
             z = layer(z, selection, capture)
-        return self.output_head(z, selection, capture, self.cfg.table_grad)
+        y = self.output_head(z, selection, capture, self.cfg.table_grad)
+        if self.output_code is None:
+            return y
+        logits = y @ self.output_code.t()
+        return logits if self.output_bias is None else logits + self.output_bias
 
     def table_parameters(self):
         """The table parameters (``S``), for optimizer grouping.
@@ -544,8 +602,29 @@ class LutModel(nn.Module):
                 out.extend([module.qk_S_flat, module.v_S_flat, module.final_S_flat])
         return out
 
+    def output_code_parameters(self):
+        """The coded head's dense parameters (``C`` and ``b``), for optimizer grouping.
+
+        These are split out from :meth:`dense_parameters` because they sit on the wrong
+        side of an asymmetry. A token's ``y`` is the sum of ``n_t`` table rows and *every*
+        one of them receives the full ``dL/dy``, so one SGD step moves the table's
+        contribution to the output by roughly ``n_t`` times a nominal step. ``C`` and ``b``
+        have no such multiplier -- one step is one step. At a shared learning rate the
+        table therefore adapts far faster and absorbs most of the learning. That costs
+        little at POS, where ``C`` is 0.1% of the head, and a great deal at a full
+        vocabulary, where ``C`` is about half of it. ``--output-code-lr-scale`` is the knob
+        that lets the question be answered rather than assumed.
+        """
+        out = []
+        if isinstance(self.output_code, nn.Parameter):
+            out.append(self.output_code)
+        if self.output_bias is not None:
+            out.append(self.output_bias)
+        return [p for p in out if p.requires_grad]
+
     def dense_parameters(self):
         """Everything else that trains: positional encodings and LayerNorm affines."""
-        table_ids = {id(p) for p in self.table_parameters()}
+        excluded = {id(p) for p in self.table_parameters()}
+        excluded.update(id(p) for p in self.output_code_parameters())
         return [p for p in self.parameters()
-                if p.requires_grad and id(p) not in table_ids]
+                if p.requires_grad and id(p) not in excluded]

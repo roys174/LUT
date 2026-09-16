@@ -25,6 +25,10 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 - `word_tokenizer.py`: word vocabulary, tokenization, universal POS labels, spaCy alignment, and cached POS encoding.
 - `run_files/run_POS_one.sh`: newest single-run template; uses new MHA, scheduler control, frozen PE, direct-sign QKPE, and the legacy-equivalent `--comparisons-per-bit 1`. Its `--weight-sharing` line is currently commented out.
 - `run_files/torch_POS_run.sh`: the torch trainer (`python -m lut_torch.train`) at the same experiment shape. Note `run_files/` is gitignored, so these scripts are local-only.
+- `run_files/torch_POS_output_code_gpu.sh`: GPU array job for the low-dimensional coded
+  output head (`--output-code-dim`), three arms (uncoded baseline, learned code, frozen
+  binary code) at the GPU sweep's best cell. Its header explains why the baseline must be
+  rerun from that script and why validation loss, not just accuracy, decides the result.
 - `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
 - `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
 - `run_files/run_POS_one_PE_only.sh`: PE-only ablation.

@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .config import ConfigError, LutConfig
+from .config import OUTPUT_CODE_MODES, ConfigError, LutConfig
 from .data import IGNORE_INDEX, load_datasets
 from .graphs import GraphedTrainStep
 from .kernels import KERNEL_BACKEND_MODES, set_kernel_backend, set_kernel_threads
@@ -124,6 +124,29 @@ def build_parser():
                         "round.")
     p.add_argument('--layernorm', action='store_true')
     p.add_argument('--dropout', type=float, default=0.0)
+
+    # output head
+    p.add_argument('--output-code-dim', type=int, default=None,
+                   help="Emit D numbers from the output table and map them to the "
+                        "vocabulary with a (V, D) code matrix, instead of one score per "
+                        "class. Cuts the output table from n_t * 2**n_c * V entries to "
+                        "n_t * 2**n_c * D. Default: off (y_dim = V).")
+    p.add_argument('--output-code', choices=list(OUTPUT_CODE_MODES), default='learned',
+                   help="Which code matrix --output-code-dim uses. 'learned' trains it "
+                        "as a dense parameter; 'binary' freezes it to the +-1 binary "
+                        "expansion of the class index, which needs "
+                        "D >= ceil(log2(V)) bits.")
+    p.add_argument('--output-code-bias', action='store_true',
+                   help="Add a per-class bias to the coded head: logits = y @ C.T + b. "
+                        "Without it every logit vector lies in col(C), class priors "
+                        "included, which a frozen code cannot choose to accommodate. "
+                        "Requires --output-code-dim.")
+    p.add_argument('--output-code-lr-scale', type=float, default=1.0,
+                   help="Multiply the learning rate of the coded head's C and b by this. "
+                        "They take one nominal step where the tables effectively take "
+                        "n_t (all n_t visited rows receive the full dL/dy), so at a "
+                        "shared LR they train far more slowly. Default 1.0 = the shared "
+                        "LR the first runs used.")
 
     # optimization
     p.add_argument('--batch-size', type=int, default=1)
@@ -282,6 +305,8 @@ def validate_args(args, parser):
         parser.error('--lr-cooldown-min-ratio must be in [0, 1]')
     if args.lr_reference_batch_size < 1:
         parser.error('--lr-reference-batch-size must be at least 1')
+    if args.output_code_lr_scale <= 0.0:
+        parser.error('--output-code-lr-scale must be positive')
     if (args.validation_interval_epochs is not None
             and args.validation_interval_epochs <= 0.0):
         parser.error('--validation-interval-epochs must be positive')
@@ -441,15 +466,26 @@ def build_optimizers(model, args):
         model.cfg.table_grad = TABLE_GRAD_DENSE
     tables = [p for p in model.table_parameters() if p.requires_grad]
     dense = model.dense_parameters()
+    # The coded head's C and b ride in the dense optimizer but get their own param group,
+    # so --output-code-lr-scale changes their step without touching PE or LayerNorm. The
+    # scheduler scales each group off its own initial lr, so the shape of the schedule is
+    # shared and only the peak differs. At scale 1.0 this is arithmetically identical to
+    # leaving them in the dense group -- which is what keeps the already-finished
+    # baseline / learned:5 / binary:5 runs comparable with anything launched after it.
+    code = model.output_code_parameters()
     lr = args.max_learning_rate
+    code_lr = lr * args.output_code_lr_scale
     optimizers = []
 
     if args.optimizer == 'sgd':
         # Plain SGD accepts either representation, so 'auto' can vary per table.
         optimizers.append(torch.optim.SGD([{'params': tables}], lr=lr))
-        if dense:
+        groups = ([{'params': dense, 'lr': lr}] if dense else [])
+        if code:
+            groups.append({'params': code, 'lr': code_lr})
+        if groups:
             optimizers.append(torch.optim.SGD(
-                [{'params': dense}], lr=lr, momentum=args.momentum,
+                groups, lr=lr, momentum=args.momentum,
                 weight_decay=args.weight_decay))
     else:
         cls = torch.optim.AdamW if args.optimizer == 'adamw' else torch.optim.Adam
@@ -458,8 +494,11 @@ def build_optimizers(model, args):
         else:
             # Adam cannot consume a sparse gradient, so pin the tables to dense.
             optimizers.append(cls(tables, lr=lr, weight_decay=args.weight_decay))
-        if dense:
-            optimizers.append(cls(dense, lr=lr, weight_decay=args.weight_decay))
+        groups = ([{'params': dense, 'lr': lr}] if dense else [])
+        if code:
+            groups.append({'params': code, 'lr': code_lr})
+        if groups:
+            optimizers.append(cls(groups, lr=lr, weight_decay=args.weight_decay))
 
     factor = lr_lambda_factory(args)
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, factor) for opt in optimizers]
@@ -658,7 +697,8 @@ def main(argv=None):
     for key in ('batch_size', 'optimizer', 'table_grad', 'momentum', 'weight_decay',
                 'lr_scheduler', 'inverse_sqrt_alpha', 'cosine_min_lr_ratio',
                 'seed', 'cpu_cores', 'kernels', 'device', 'cuda_graphs',
-                'testing_length', 'loss_file', 'save_model', 'load_model'):
+                'testing_length', 'loss_file', 'save_model', 'load_model',
+                'output_code_lr_scale'):
         print(f"  {key:24s} = {getattr(args, key)}")
     print('=' * 50)
 
@@ -691,6 +731,9 @@ def main(argv=None):
     print(f"Trainable tables: {len(model.table_parameters())}, "
           f"table entries: {sum(p.numel() for p in model.table_parameters()):,}, "
           f"dense parameters: {sum(p.numel() for p in model.dense_parameters()):,}, "
+          f"output code parameters: "
+          f"{sum(p.numel() for p in model.output_code_parameters()):,} "
+          f"@ lr x{args.output_code_lr_scale:g}, "
           f"device: {device}, cuda graphs: {'on' if use_graphs else 'off'}")
 
     optimizers, schedulers = build_optimizers(model, args)

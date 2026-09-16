@@ -25,6 +25,14 @@ class ConfigError(ValueError):
     """Raised for an invalid structural configuration."""
 
 
+# How the output head's low-dimensional code is chosen. ``learned`` makes the class-code
+# matrix a dense parameter; ``binary`` freezes it to the +-1 binary expansion of each
+# class index. See ``LutModel`` for why both are a plain linear readout.
+OUTPUT_CODE_LEARNED = 'learned'
+OUTPUT_CODE_BINARY = 'binary'
+OUTPUT_CODE_MODES = (OUTPUT_CODE_LEARNED, OUTPUT_CODE_BINARY)
+
+
 @dataclass
 class LutConfig:
     # --- shape ---
@@ -67,6 +75,20 @@ class LutConfig:
     table_grad: str = TABLE_GRAD_AUTO
     layernorm: bool = False
     dropout: float = 0.0
+
+    # --- output head ---
+    # None keeps the head's y_dim at vocab_size_output (one score per class, the
+    # `main.py` behaviour). An int D makes the head emit D numbers that a (V, D) code
+    # matrix maps to the V logits, so the table costs n_t * 2**n_c * D instead of
+    # n_t * 2**n_c * V.
+    output_code_dim: Optional[int] = None
+    output_code: str = OUTPUT_CODE_LEARNED
+    # Add a per-class bias: logits = y @ C.T + b. Without it every logit vector the model
+    # can produce lies in col(C), a D-dimensional subspace -- class priors included. The
+    # frozen binary code's column space holds only 20.8% of this corpus's log-prior energy
+    # (less than a random D-dim subspace), so that arm cannot express "NOUN is common"
+    # except by spending its rank on it. V extra parameters; 18 here, 14,398 at full vocab.
+    output_code_bias: bool = False
 
     # --- task ---
     POS_task: bool = False
@@ -126,6 +148,26 @@ class LutConfig:
             raise ConfigError('qk_norm_eps must be positive')
         if not 0.0 <= self.dropout < 1.0:
             raise ConfigError('dropout must be in [0, 1)')
+        if self.output_code not in OUTPUT_CODE_MODES:
+            raise ConfigError(f'output_code must be one of {OUTPUT_CODE_MODES}')
+        if self.output_code_bias and self.output_code_dim is None:
+            # The uncoded head reaches class priors through the table's own rows, so a
+            # bias there would make the control differ from the default head by two
+            # things at once.
+            raise ConfigError('output_code_bias requires output_code_dim')
+        if self.output_code_dim is not None:
+            if self.output_code_dim < 1:
+                raise ConfigError('output_code_dim must be at least 1')
+            if self.output_code_dim > self.vocab_size_output:
+                raise ConfigError('output_code_dim must not exceed vocab_size_output; '
+                                  'a code wider than the vocabulary saves nothing')
+            if self.output_code == OUTPUT_CODE_BINARY:
+                # A binary code needs enough bits to give every class its own codeword.
+                need = max(1, (self.vocab_size_output - 1).bit_length())
+                if self.output_code_dim < need:
+                    raise ConfigError(
+                        f'output_code binary needs output_code_dim >= {need} to give '
+                        f'{self.vocab_size_output} classes distinct codewords')
 
     @property
     def head_value_dim(self):
