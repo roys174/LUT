@@ -386,6 +386,89 @@ def test_checkpoint_reset_optimizer_loads_weights_only():
 
 
 # ---------------------------------------------------------------------------
+# Tree weights
+# ---------------------------------------------------------------------------
+
+@parametrize('stack_heads', [False, True])
+def test_tree_weights_start_as_the_unweighted_model(stack_heads):
+    """Ones-initialised weights must not change the forward or the table gradients."""
+    rng = np.random.default_rng(12)
+    inputs = rng.integers(0, CFG_KWARGS['vocab_size_input'], (2, CFG_KWARGS['context_size']))
+    targets = rng.integers(0, CFG_KWARGS['vocab_size_output'], (2, CFG_KWARGS['context_size']))
+    results = []
+    for tree_weights in (False, True):
+        model, cfg = make_model(tree_weights=tree_weights, stack_heads=stack_heads,
+                                table_grad='dense')
+        loss = objective(model, cfg, inputs, targets)
+        loss.backward()
+        results.append((float(loss), table_grads(model), model))
+    (loss_a, grads_a, _), (loss_b, grads_b, weighted) = results
+    assert abs(loss_a - loss_b) <= 1e-5 * abs(loss_a)
+    for a, b in zip(grads_a, grads_b):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+    weights = weighted.tree_weight_parameters()
+    assert weights and all(torch.equal(w.detach(), torch.ones_like(w)) for w in weights)
+    assert all(w.grad is not None and bool(w.grad.abs().sum() > 0) for w in weights)
+
+
+def test_every_table_gets_tree_weights():
+    model, cfg = make_model(tree_weights=True)
+    plain, _ = make_model()
+    assert plain.tree_weight_parameters() == []
+    L, H = cfg.num_layers, cfg.num_heads
+    # Q, K, V, Final per head, plus FFN and MHA_O per layer, plus the output head.
+    assert len(model.tree_weight_parameters()) == L * (4 * H + 2) + 1
+
+
+@parametrize('optimizer', ['sgd', 'adam'])
+def test_tree_weights_train_in_their_own_group(optimizer):
+    """Same lr as the dense group, no weight decay, and every parameter in exactly one
+    group of one optimizer."""
+    model, cfg = make_model(tree_weights=True)
+    args = parse_args(['--optimizer', optimizer, '--warmup-steps', '2', '--max-steps', '20',
+                       '--weight-decay', '0.1', '--max-learning-rate', '0.05',
+                       '--tree-weights'])
+    optimizers, schedulers = build_optimizers(model, args)
+    for sched in schedulers:      # warmup starts at lr 0, which would hide the step
+        sched.step()
+    seen = [id(p) for opt in optimizers for g in opt.param_groups for p in g['params']]
+    assert sorted(seen) == sorted(id(p) for p in model.parameters() if p.requires_grad)
+
+    tree_ids = {id(p) for p in model.tree_weight_parameters()}
+    groups = [g for opt in optimizers for g in opt.param_groups
+              if {id(p) for p in g['params']} & tree_ids]
+    assert len(groups) == 1 and {id(p) for p in groups[0]['params']} == tree_ids
+    assert groups[0]['weight_decay'] == 0.0
+    assert groups[0]['lr'] == optimizers[-1].param_groups[0]['lr']
+
+    rng = np.random.default_rng(13)
+    inputs = rng.integers(0, cfg.vocab_size_input, (2, cfg.context_size))
+    targets = rng.integers(0, cfg.vocab_size_output, (2, cfg.context_size))
+    objective(model, cfg, inputs, targets).backward()
+    for opt in optimizers:
+        opt.step()
+    assert any(not torch.equal(w.detach(), torch.ones_like(w))
+               for w in model.tree_weight_parameters())
+
+
+def test_tree_weights_survive_a_checkpoint():
+    model, cfg = make_model(tree_weights=True)
+    with torch.no_grad():
+        for w in model.tree_weight_parameters():
+            w.uniform_(0.5, 1.5)
+    args = parse_args(['--warmup-steps', '2', '--max-steps', '20', '--tree-weights'])
+    optimizers, schedulers = build_optimizers(model, args)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'ckpt')
+        save_checkpoint(path, model, cfg, optimizers, schedulers, 3, args)
+        restored, _ = make_model(seed=99, tree_weights=True)
+        r_opts, r_scheds = build_optimizers(restored, args)
+        load_checkpoint(path, restored, r_opts, r_scheds, reset_optimizer=False)
+    for a, b in zip(model.tree_weight_parameters(), restored.tree_weight_parameters()):
+        assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 

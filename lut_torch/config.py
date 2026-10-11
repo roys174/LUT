@@ -63,6 +63,10 @@ class LutConfig:
     # test suites that reach into per-head modules (test_torch_parity.py above all) build
     # models unstacked and are the reason this is not simply always on.
     stack_heads: bool = False
+    # A learned weight per tree slot in every table: y = sum_t w[t] * S[trees[t], j[t]].
+    # Initialised to 1, so a fresh model computes exactly what it would without them.
+    # Off by default because it adds parameters, which existing checkpoints do not have.
+    tree_weights: bool = False
 
     # --- PE / QK ablations ---
     PE_only: bool = False

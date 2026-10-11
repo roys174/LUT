@@ -238,5 +238,33 @@ def test_checkpoint_conversion_round_trip():
         assert torch.equal(plain(tokens), stacked(tokens))
 
 
+
+def test_tree_weights_stack_like_the_tables():
+    """Non-trivial tree weights: forward exact, and each head's weight gradient lands in
+    its own row of the stacked parameter."""
+    plain, stacked, cfg = build_pair(num_layers=1, tree_weights=True, table_grad='dense',
+                                     qkpe_direct_sign=True)
+    with torch.no_grad():
+        gen = torch.Generator().manual_seed(8)
+        for w in plain.tree_weight_parameters():
+            w.copy_(torch.rand(w.shape, generator=gen) + 0.5)
+    stacked.load_state_dict(stack_state_dict(plain.state_dict(), stacked))
+
+    rng = np.random.default_rng(9)
+    tokens = torch.from_numpy(rng.integers(0, cfg.vocab_size_input, (2, cfg.context_size)))
+    targets = torch.from_numpy(rng.integers(0, cfg.vocab_size_output,
+                                            (2, cfg.context_size)))
+    logits_p, _ = run_step(plain, cfg, tokens, targets)
+    logits_s, _ = run_step(stacked, cfg, tokens, targets)
+    assert torch.equal(logits_p, logits_s)
+
+    names = {id(p): n for n, p in plain.named_parameters()}
+    want = stack_state_dict({names[id(w)]: w.grad for w in plain.tree_weight_parameters()},
+                            stacked)
+    got = {n: p.grad for n, p in stacked.named_parameters() if 'tree_weights' in n}
+    assert set(want) == set(got), f'{sorted(want)} != {sorted(got)}'
+    for name in want:
+        torch.testing.assert_close(got[name], want[name], rtol=1e-6, atol=1e-6, msg=name)
+
 if __name__ == '__main__':
     raise SystemExit(run_all(globals()))

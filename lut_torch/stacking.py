@@ -19,9 +19,10 @@ import torch
 _ROLES = (('qk', ('Q', 'K')), ('v', ('V',)), ('final', ('Final',)))
 
 # Per-head leaf -> stacked suffix.  ``S_flat`` concatenates along the row axis (the slabs
-# are contiguous); the index buffers stack into a new leading slot axis.
+# are contiguous); the index buffers and per-tree weights stack into a new leading slot
+# axis.
 _CONCAT = {'S_flat': 'S_flat'}
-_STACK = {'a_arr': 'a', 'b_arr': 'b', 'trees': 'trees'}
+_STACK = {'a_arr': 'a', 'b_arr': 'b', 'trees': 'trees', 'tree_weights': 'tree_weights'}
 
 
 def _stacked_layers(model):

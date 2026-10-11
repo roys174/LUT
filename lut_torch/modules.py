@@ -202,7 +202,7 @@ class LUTTable(nn.Module):
     """
 
     def __init__(self, name, n_t, n_c, fan_in, total_n_c, y_dim, input_dim,
-                 s_n_t=None, trees=None):
+                 s_n_t=None, trees=None, tree_weights=False):
         super().__init__()
         self.name = name
         self.n_t = n_t
@@ -219,6 +219,9 @@ class LUTTable(nn.Module):
         tree_map = np.arange(n_t, dtype=np.int32) if trees is None else np.asarray(trees)
         self.register_buffer('trees', torch.tensor(tree_map, dtype=torch.int64))
         self.S_flat = nn.Parameter(torch.zeros(self.s_n_t * self.n_bins, y_dim))
+        # One weight per logical slot, so slots sharing a physical tree under
+        # --weight-sharing still weigh separately. Ones: draws no RNG, changes nothing.
+        self.tree_weights = nn.Parameter(torch.ones(n_t)) if tree_weights else None
 
     @property
     def S(self):
@@ -237,7 +240,8 @@ class LUTTable(nn.Module):
         entry = {} if capture is not None else None
         y = lut_lookup(self.S_flat, self.trees, self.n_bins, [self.group()],
                        [self.margins(x)], selection=selection,
-                       table_grad=table_grad, capture=entry)
+                       table_grad=table_grad, capture=entry,
+                       tree_weights=self.tree_weights)
         if capture is not None:
             capture[self.name] = entry
         return y
@@ -268,18 +272,20 @@ class NewAttentionHead(nn.Module):
         self.positional_encoding = nn.Parameter(
             torch.tensor(pe, dtype=torch.float32), requires_grad=not cfg.freeze_PE)
 
+        tw = cfg.tree_weights
         self.Q = LUTTable(f'{name}_Q', cfg.attn_qk_n_t, cfg.attn_qk_n_c,
                           cfg.comparisons_per_bit, cfg.attn_qk_n_c, cfg.attn_qk_dim,
-                          cfg.embedding_dim)
+                          cfg.embedding_dim, tree_weights=tw)
         self.K = LUTTable(f'{name}_K', cfg.attn_qk_n_t, cfg.attn_qk_n_c,
                           cfg.comparisons_per_bit, cfg.attn_qk_n_c, cfg.attn_qk_dim,
-                          cfg.embedding_dim)
+                          cfg.embedding_dim, tree_weights=tw)
         self.V = LUTTable(f'{name}_V', cfg.n_t, cfg.n_c, cfg.comparisons_per_bit,
-                          cfg.n_c, value_dim, cfg.embedding_dim)
+                          cfg.n_c, value_dim, cfg.embedding_dim, tree_weights=tw)
         self.Final = LUTTable(f'{name}_Final', cfg.n_t, cfg.n_c, cfg.comparisons_per_bit,
                               cfg.final_total_n_c, value_dim, value_dim,
                               s_n_t=cfg.final_n_t,
-                              trees=final_tree_map(cfg.final_n_t, cfg.final_share_m))
+                              trees=final_tree_map(cfg.final_n_t, cfg.final_share_m),
+                              tree_weights=tw)
 
         qkpe_a, qkpe_b = build_random_comparison_arrays(
             cfg.n_t, cfg.positional_dim, cfg.attn_qk_dim)
@@ -339,7 +345,8 @@ class NewAttentionHead(nn.Module):
         entry = {} if capture is not None else None
         y_pairs = lut_lookup(self.Final.S_flat, self.Final.trees, self.Final.n_bins,
                              groups, [qkpe, v_margins], selection=selection,
-                             table_grad=cfg.table_grad, capture=entry)
+                             table_grad=cfg.table_grad, capture=entry,
+                             tree_weights=self.Final.tree_weights)
         if capture is not None:
             capture[f'{self.name}_Final'] = entry
 
@@ -439,12 +446,25 @@ class StackedHeads(nn.Module):
                    * first.s_n_t)
         self.register_buffer(f'{prefix}_trees',
                              torch.stack([t.trees for t in tables]) + offsets)
+        # (slots, N_T): row s is slot s's own weights, as in the unstacked tables.
+        self.register_parameter(
+            f'{prefix}_tree_weights',
+            nn.Parameter(torch.stack([t.tree_weights.detach() for t in tables]))
+            if first.tree_weights is not None else None)
 
     def _slot_trees(self, prefix, batch):
         """The stacked tree map replicated over the batch, as ``(batch * slots, N_T)``."""
         trees = getattr(self, f'{prefix}_trees')
         slots, n_t = trees.shape
         return trees.unsqueeze(0).expand(batch, slots, n_t).reshape(batch * slots, n_t)
+
+    def _slot_tree_weights(self, prefix, batch):
+        """The stacked tree weights replicated like :meth:`_slot_trees`, or ``None``."""
+        weights = getattr(self, f'{prefix}_tree_weights')
+        if weights is None:
+            return None
+        slots, n_t = weights.shape
+        return weights.unsqueeze(0).expand(batch, slots, n_t).reshape(batch * slots, n_t)
 
     def _shared_margins(self, prefix, x):
         """``u = x[a] - x[b]`` for every slot, from an input all slots share.
@@ -483,7 +503,8 @@ class StackedHeads(nn.Module):
         y = lut_lookup(getattr(self, f'{prefix}_S_flat'), self._slot_trees(prefix, batch),
                        getattr(self, f'{prefix}_n_bins'), groups, margins,
                        selection=self.cfg.gradient_pair_selection,
-                       table_grad=table_grad, capture=entry)
+                       table_grad=table_grad, capture=entry,
+                       tree_weights=self._slot_tree_weights(prefix, batch))
         if capture is not None:
             self._split_capture(entry, capture, names, batch, len(names))
         return y
@@ -587,11 +608,12 @@ class LutLayer(nn.Module):
         ed = cfg.embedding_dim
 
         self.ffn = LUTTable(f'ffn_{index}', cfg.n_t, cfg.n_c, cfg.comparisons_per_bit,
-                            cfg.n_c, ed, ed)
+                            cfg.n_c, ed, ed, tree_weights=cfg.tree_weights)
         if cfg.new_MHA:
             self.mha_o = LUTTable(f'mha_o_{index}', cfg.n_t, cfg.n_c,
                                   cfg.comparisons_per_bit, cfg.n_c, ed,
-                                  cfg.num_heads * cfg.head_value_dim)
+                                  cfg.num_heads * cfg.head_value_dim,
+                                  tree_weights=cfg.tree_weights)
         else:
             self.mha_o = None
         self.stacked = cfg.stack_heads
@@ -679,7 +701,7 @@ class LutModel(nn.Module):
                                     cfg.n_c,
                                     cfg.vocab_size_output if code_dim is None
                                     else code_dim,
-                                    cfg.embedding_dim)
+                                    cfg.embedding_dim, tree_weights=cfg.tree_weights)
         # Drawn last, and only when a code is asked for, so every existing configuration
         # leaves both RNG streams exactly where main.build_Model does.
         if code_dim is None:
@@ -738,6 +760,17 @@ class LutModel(nn.Module):
                 out.extend([module.qk_S_flat, module.v_S_flat, module.final_S_flat])
         return out
 
+    def tree_weight_parameters(self):
+        """The per-tree weights (``--tree-weights``), for optimizer grouping."""
+        out = []
+        for module in self.modules():
+            if isinstance(module, LUTTable):
+                out.append(module.tree_weights)
+            elif isinstance(module, StackedHeads):
+                out.extend([module.qk_tree_weights, module.v_tree_weights,
+                            module.final_tree_weights])
+        return [p for p in out if p is not None and p.requires_grad]
+
     def output_code_parameters(self):
         """The coded head's dense parameters (``C`` and ``b``), for optimizer grouping.
 
@@ -762,5 +795,6 @@ class LutModel(nn.Module):
         """Everything else that trains: positional encodings and LayerNorm affines."""
         excluded = {id(p) for p in self.table_parameters()}
         excluded.update(id(p) for p in self.output_code_parameters())
+        excluded.update(id(p) for p in self.tree_weight_parameters())
         return [p for p in self.parameters()
                 if p.requires_grad and id(p) not in excluded]

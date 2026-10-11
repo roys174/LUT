@@ -354,9 +354,6 @@ def test_rejected_configurations(kwargs):
     raise AssertionError(f'expected ConfigError for {kwargs}')
 
 
-if __name__ == '__main__':
-    raise SystemExit(run_all(globals()))
-
 
 def test_tree_chunking_is_off_at_normal_widths():
     """The chunked backward must be the single-call path for everything but a wide head.
@@ -399,3 +396,7 @@ def test_chunked_backward_matches_unchunked(mode):
     for name, value in big.items():
         # Chunking reassociates one scatter-add, so float32 may differ in the last ULP.
         assert torch.allclose(value, small[name], rtol=1e-5, atol=1e-6), name
+
+
+if __name__ == '__main__':
+    raise SystemExit(run_all(globals()))

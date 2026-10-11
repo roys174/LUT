@@ -335,6 +335,14 @@ on the machine you will actually train on — a shared login node gives noisy nu
   target, and `loss_no_unk`/`acc_no_unk` over the same targets with `<unk>` removed — and
   both reach `loss.csv` and W&B. Training is untouched, so nothing is committed to. Use
   the no-unk pair to compare runs; a headline perplexity is not comparable across the two.
+- `--tree-weights` — every table (Q, K, V, Final, FFN, MHA_O, output) gets a learned weight
+  per tree slot, `y = sum_t w[t] * S[trees[t], j_t]` (`lut_lookup(..., tree_weights=)`).
+  Initialised to 1, so a fresh model is the unweighted one. One weight per *logical* slot,
+  so slots sharing a physical tree under `--weight-sharing` weigh separately. They train
+  in their own group of the dense optimizer at the dense lr, with momentum but **no weight
+  decay** (decay pulls towards 0, not 1). A weighted call never reaches the Numba kernels,
+  so CPU runs are slower with this on. Off by default: existing checkpoints have no
+  `tree_weights` keys and will not load into a model built with it.
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
 - `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. `--kernels` is silently a no-op on
   GPU.

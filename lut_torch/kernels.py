@@ -51,8 +51,8 @@ def set_kernel_backend(mode):
     A module-level switch rather than a ``lut_lookup`` argument on purpose: it is a pure
     performance choice with identical numerics, and adding an argument to
     ``LUTFunction.apply`` would shift the ``needs_input_grad`` offset that ``backward``
-    indexes from (margins start at 7 today) -- a change that fails silently as a wrong
-    gradient, not a crash.
+    indexes from (margins start at 8 today; see ``functional._MARGINS_ARG0``) -- a
+    change that fails silently as a wrong gradient, not a crash.
     """
     global _backend
     if mode not in KERNEL_BACKEND_MODES:

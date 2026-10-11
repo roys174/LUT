@@ -6,6 +6,7 @@ table::
     bit_b   = XOR_k ( u[..., b*K + k] > 0 )        # K = comparisons_per_bit
     j       = sum_b bit_b << b     (per group, shifted by the group's bit_offset)
     y[p]    = sum_t S[trees[t], j[p, t], :]
+            (or sum_t w[t] * S[trees[t], j[p, t], :] with optional learned tree weights)
 
 Nothing about that is differentiable, so ``main.py`` defines two gradients by hand and this
 module reproduces them exactly:
@@ -152,6 +153,33 @@ def _tree_rows(trees: torch.Tensor) -> torch.Tensor:
     return rows if rows.dim() == 1 else rows.unsqueeze(1)
 
 
+def _tree_weights(weights: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Tree weights shaped to broadcast against a ``(B, P, N_T)`` row index.
+
+    Same two forms as :func:`_tree_rows`: ``(N_T,)`` for one table, ``(B, N_T)`` for the
+    stacked form where each batch row is its own table.
+    """
+    if weights is None or weights.dim() == 1:
+        return weights
+    return weights.unsqueeze(1)
+
+
+def _visit_rows(grad_y, shape, weights):
+    """``grad_y`` repeated once per visit of an index of ``shape``, as ``(-1, y_dim)``.
+
+    Each visit is scaled by its tree's weight when there is one. Unweighted, a single-tree
+    ``shape`` is served by a view of ``grad_y`` (no copy); the general case copies, since
+    ``expand`` leaves stride 0.
+    """
+    y_dim = grad_y.shape[-1]
+    if weights is not None:
+        return (grad_y.unsqueeze(-2) * weights.unsqueeze(-1)).expand(
+            *shape, y_dim).reshape(-1, y_dim)
+    if shape[-1] == 1:
+        return grad_y.reshape(-1, y_dim)
+    return grad_y.unsqueeze(-2).expand(*shape, y_dim).reshape(-1, y_dim)
+
+
 def _first_argmin(values: torch.Tensor) -> torch.Tensor:
     """Index of the first minimum along the last dim.
 
@@ -220,26 +248,40 @@ def _reduce_to(grad: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     return grad
 
 
+# Positions of the tensor arguments of ``LUTFunction.apply``. ``backward`` indexes
+# ``needs_input_grad`` by these, and an off-by-one is a silent wrong gradient, not a crash.
+_WEIGHTS_ARG = 7
+_MARGINS_ARG0 = 8
+
+
 class LUTFunction(torch.autograd.Function):
-    """Forward/backward for ``y[p] = sum_t S[trees[t], j[p, t]]``."""
+    """Forward/backward for ``y[p] = sum_t w[t] * S[trees[t], j[p, t]]`` (``w`` optional)."""
 
     @staticmethod
     def forward(ctx, S_flat, trees, n_bins, groups, selection, table_grad, capture,
-                *margins):
+                tree_weights, *margins):
         n_trees = trees.shape[-1]
-        use_kernels = _kernels.supported(S_flat, trees, groups, margins, selection)
+        # The Numba kernels only know the unweighted sum, so a weighted call takes the
+        # torch path.
+        use_kernels = (tree_weights is None
+                       and _kernels.supported(S_flat, trees, groups, margins, selection))
         with torch.no_grad():
             if use_kernels:
                 y, j, fallback = _kernels.forward(S_flat, trees, n_bins, groups, margins)
             else:
                 j, fallback = _index_and_fallback(margins, groups, n_trees)
                 idx = _tree_rows(trees) * n_bins + j
+                per_visit = None
+                if tree_weights is not None:
+                    per_visit = _tree_weights(tree_weights).expand(idx.shape).reshape(
+                        -1, n_trees)
                 # embedding_bag sums the tree axis without materialising the
                 # (B, P, N_T, y_dim) gather that embedding(...).sum(-2) would.
-                y = F.embedding_bag(idx.reshape(-1, n_trees), S_flat, mode='sum').view(
+                y = F.embedding_bag(idx.reshape(-1, n_trees), S_flat, mode='sum',
+                                    per_sample_weights=per_visit).view(
                     *idx.shape[:-1], S_flat.shape[-1])
 
-        ctx.save_for_backward(S_flat, trees, j, *fallback, *margins)
+        ctx.save_for_backward(S_flat, trees, j, tree_weights, *fallback, *margins)
         ctx.groups = groups
         ctx.n_bins = n_bins
         ctx.selection = selection
@@ -254,18 +296,20 @@ class LUTFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_y):
         n_groups = len(ctx.groups)
-        S_flat, trees, j = ctx.saved_tensors[:3]
-        fallback = ctx.saved_tensors[3:3 + n_groups]
-        margins = ctx.saved_tensors[3 + n_groups:]
+        S_flat, trees, j, tree_weights = ctx.saved_tensors[:4]
+        fallback = ctx.saved_tensors[4:4 + n_groups]
+        margins = ctx.saved_tensors[4 + n_groups:]
         groups = ctx.groups
         n_bins = ctx.n_bins
         cosine = ctx.selection == SELECTION_COSINE
         trees64 = _tree_rows(trees)
+        weights = _tree_weights(tree_weights)
 
         grad_y = grad_y.contiguous()
         idx = trees64 * n_bins + j
         need_S = ctx.needs_input_grad[0]
-        need_margins = any(ctx.needs_input_grad[7:])
+        need_weights = ctx.needs_input_grad[_WEIGHTS_ARG]
+        need_margins = any(ctx.needs_input_grad[_MARGINS_ARG0:])
 
         n_trees = idx.shape[-1]
         y_dim = grad_y.shape[-1]
@@ -280,26 +324,23 @@ class LUTFunction(torch.autograd.Function):
                      or (ctx.table_grad == TABLE_GRAD_AUTO
                          and flat_idx.numel() >= S_flat.shape[0]))
             if dense and chunk < n_trees:
-                # Chunked scatter-add. At chunk == 1 `grad_y.reshape` is a view, so this
-                # path allocates nothing at all beyond grad_S itself -- the `expand(...)
-                # .reshape(...)` below is a real copy because expand leaves stride 0.
-                flat_grad = grad_y.reshape(-1, y_dim)
+                # Chunked scatter-add. Unweighted at chunk == 1, the visit rows are a
+                # view of grad_y, so this path allocates nothing beyond grad_S itself.
                 grad_S = torch.zeros_like(S_flat)
                 for t0 in range(0, n_trees, chunk):
                     cols = idx[..., t0:t0 + chunk]
-                    vals = (flat_grad if cols.shape[-1] == 1
-                            else grad_y.unsqueeze(-2)
-                            .expand(*cols.shape, y_dim).reshape(-1, y_dim))
-                    grad_S.index_add_(0, cols.reshape(-1), vals)
+                    w_cols = None if weights is None else weights[..., t0:t0 + chunk]
+                    grad_S.index_add_(0, cols.reshape(-1),
+                                      _visit_rows(grad_y, cols.shape, w_cols))
             elif dense:
-                values = grad_y.unsqueeze(-2).expand(*idx.shape, y_dim).reshape(-1, y_dim)
+                values = _visit_rows(grad_y, idx.shape, weights)
                 grad_S = torch.zeros_like(S_flat).index_add_(0, flat_idx, values)
             else:
                 # A sparse gradient must materialise one y_dim-wide row per visit by
                 # construction, so chunking cannot help it. At a full vocabulary that is
                 # the larger object anyway (visits x V against rows x V), which is what
                 # --table-grad is for; `auto` already picks dense once visits >= rows.
-                values = grad_y.unsqueeze(-2).expand(*idx.shape, y_dim).reshape(-1, y_dim)
+                values = _visit_rows(grad_y, idx.shape, weights)
                 # Indices are constructed, not user-supplied, so skip invariant checks
                 # (the context manager form also keeps torch from warning about it).
                 with torch.sparse.check_sparse_tensor_invariants(False):
@@ -308,9 +349,11 @@ class LUTFunction(torch.autograd.Function):
                         check_invariants=False,
                     )
 
+        S_j_dot = None
         grad_margins = [None] * len(margins)
         if need_margins:
-            needs_grad = [ctx.needs_input_grad[7 + gi] for gi in range(n_groups)]
+            needs_grad = [ctx.needs_input_grad[_MARGINS_ARG0 + gi]
+                          for gi in range(n_groups)]
             if ctx.use_kernels and not cosine:
                 # The raw map, not the broadcast-shaped ``trees64``: the kernels index
                 # ``trees[b, t]`` and normalise the shape themselves.
@@ -337,17 +380,27 @@ class LUTFunction(torch.autograd.Function):
                     if cosine:
                         grad_margins[gi_idx] = _cosine_group_grad(
                             S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq, idx,
-                            margin, group, fallback[gi_idx])
+                            margin, group, fallback[gi_idx], weights)
                     else:
                         grad_margins[gi_idx] = _closest_group_grad(
                             S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
-                            margin, group, fallback[gi_idx])
+                            margin, group, fallback[gi_idx], weights)
 
-        return (grad_S, None, None, None, None, None, None, *grad_margins)
+        grad_weights = None
+        if need_weights:
+            # dL/dw[t] = sum over (b, p) of S[idx[b, p, t]] . g[b, p] -- the unweighted
+            # S[j] contraction, which the margin path has usually computed already.
+            if S_j_dot is None:
+                S_j_dot = _rows_dot(S_flat, idx, grad_y, chunk)
+            grad_weights = S_j_dot.sum(dim=1)                 # (B, N_T)
+            if tree_weights.dim() == 1:
+                grad_weights = grad_weights.sum(dim=0)        # (N_T,)
+
+        return (grad_S, None, None, None, None, None, None, grad_weights, *grad_margins)
 
 
 def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
-                        margin, group, r):
+                        margin, group, r, weights=None):
     """Margin gradient for ``closest`` selection.
 
     The chosen comparison is ``argmin |u|``, which depends only on the margins, so it is
@@ -363,6 +416,8 @@ def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
     if group.pair_index is not None:
         u = u.index_select(1, group.pair_index)
     contribution = gi * _surrogate_factor(u)                             # (B, P, N_T)
+    if weights is not None:  # flipping tree t's bit changes y by w[t] * delta
+        contribution = contribution * weights
 
     if group.pair_index is not None:
         accumulated = contribution.new_zeros(
@@ -378,12 +433,16 @@ def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
 
 
 def _cosine_group_grad(S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq, idx,
-                       margin, group, r_fallback):
+                       margin, group, r_fallback, weights=None):
     """Margin gradient for ``cosine-distance`` selection.
 
     Here the choice of comparison depends on the upstream gradient and on the table rows,
     so it varies per pair and per tree; the gradient must be assembled at the expanded
     shape and scattered back.
+
+    Tree weights scale ``gi`` but not the selection: the score's cosine term is invariant
+    to rescaling ``delta`` by a nonzero ``w[t]``, and at ``w[t] = 0`` the gradient is zero
+    whichever comparison is picked.
     """
     gathered = _gather_pairs(margin, group).expand(*idx.shape, group.raw_count)
     r = _select_cosine(S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq,
@@ -392,6 +451,8 @@ def _cosine_group_grad(S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq, idx,
     jbar = j ^ _flip_mask(r, group)
     delta = F.embedding(trees64 * n_bins + jbar, S_flat) - S_j
     gi = (delta * grad_yt).sum(dim=-1)
+    if weights is not None:
+        gi = gi * weights
     u = gathered.gather(-1, r.unsqueeze(-1)).squeeze(-1)
 
     grad_full = torch.zeros_like(gathered)
@@ -448,8 +509,20 @@ def _select_cosine(S_flat, trees64, n_bins, j, S_j, grad_yt, grad_sq,
     return torch.where(best_r >= 0, best_r, r_fallback)
 
 
+def _check_tree_weights(tree_weights, trees, S_flat):
+    if tree_weights is None:
+        return
+    if tree_weights.shape[-1] != trees.shape[-1] or tree_weights.dim() > trees.dim():
+        raise ValueError(f'tree_weights {tuple(tree_weights.shape)} must be (N_T,) or '
+                         f'match trees {tuple(trees.shape)}')
+    if tree_weights.dtype != S_flat.dtype:
+        raise ValueError(f'tree_weights dtype {tree_weights.dtype} must match the '
+                         f'table ({S_flat.dtype})')
+
+
 def lut_lookup(S_flat, trees, n_bins, groups, margins,
-               selection=SELECTION_CLOSEST, table_grad=TABLE_GRAD_AUTO, capture=None):
+               selection=SELECTION_CLOSEST, table_grad=TABLE_GRAD_AUTO, capture=None,
+               tree_weights=None):
     """Look up and sum LUT rows. Returns ``(B, P, y_dim)``.
 
     Args:
@@ -466,12 +539,19 @@ def lut_lookup(S_flat, trees, n_bins, groups, margins,
         capture: optional dict; receives ``j`` (the row index, ``(B, P, N_T)``) and
             ``r_closest`` (per group, the closest-margin comparison at the margin
             source's own shape) for instrumentation.
+        tree_weights: optional per-tree weights, making the sum over trees
+            ``sum_t w[t] * S[...]``. ``(N_T,)``, or ``(B, N_T)`` alongside a ``(B, N_T)``
+            ``trees``; one weight per logical slot, so slots sharing a physical tree under
+            ``--weight-sharing`` still weigh separately. Gets a gradient when it requires
+            one. Disables the Numba kernels for the call.
     """
+    _check_tree_weights(tree_weights, trees, S_flat)
     return LUTFunction.apply(S_flat, trees, n_bins, tuple(groups), selection,
-                             table_grad, capture, *margins)
+                             table_grad, capture, tree_weights, *margins)
 
 
-def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None):
+def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None,
+                         tree_weights=None):
     """Pure-autograd equivalent of :func:`lut_lookup` for ``closest`` selection.
 
     Uses the identity ``dphi/du = -0.5*sign(u)/(1+|u|)^2`` for ``phi(u) = 0.5/(1+|u|)``:
@@ -479,14 +559,17 @@ def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None):
     surrogate gradient in backward.  Kept as a test oracle -- it cannot express
     ``cosine-distance``, whose selection depends on the upstream gradient.
     """
+    _check_tree_weights(tree_weights, trees, S_flat)
     n_trees = trees.shape[-1]
     trees64 = _tree_rows(trees)
+    weights = _tree_weights(tree_weights)
 
     with torch.no_grad():
         j, fallback = _index_and_fallback([m.detach() for m in margins], groups, n_trees)
 
     idx = trees64 * n_bins + j
-    y = F.embedding(idx, S_flat, sparse=True).sum(dim=-2)
+    rows = F.embedding(idx, S_flat, sparse=True)
+    y = (rows if weights is None else rows * weights.unsqueeze(-1)).sum(dim=-2)
     S_j = F.embedding(idx, S_flat).detach()
 
     for margin, group, r in zip(margins, groups, fallback):
@@ -496,6 +579,8 @@ def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None):
         phi = 0.5 / (1.0 + torch.where(u > 0, u, -u))
         jbar = j ^ _flip_mask(r, group)
         delta = (F.embedding(trees64 * n_bins + jbar, S_flat).detach() - S_j)
+        if weights is not None:  # zero in forward, so it carries no gradient to w
+            delta = delta * weights.detach().unsqueeze(-1)
         y = y + (delta * (phi - phi.detach()).unsqueeze(-1)).sum(dim=-2)
 
     if capture is not None:

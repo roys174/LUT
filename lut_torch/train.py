@@ -139,6 +139,12 @@ def build_parser():
                         "constant, so the code loses rank); 'random' freezes it to an "
                         "i.i.d. +-1 code, which is the one to widen -- expected Hamming "
                         "distance D/2 instead of a minimum of 1.")
+    p.add_argument('--tree-weights', action='store_true',
+                   help="Give every table a learned weight per tree, so its output is "
+                        "sum_t w[t] * S[t, j_t] instead of the plain sum. Initialised to "
+                        "1 (a fresh model is unchanged) and trained at the dense learning "
+                        "rate without weight decay, which would pull them towards 0 "
+                        "rather than 1. Disables the Numba CPU kernels.")
     p.add_argument('--output-code-bias', action='store_true',
                    help="Add a per-class bias to the coded head: logits = y @ C.T + b. "
                         "Without it every logit vector lies in col(C), class priors "
@@ -487,6 +493,9 @@ def build_optimizers(model, args):
     # leaving them in the dense group -- which is what keeps the already-finished
     # baseline / learned:5 / binary:5 runs comparable with anything launched after it.
     code = model.output_code_parameters()
+    # Tree weights start at 1, so weight decay (which pulls towards 0) would be a prior
+    # against the very model they initialise to. Same lr as everything else for now.
+    tree_w = model.tree_weight_parameters()
     lr = args.max_learning_rate
     code_lr = lr * args.output_code_lr_scale
     optimizers = []
@@ -497,6 +506,8 @@ def build_optimizers(model, args):
         groups = ([{'params': dense, 'lr': lr}] if dense else [])
         if code:
             groups.append({'params': code, 'lr': code_lr})
+        if tree_w:
+            groups.append({'params': tree_w, 'lr': lr, 'weight_decay': 0.0})
         if groups:
             optimizers.append(torch.optim.SGD(
                 groups, lr=lr, momentum=args.momentum,
@@ -511,6 +522,8 @@ def build_optimizers(model, args):
         groups = ([{'params': dense, 'lr': lr}] if dense else [])
         if code:
             groups.append({'params': code, 'lr': code_lr})
+        if tree_w:
+            groups.append({'params': tree_w, 'lr': lr, 'weight_decay': 0.0})
         if groups:
             optimizers.append(cls(groups, lr=lr, weight_decay=args.weight_decay))
 
@@ -787,6 +800,7 @@ def main(argv=None):
           f"output code parameters: "
           f"{sum(p.numel() for p in model.output_code_parameters()):,} "
           f"@ lr x{args.output_code_lr_scale:g}, "
+          f"tree weights: {sum(p.numel() for p in model.tree_weight_parameters()):,}, "
           f"device: {device}, cuda graphs: {'on' if use_graphs else 'off'}")
 
     optimizers, schedulers = build_optimizers(model, args)

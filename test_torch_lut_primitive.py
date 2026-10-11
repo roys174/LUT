@@ -242,5 +242,150 @@ def test_batch_equals_sum_of_singles():
     np.testing.assert_allclose(single_s_grad, batched_s_grad, rtol=1e-5, atol=1e-5)
 
 
+# ---------------------------------------------------------------------------
+# Tree weights: y = sum_t w[t] * S[trees[t], j[t]]
+# ---------------------------------------------------------------------------
+
+def weighted_case(seed=0, share=1, fan_in=1, stacked=False, batch=2, cs=5, n_t=4,
+                  n_c=3, y_dim=6):
+    """Random inputs for a weighted lookup. ``stacked`` gives each batch row its own
+    table slab via a ``(batch, N_T)`` tree map, with ``(batch, N_T)`` weights to match."""
+    g = torch.Generator().manual_seed(seed)
+    s_n_t = n_t // share
+    n_bins = 2 ** n_c
+    trees = torch.arange(n_t) // share
+    if stacked:
+        trees = trees + s_n_t * torch.arange(batch).unsqueeze(1)
+    n_slabs = batch if stacked else 1
+    return dict(
+        S=torch.randn(n_slabs * s_n_t * n_bins, y_dim, generator=g),
+        trees=trees,
+        n_bins=n_bins,
+        group=LutGroup(n_bits=n_c, fan_in=fan_in, bit_offset=0),
+        u=torch.randn(batch, cs, n_t, n_c * fan_in, generator=g),
+        w=torch.randn(*((batch, n_t) if stacked else (n_t,)), generator=g),
+        grad_y=torch.randn(batch, cs, y_dim, generator=g),
+    )
+
+
+def run_weighted(case, weights='learned', reference=False, **kw):
+    """Forward + backward; returns y and every gradient, densified.
+
+    ``weights``: 'learned' (w requires grad), 'none' (unweighted call), or a tensor to use
+    in place of ``case['w']``.
+    """
+    S = case['S'].clone().requires_grad_(True)
+    u = case['u'].clone().requires_grad_(True)
+    w = None
+    if isinstance(weights, torch.Tensor):
+        w = weights.clone().requires_grad_(True)
+    elif weights == 'learned':
+        w = case['w'].clone().requires_grad_(True)
+    fn = lut_lookup_reference if reference else lut_lookup
+    y = fn(S, case['trees'], case['n_bins'], [case['group']], [u], tree_weights=w, **kw)
+    (y * case['grad_y']).sum().backward()
+    S_grad = S.grad.to_dense() if S.grad.is_sparse else S.grad
+    return dict(y=y.detach(), S=S_grad, u=u.grad,
+                w=None if w is None else w.grad)
+
+
+def assert_close_dicts(a, b, rtol=1e-5, atol=1e-6):
+    assert set(a) == set(b)
+    for key in a:
+        if a[key] is None or b[key] is None:
+            assert a[key] is None and b[key] is None, key
+            continue
+        torch.testing.assert_close(a[key], b[key], rtol=rtol, atol=atol, msg=key)
+
+
+@parametrize('fan_in', [1, 2])
+@parametrize('share', [1, 2])
+@parametrize('stacked', [False, True])
+@parametrize('table_grad', ['dense', 'sparse'])
+def test_weighted_matches_reference_closest(fan_in, share, stacked, table_grad):
+    """Forward and all three gradients (S, margins, w) against the autograd oracle.
+
+    Runs under the default kernel backend, so on CPU float32 it also checks that a
+    weighted call does not reach the (unweighted) Numba kernels.
+    """
+    case = weighted_case(seed=1, share=share, fan_in=fan_in, stacked=stacked)
+    assert_close_dicts(run_weighted(case, table_grad=table_grad),
+                       run_weighted(case, reference=True))
+
+
+def test_weighted_forward_is_the_weighted_sum():
+    case = weighted_case(seed=2)
+    capture = {}
+    y = lut_lookup(case['S'], case['trees'], case['n_bins'], [case['group']],
+                   [case['u']], capture=capture, tree_weights=case['w'])
+    rows = case['S'][case['trees'] * case['n_bins'] + capture['j']]   # (B, P, N_T, y)
+    torch.testing.assert_close(y, (rows * case['w'][:, None]).sum(-2))
+
+
+@parametrize('selection', [SELECTION_CLOSEST, SELECTION_COSINE])
+def test_unit_weights_reproduce_unweighted(selection):
+    case = weighted_case(seed=3, fan_in=2)
+    ones = torch.ones_like(case['w'])
+    weighted = run_weighted(case, weights=ones, selection=selection)
+    plain = run_weighted(case, weights='none', selection=selection)
+    weighted.pop('w')
+    plain.pop('w')
+    assert_close_dicts(weighted, plain, rtol=0, atol=1e-6)
+
+
+@parametrize('selection', [SELECTION_CLOSEST, SELECTION_COSINE])
+def test_weights_scale_each_tree_separately(selection):
+    """With one physical tree per slot and per-tree margins, tree t's table rows and
+    margin gradients are exactly w[t] times the unweighted ones -- including under
+    cosine selection, whose choice of comparison must not move."""
+    case = weighted_case(seed=4, fan_in=2)
+    w = case['w']
+    weighted = run_weighted(case, selection=selection)
+    plain = run_weighted(case, weights='none', selection=selection)
+
+    torch.testing.assert_close(weighted['u'], plain['u'] * w[:, None],
+                               rtol=1e-5, atol=1e-6)
+    n_bins, y_dim = case['n_bins'], case['S'].shape[-1]
+    torch.testing.assert_close(weighted['S'].view(-1, n_bins, y_dim),
+                               plain['S'].view(-1, n_bins, y_dim) * w[:, None, None],
+                               rtol=1e-5, atol=1e-6)
+
+
+@parametrize('stacked', [False, True])
+def test_weighted_chunked_backward_matches_unchunked(stacked):
+    from lut_torch import functional as fn
+    case = weighted_case(seed=5, fan_in=2, stacked=stacked)
+    full = run_weighted(case, table_grad='dense')
+    saved = fn.GATHER_BUDGET_ELEMS
+    fn.GATHER_BUDGET_ELEMS = 1
+    try:
+        chunked = run_weighted(case, table_grad='dense')
+    finally:
+        fn.GATHER_BUDGET_ELEMS = saved
+    assert_close_dicts(full, chunked)
+
+
+def test_weight_grad_without_margin_grad():
+    """grad_w must not depend on the margin path having computed S[j] . g."""
+    case = weighted_case(seed=6)
+    w = case['w'].clone().requires_grad_(True)
+    y = lut_lookup(case['S'], case['trees'], case['n_bins'], [case['group']],
+                   [case['u']], tree_weights=w)
+    (y * case['grad_y']).sum().backward()
+    torch.testing.assert_close(w.grad, run_weighted(case, reference=True)['w'])
+
+
+def test_tree_weights_shape_is_checked():
+    case = weighted_case(seed=7)
+    for bad in (torch.ones(case['w'].shape[0] + 1), torch.ones(2, 3, case['w'].shape[0]),
+                torch.ones(case['w'].shape, dtype=torch.float64)):
+        try:
+            lut_lookup(case['S'], case['trees'], case['n_bins'], [case['group']],
+                       [case['u']], tree_weights=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'accepted tree_weights {tuple(bad.shape)} {bad.dtype}')
+
+
 if __name__ == '__main__':
     raise SystemExit(run_all(globals()))
