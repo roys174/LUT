@@ -61,6 +61,47 @@ TABLE_GRAD_SPARSE = 'sparse'
 TABLE_GRAD_MODES = (TABLE_GRAD_AUTO, TABLE_GRAD_DENSE, TABLE_GRAD_SPARSE)
 
 
+# Tree-axis chunking budget, in elements of a float32 temporary (1<<24 = 64 MB).
+#
+# Every wide intermediate in the backward has shape ``(B, P, N_T, y_dim)``: the per-visit
+# copy of ``grad_y`` that feeds the scatter-add, and the ``S[j]`` / ``S[jbar]`` gathers
+# that are immediately contracted down to ``(B, P, N_T)`` scalars. At POS widths (y_dim
+# 5-64) those are a few MB and materialising them is the fastest thing to do. At a full
+# vocabulary they are not: y_dim = 14,398 with B=32, CS=32, N_T=64 makes each one 3.8 GB,
+# and the backward holds about three at once.
+#
+# So the tree axis is processed in chunks sized to this budget. The chunk is the whole
+# tree axis whenever that fits, which makes every existing configuration take exactly the
+# same single-call path it took before -- bit-identical, not merely close, which is what
+# keeps `test_torch_parity.py` meaningful. It only splits when the temporary would be
+# large, and the traffic is unchanged either way; only the peak allocation moves.
+GATHER_BUDGET_ELEMS = 1 << 24
+
+
+def _tree_chunk(n_trees, lead, y_dim):
+    """Trees per pass: all of them unless that would blow :data:`GATHER_BUDGET_ELEMS`."""
+    per_tree = max(1, lead * y_dim)
+    return max(1, min(n_trees, GATHER_BUDGET_ELEMS // per_tree))
+
+
+def _rows_dot(S_flat, idx, grad_y, chunk):
+    """``(S_flat[idx] * grad_y).sum(-1)`` -> ``(B, P, N_T)``, without the wide gather.
+
+    ``chunk >= idx.shape[-1]`` takes the original single-call path, so the common case is
+    unchanged down to the last bit.
+    """
+    n_trees = idx.shape[-1]
+    grad_col = grad_y.unsqueeze(-1)
+    if chunk >= n_trees:
+        return torch.matmul(F.embedding(idx, S_flat), grad_col).squeeze(-1)
+    out = grad_y.new_empty(idx.shape)
+    for t0 in range(0, n_trees, chunk):
+        cols = idx[..., t0:t0 + chunk]
+        out[..., t0:t0 + chunk] = torch.matmul(
+            F.embedding(cols, S_flat), grad_col).squeeze(-1)
+    return out
+
+
 class LutGroup(NamedTuple):
     """One contiguous run of row bits fed by a single margin source.
 
@@ -226,19 +267,39 @@ class LUTFunction(torch.autograd.Function):
         need_S = ctx.needs_input_grad[0]
         need_margins = any(ctx.needs_input_grad[7:])
 
+        n_trees = idx.shape[-1]
+        y_dim = grad_y.shape[-1]
+        chunk = _tree_chunk(n_trees, idx.numel() // max(1, n_trees), y_dim)
+
         grad_S = None
         if need_S:
-            y_dim = grad_y.shape[-1]
             flat_idx = idx.reshape(-1)
-            values = grad_y.unsqueeze(-2).expand(*idx.shape, y_dim).reshape(-1, y_dim)
-            # One row of `values` per visit. Dense costs S_flat.shape[0] rows regardless;
-            # sparse costs one row per visit, so it only wins while visits < rows.
+            # One row per visit. Dense costs S_flat.shape[0] rows regardless; sparse costs
+            # one row per visit, so it only wins while visits < rows.
             dense = (ctx.table_grad == TABLE_GRAD_DENSE
                      or (ctx.table_grad == TABLE_GRAD_AUTO
                          and flat_idx.numel() >= S_flat.shape[0]))
-            if dense:
+            if dense and chunk < n_trees:
+                # Chunked scatter-add. At chunk == 1 `grad_y.reshape` is a view, so this
+                # path allocates nothing at all beyond grad_S itself -- the `expand(...)
+                # .reshape(...)` below is a real copy because expand leaves stride 0.
+                flat_grad = grad_y.reshape(-1, y_dim)
+                grad_S = torch.zeros_like(S_flat)
+                for t0 in range(0, n_trees, chunk):
+                    cols = idx[..., t0:t0 + chunk]
+                    vals = (flat_grad if cols.shape[-1] == 1
+                            else grad_y.unsqueeze(-2)
+                            .expand(*cols.shape, y_dim).reshape(-1, y_dim))
+                    grad_S.index_add_(0, cols.reshape(-1), vals)
+            elif dense:
+                values = grad_y.unsqueeze(-2).expand(*idx.shape, y_dim).reshape(-1, y_dim)
                 grad_S = torch.zeros_like(S_flat).index_add_(0, flat_idx, values)
             else:
+                # A sparse gradient must materialise one y_dim-wide row per visit by
+                # construction, so chunking cannot help it. At a full vocabulary that is
+                # the larger object anyway (visits x V against rows x V), which is what
+                # --table-grad is for; `auto` already picks dense once visits >= rows.
+                values = grad_y.unsqueeze(-2).expand(*idx.shape, y_dim).reshape(-1, y_dim)
                 # Indices are constructed, not user-supplied, so skip invariant checks
                 # (the context manager form also keeps torch from warning about it).
                 with torch.sparse.check_sparse_tensor_invariants(False):
@@ -257,14 +318,18 @@ class LUTFunction(torch.autograd.Function):
                     S_flat, trees, n_bins, groups, margins, j, fallback, grad_y,
                     needs_grad)
             else:
-                S_j = F.embedding(idx, S_flat)
-                grad_yt = grad_y.unsqueeze(-2)
-                grad_sq = (grad_y * grad_y).sum(dim=-1, keepdim=True) if cosine else None
-                # gi = (S[jbar] - S[j]) . g  is split so the S[j] half is contracted once
-                # for all groups, and each contraction is a batched mat-vec rather than an
-                # elementwise product plus reduction over a (B, P, N_T, y_dim) temporary.
-                grad_col = grad_y.unsqueeze(-1)
-                S_j_dot = torch.matmul(S_j, grad_col).squeeze(-1)
+                # gi = (S[jbar] - S[j]) . g  is split so the S[j] half is contracted
+                # once for all groups, and each contraction is a batched mat-vec rather
+                # than an elementwise product plus a reduction over a wide temporary.
+                # `cosine` needs the gathered rows themselves, not just their dot with g,
+                # so it keeps the single wide gather; `closest` never does.
+                if cosine:
+                    S_j = F.embedding(idx, S_flat)
+                    grad_yt = grad_y.unsqueeze(-2)
+                    grad_sq = (grad_y * grad_y).sum(dim=-1, keepdim=True)
+                    S_j_dot = torch.matmul(S_j, grad_y.unsqueeze(-1)).squeeze(-1)
+                else:
+                    S_j_dot = _rows_dot(S_flat, idx, grad_y, chunk)
 
                 for gi_idx, (group, margin) in enumerate(zip(groups, margins)):
                     if not needs_grad[gi_idx]:
@@ -275,13 +340,13 @@ class LUTFunction(torch.autograd.Function):
                             margin, group, fallback[gi_idx])
                     else:
                         grad_margins[gi_idx] = _closest_group_grad(
-                            S_flat, trees64, n_bins, j, S_j_dot, grad_col,
+                            S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
                             margin, group, fallback[gi_idx])
 
         return (grad_S, None, None, None, None, None, None, *grad_margins)
 
 
-def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_col,
+def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
                         margin, group, r):
     """Margin gradient for ``closest`` selection.
 
@@ -292,8 +357,7 @@ def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_col,
     """
     r_pair = r if group.pair_index is None else r.index_select(1, group.pair_index)
     jbar = j ^ _flip_mask(r_pair, group)
-    S_jbar = F.embedding(trees64 * n_bins + jbar, S_flat)
-    gi = torch.matmul(S_jbar, grad_col).squeeze(-1) - S_j_dot            # (B, P, N_T)
+    gi = _rows_dot(S_flat, trees64 * n_bins + jbar, grad_y, chunk) - S_j_dot  # (B, P, N_T)
 
     u = margin.gather(-1, r.unsqueeze(-1)).squeeze(-1)                   # source shape
     if group.pair_index is not None:

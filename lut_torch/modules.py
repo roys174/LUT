@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import OUTPUT_CODE_BINARY
+from .config import OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM
 from .comparisons import (
     build_random_comparison_arrays,
     causal_pair_indices,
@@ -33,13 +33,87 @@ from .functional import (
 )
 
 
-def binary_code_matrix(n_classes, n_bits):
-    """The ``+-1`` binary expansion of ``0..n_classes-1``, as ``(n_classes, n_bits)``.
+def _parity(values, mask):
+    """Parity of ``values & mask`` over GF(2), vectorised."""
+    x = np.asarray(values, dtype=np.int64) & int(mask)
+    x ^= x >> 32
+    x ^= x >> 16
+    x ^= x >> 8
+    x ^= x >> 4
+    x ^= x >> 2
+    x ^= x >> 1
+    return x & 1
 
-    Bit ``b`` of class ``k`` becomes ``+1`` when set and ``-1`` when clear. Rows are
-    scaled by ``1/sqrt(n_bits)`` so they are unit-norm, which puts this code on the same
-    logit scale as the learned code's initialisation and makes the two comparable at a
-    shared learning rate.
+
+def ecoc_masks(n_classes, n_bits, max_candidates=512):
+    """Bit masks for a systematic linear code: ``K`` index bits then parity bits.
+
+    Bit ``b`` of class ``k`` is ``parity(k & masks[b])``. The first
+    ``K = ceil(log2 n_classes)`` masks are ``1, 2, 4, ...``, so those bits *are* the class
+    index and codewords are distinct by construction. Every later mask is a parity check
+    over a subset of the index bits -- a genuinely new coordinate, which is what
+    zero-padding the index expansion failed to give.
+
+    Because the code is linear, the distance between two codewords is the codeword weight
+    of the XOR of their indices, so minimum distance is a minimum over at most
+    ``2**K`` differences rather than over ``n_classes**2`` pairs. That makes an exact
+    greedy choice affordable: at each step take the mask maximising (min distance, then
+    mean distance). Candidates are capped at ``max_candidates`` (sampled with a *local*
+    RNG, so the code is a deterministic function of ``(n_classes, n_bits)`` and does not
+    depend on -- or perturb -- the run seed), which keeps this bounded at the vocabulary
+    sizes where ``2**K`` is large.
+    """
+    k_bits = max(1, (n_classes - 1).bit_length())
+    if n_bits < k_bits:
+        raise ValueError(f'{n_bits} bits cannot index {n_classes} classes')
+    masks = [1 << b for b in range(k_bits)]
+    if n_bits == k_bits:
+        return masks
+
+    # Differences that actually occur between used class indices. For a linear code these
+    # are the only messages whose codeword weight can be a pairwise distance.
+    idx = np.arange(n_classes, dtype=np.int64)
+    diffs = np.unique(np.bitwise_xor.outer(idx, idx))
+    diffs = diffs[diffs != 0]
+
+    weights = np.zeros(diffs.shape, dtype=np.int64)
+    for mask in masks:
+        weights += _parity(diffs, mask)
+
+    rng = np.random.RandomState(0)
+    pool = [m for m in range(1, 1 << k_bits) if m not in set(masks)]
+    while len(masks) < n_bits:
+        if not pool:  # every functional used; repeats are the only option left
+            pool = [m for m in range(1, 1 << k_bits)]
+        candidates = (pool if len(pool) <= max_candidates
+                      else [pool[i] for i in
+                            rng.choice(len(pool), max_candidates, replace=False)])
+        best, best_key, best_bits = None, None, None
+        for mask in candidates:
+            bits = _parity(diffs, mask)
+            w = weights + bits
+            key = (int(w.min()), float(w.mean()), -mask)
+            if best_key is None or key > best_key:
+                best, best_key, best_bits = mask, key, bits
+        masks.append(best)
+        weights = weights + best_bits
+        if best in pool:
+            pool.remove(best)
+    return masks
+
+
+def binary_code_matrix(n_classes, n_bits):
+    """A frozen ``+-1`` systematic ECOC, ``(n_classes, n_bits)``.
+
+    At ``n_bits = ceil(log2 n_classes)`` this is exactly the binary expansion of the class
+    index (the masks are ``1, 2, 4, ...``), so earlier results at that width still stand.
+    Above it, the extra bits are parity checks chosen by :func:`ecoc_masks` rather than the
+    zeros the index expansion would supply -- padding with the high bits of a small index
+    gives constant columns, which only shift every logit equally and cancel in the softmax.
+
+    Rows are scaled by ``1/sqrt(n_bits)`` so they are unit-norm, which puts this code on
+    the same logit scale as the learned code's initialisation and makes the two comparable
+    at a shared learning rate.
 
     Sign rather than ``0/1`` is not cosmetic: under a ``0/1`` code the readout can only
     add evidence, never subtract it. The two differ by ``sum_b y_b``, a per-position
@@ -47,7 +121,66 @@ def binary_code_matrix(n_classes, n_bits):
     factor of two on the logits -- but only the ``+-1`` form keeps that factor from
     depending on how many bits a class happens to have set.
     """
-    codes = np.arange(n_classes, dtype=np.int64)[:, None]
+    idx = np.arange(n_classes, dtype=np.int64)
+    bits = np.stack([_parity(idx, mask) for mask in ecoc_masks(n_classes, n_bits)],
+                    axis=1)
+    return torch.tensor((2 * bits - 1) / math.sqrt(n_bits), dtype=torch.float32)
+
+
+def random_code_matrix(n_classes, n_bits, max_attempts=64):
+    """A frozen i.i.d. ``+-1`` code, ``(n_classes, n_bits)``, rows unit-norm.
+
+    This is the frozen code to use above ``ceil(log2 V)`` bits, because the binary
+    expansion cannot use them: class indices ``0..17`` leave bits 5 and up clear, so
+    ``binary_code_matrix(18, 10)`` has five constant columns and rank 6. Widening D under
+    that construction buys exactly nothing.
+
+    A random code does use every column, and that is the whole point of the extra bits:
+    expected Hamming distance between two codewords is ``D/2`` rather than the binary
+    code's minimum of 1, so no single coordinate's sign decides between two classes.
+
+    Codewords must be distinct or two classes are literally indistinguishable, and drawing
+    each one independently does not give that: 18 classes over the 32 codewords of a
+    5-bit code collide with probability ~1, and even at 10 bits collisions are common. So
+    this samples ``n_classes`` *distinct* codeword indices without replacement and expands
+    them, rather than drawing bits and hoping.
+
+    The draw is uniform over subsets but the index set is not built by permuting
+    ``2**n_bits`` entries, which would be gigabytes once ``n_bits`` reaches the twenties --
+    exactly the regime a full vocabulary needs.
+
+    Above 62 bits the codeword index no longer fits an int64 and the sampler below cannot
+    represent the space at all (``np.random.randint`` raises "high is out of bounds for
+    int64"), so the bits are drawn directly and deduplicated by row instead. The two paths
+    agree in distribution; the integer one is kept because it is what produced every code
+    at D <= 62, and switching it would silently change those runs' codes.
+    """
+    if n_bits >= 63:
+        bits = (np.random.randint(0, 2, size=(n_classes, n_bits))
+                .astype(np.int64))
+        # Distinctness is the contract. At this width a collision is vanishingly
+        # unlikely, but "unlikely" is not "checked".
+        while True:
+            _, first = np.unique(bits, axis=0, return_index=True)
+            dupes = np.setdiff1d(np.arange(n_classes), first)
+            if dupes.size == 0:
+                break
+            bits[dupes] = np.random.randint(0, 2, size=(dupes.size, n_bits))
+        return torch.tensor((2 * bits - 1) / math.sqrt(n_bits), dtype=torch.float32)
+
+    if n_classes > 2 ** n_bits:
+        raise ValueError(f'{n_bits} bits cannot give {n_classes} distinct codewords')
+    space = 2 ** n_bits
+    chosen, seen = [], set()
+    while len(chosen) < n_classes:
+        for value in np.random.randint(0, space, size=2 * (n_classes - len(chosen)) + 8):
+            value = int(value)
+            if value not in seen:
+                seen.add(value)
+                chosen.append(value)
+                if len(chosen) == n_classes:
+                    break
+    codes = np.array(chosen, dtype=np.int64)[:, None]
     bits = (codes >> np.arange(n_bits, dtype=np.int64)[None, :]) & 1
     return torch.tensor((2 * bits - 1) / math.sqrt(n_bits), dtype=torch.float32)
 
@@ -554,6 +687,9 @@ class LutModel(nn.Module):
         elif cfg.output_code == OUTPUT_CODE_BINARY:
             self.register_buffer('output_code',
                                  binary_code_matrix(cfg.vocab_size_output, code_dim))
+        elif cfg.output_code == OUTPUT_CODE_RANDOM:
+            self.register_buffer('output_code',
+                                 random_code_matrix(cfg.vocab_size_output, code_dim))
         else:
             # Unit-norm rows in expectation, matching binary_code_matrix. C must not
             # start at zero: y is zero at step 0 (S is), so dL/dC is zero too, and a

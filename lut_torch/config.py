@@ -30,7 +30,9 @@ class ConfigError(ValueError):
 # class index. See ``LutModel`` for why both are a plain linear readout.
 OUTPUT_CODE_LEARNED = 'learned'
 OUTPUT_CODE_BINARY = 'binary'
-OUTPUT_CODE_MODES = (OUTPUT_CODE_LEARNED, OUTPUT_CODE_BINARY)
+OUTPUT_CODE_RANDOM = 'random'
+OUTPUT_CODE_MODES = (OUTPUT_CODE_LEARNED, OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM)
+OUTPUT_CODE_FROZEN = (OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM)
 
 
 @dataclass
@@ -161,13 +163,16 @@ class LutConfig:
             if self.output_code_dim > self.vocab_size_output:
                 raise ConfigError('output_code_dim must not exceed vocab_size_output; '
                                   'a code wider than the vocabulary saves nothing')
-            if self.output_code == OUTPUT_CODE_BINARY:
-                # A binary code needs enough bits to give every class its own codeword.
-                need = max(1, (self.vocab_size_output - 1).bit_length())
-                if self.output_code_dim < need:
-                    raise ConfigError(
-                        f'output_code binary needs output_code_dim >= {need} to give '
-                        f'{self.vocab_size_output} classes distinct codewords')
+            # Any code needs enough bits to give every class its own codeword.
+            need = max(1, (self.vocab_size_output - 1).bit_length())
+            if self.output_code in OUTPUT_CODE_FROZEN and self.output_code_dim < need:
+                raise ConfigError(
+                    f'output_code {self.output_code} needs output_code_dim >= {need} to '
+                    f'give {self.vocab_size_output} classes distinct codewords')
+            # Above `need` bits, `binary` is a systematic ECOC: the first `need` bits are
+            # the class index and the rest are parity checks over it (see ecoc_masks).
+            # Padding the index expansion with its own high bits would give constant
+            # columns instead, which only shift every logit equally and cancel.
 
     @property
     def head_value_dim(self):

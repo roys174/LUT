@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import main
 from lut_torch._testing import parametrize, run_all
 from lut_torch.config import LutConfig
-from lut_torch.data import IGNORE_INDEX, SnippetDataset
+from lut_torch.data import IGNORE_INDEX, UNK_TOKEN_ID, SnippetDataset
 from lut_torch.modules import LutModel
 from lut_torch.train import (
     best_model_path,
@@ -390,36 +390,70 @@ def test_checkpoint_reset_optimizer_loads_weights_only():
 # ---------------------------------------------------------------------------
 
 @parametrize('pos_task', [True, False])
-def test_evaluate_matches_manual_scoring(pos_task):
-    """evaluate() must score every valid position for POS, last position only for LM."""
+@parametrize('last_only', [False, True])
+def test_evaluate_matches_manual_scoring(pos_task, last_only):
+    """evaluate() scores every valid position, or only the last under the LM flag.
+
+    ``--lm-validate-last-position-only`` is LM-only, so the POS cells must be unaffected
+    by it -- POS has always scored every position and still does.
+    """
     model, cfg = make_model(POS_task=pos_task,
                             vocab_size_output=7 if pos_task else 23)
     model.eval()
     rng = np.random.default_rng(4)
     tokens = rng.integers(1, cfg.vocab_size_input, 200)
+    tokens[3::7] = UNK_TOKEN_ID     # so the <unk>-excluded split is actually exercised
     pos = rng.integers(0, 7, 200) if pos_task else None
     dataset = SnippetDataset(tokens, pos, cfg.context_size, pos_task)
     starts = np.arange(6)
-    args = parse_args(['--validation-batch-size', '3'])
+    argv = ['--validation-batch-size', '3']
+    if last_only:
+        argv.append('--lm-validate-last-position-only')
+    args = parse_args(argv)
 
-    loss, acc = evaluate(model, dataset, starts, args, cfg, torch.device('cpu'))
+    val = evaluate(model, dataset, starts, args, cfg, torch.device('cpu'))
+    loss, acc = val['loss'], val['acc']
 
+    scored_last_only = last_only and not pos_task
     total, correct, count = 0.0, 0, 0
+    nu_total, nu_correct, nu_count = 0.0, 0, 0
     with torch.no_grad():
         for start in starts:
             inp, tgt = dataset.batch([start])
             logits = model(torch.from_numpy(inp))[0]
-            positions = range(cfg.context_size) if pos_task else [cfg.context_size - 1]
+            positions = ([cfg.context_size - 1] if scored_last_only
+                         else range(cfg.context_size))
             for p in positions:
                 if tgt[0, p] == IGNORE_INDEX:
                     continue
-                total += float(F.cross_entropy(logits[p:p + 1],
-                                               torch.tensor([int(tgt[0, p])])))
-                correct += int(int(logits[p].argmax()) == int(tgt[0, p]))
+                item = float(F.cross_entropy(logits[p:p + 1],
+                                             torch.tensor([int(tgt[0, p])])))
+                hit = int(int(logits[p].argmax()) == int(tgt[0, p]))
+                total += item
+                correct += hit
                 count += 1
+                if not pos_task and int(tgt[0, p]) != UNK_TOKEN_ID:
+                    nu_total += item
+                    nu_correct += hit
+                    nu_count += 1
     assert count > 0
     assert abs(loss - total / count) < 1e-4
     assert abs(acc - correct / count) < 1e-9
+
+    # The <unk>-excluded pair is LM-only and must be scored over a strict subset.
+    if pos_task:
+        assert val['count_no_unk'] == 0
+        assert val['loss_no_unk'] != val['loss_no_unk']      # NaN
+    else:
+        assert val['count_no_unk'] == nu_count
+        # Only the all-positions mode is guaranteed to score an <unk> target: last-only
+        # scores 6 tokens, and whether one of them lands on the 3::7 injection depends
+        # on the context size.
+        if not scored_last_only:
+            assert nu_count < val['count']
+        if nu_count:
+            assert abs(val['loss_no_unk'] - nu_total / nu_count) < 1e-4
+            assert abs(val['acc_no_unk'] - nu_correct / nu_count) < 1e-9
 
 
 if __name__ == '__main__':

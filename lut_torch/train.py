@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import OUTPUT_CODE_MODES, ConfigError, LutConfig
-from .data import IGNORE_INDEX, load_datasets
+from .data import IGNORE_INDEX, UNK_TOKEN_ID, load_datasets
 from .graphs import GraphedTrainStep
 from .kernels import KERNEL_BACKEND_MODES, set_kernel_backend, set_kernel_threads
 from .functional import (
@@ -134,8 +134,11 @@ def build_parser():
     p.add_argument('--output-code', choices=list(OUTPUT_CODE_MODES), default='learned',
                    help="Which code matrix --output-code-dim uses. 'learned' trains it "
                         "as a dense parameter; 'binary' freezes it to the +-1 binary "
-                        "expansion of the class index, which needs "
-                        "D >= ceil(log2(V)) bits.")
+                        "expansion of the class index, which is only meaningful at "
+                        "exactly D = ceil(log2(V)) (higher bits of a class index are "
+                        "constant, so the code loses rank); 'random' freezes it to an "
+                        "i.i.d. +-1 code, which is the one to widen -- expected Hamming "
+                        "distance D/2 instead of a minimum of 1.")
     p.add_argument('--output-code-bias', action='store_true',
                    help="Add a per-class bias to the coded head: logits = y @ C.T + b. "
                         "Without it every logit vector lies in col(C), class priors "
@@ -238,6 +241,17 @@ def build_parser():
     p.add_argument('--testing-length', type=int, default=10000,
                    help='Validation snippets per evaluation')
     p.add_argument('--validation-interval', type=int, default=10000)
+    p.add_argument('--lm-validate-last-position-only', action='store_true',
+                   help="Score only the final position of each validation window for LM, "
+                        "as main.py's StandardOutputHead.validation_loss does. The default "
+                        "is now every position: the forward already computes all of them, "
+                        "and one per window leaves far too few scored tokens to separate "
+                        "two runs. The two modes are not comparable with each other -- the "
+                        "last position is the only one with a full context.")
+    p.add_argument('--best-checkpoint-metric', choices=['auto', 'acc', 'loss'],
+                   default='auto',
+                   help="Which validation metric selects the best checkpoint. 'auto' is "
+                        "accuracy for POS and loss for LM.")
     p.add_argument('--validation-interval-epochs', type=float, default=None,
                    help='Validate every this many epochs instead of every N steps. A '
                         'fixed step interval puts validation points at a different '
@@ -608,21 +622,44 @@ def batch_loss(model, inputs, targets, vocab_size):
 
 @torch.no_grad()
 def evaluate(model, dataset, starts, args, cfg, device):
-    """Validation loss / accuracy.
+    """Validation loss / accuracy, as a dict.
 
-    POS scores every valid position; language modelling scores only the final position,
-    matching ``StandardOutputHead.validation_loss``.
+    Returns ``loss``/``acc`` over every scored target plus ``loss_no_unk``/``acc_no_unk``
+    over the same targets excluding ``<unk>`` (NaN for POS), and the token counts behind
+    each.
+
+    POS scores every valid position. Language modelling scores every position too unless
+    ``--lm-validate-last-position-only`` is set, which restores ``main.py``'s
+    ``StandardOutputHead.validation_loss`` behaviour.
+
+    Scoring one position per window throws away 31 of the 32 predictions the forward has
+    already computed, and at ``--testing-length 1000`` leaves 1,000 scored tokens -- an
+    accuracy interval wider than most differences these runs are launched to measure.
+    The flag exists because the two are not comparable: the last position is the only one
+    with a full context, so its loss is systematically lower than the all-position mean,
+    and mixing the two across runs would be worse than either choice.
     """
     model.eval()
     batch = args.validation_batch_size or args.batch_size
     loss_sum = 0.0
     correct = 0
     count = 0
+    # The same three sums again over targets that are not <unk>. <unk> is the single most
+    # frequent token in this corpus (6.9%), it is a legitimate LM target, and it is not
+    # one the model could have learned anything about -- so it inflates accuracy and
+    # deflates perplexity by an amount nobody can read off the headline number. Both are
+    # reported rather than one being chosen, because that choice is reversible only while
+    # both have been recorded. POS is excluded: its targets are tag ids, where id 0 is
+    # ADJ, not <unk> (data.py already masks POS targets whose *input* was <unk>).
+    score_no_unk = not cfg.POS_task
+    loss_sum_nu = 0.0
+    correct_nu = 0
+    count_nu = 0
     for begin in tqdm(range(0, len(starts), batch), desc='  Val', leave=False,
                       unit='batch'):
         chunk = starts[begin:begin + batch]
         inputs, targets = dataset.batch(chunk)
-        if not cfg.POS_task:
+        if not cfg.POS_task and args.lm_validate_last_position_only:
             keep = np.full_like(targets, IGNORE_INDEX)
             keep[:, -1] = targets[:, -1]
             targets = keep
@@ -632,14 +669,29 @@ def evaluate(model, dataset, starts, args, cfg, device):
         valid = flat_targets != IGNORE_INDEX
         if not bool(valid.any()):
             continue
+        hit = flat.argmax(dim=-1) == flat_targets
         loss_sum += float(F.cross_entropy(flat[valid], flat_targets[valid],
                                           reduction='sum'))
-        correct += int((flat.argmax(dim=-1) == flat_targets)[valid].sum())
+        correct += int(hit[valid].sum())
         count += int(valid.sum())
+        if score_no_unk:
+            keep_nu = valid & (flat_targets != UNK_TOKEN_ID)
+            if bool(keep_nu.any()):
+                loss_sum_nu += float(F.cross_entropy(flat[keep_nu],
+                                                     flat_targets[keep_nu],
+                                                     reduction='sum'))
+                correct_nu += int(hit[keep_nu].sum())
+                count_nu += int(keep_nu.sum())
     model.train()
-    if count == 0:
-        return float('nan'), float('nan')
-    return loss_sum / count, correct / count
+    nan = float('nan')
+    return {
+        'loss': loss_sum / count if count else nan,
+        'acc': correct / count if count else nan,
+        'count': count,
+        'loss_no_unk': loss_sum_nu / count_nu if count_nu else nan,
+        'acc_no_unk': correct_nu / count_nu if count_nu else nan,
+        'count_no_unk': count_nu,
+    }
 
 
 def main(argv=None):
@@ -698,7 +750,8 @@ def main(argv=None):
                 'lr_scheduler', 'inverse_sqrt_alpha', 'cosine_min_lr_ratio',
                 'seed', 'cpu_cores', 'kernels', 'device', 'cuda_graphs',
                 'testing_length', 'loss_file', 'save_model', 'load_model',
-                'output_code_lr_scale'):
+                'output_code_lr_scale', 'best_checkpoint_metric',
+                'lm_validate_last_position_only'):
         print(f"  {key:24s} = {getattr(args, key)}")
     print('=' * 50)
 
@@ -766,11 +819,13 @@ def main(argv=None):
     # The final checkpoint is not the best one. Under a fixed-step schedule these runs
     # peaked as early as 18% in and then trained for another ten hours, so what landed
     # on disk was never the model the run actually found; keep both.
-    best = {'acc': float('-inf'), 'loss': float('nan'), 'step': -1, 'epoch': 0.0}
+    best = {'acc': float('-inf'), 'loss': float('inf'), 'step': -1, 'epoch': 0.0}
     validations = 0
 
     with open(args.loss_file, 'w') as f:
-        f.write('step, epoch, tokens, loss, perplexity, accuracy\n')
+        # The last three are LM-only and NaN for POS; see evaluate().
+        f.write('step, epoch, tokens, loss, perplexity, accuracy, '
+                'loss_no_unk, perplexity_no_unk, accuracy_no_unk\n')
 
     model.train()
     ema_loss = None
@@ -818,7 +873,10 @@ def main(argv=None):
         lr = optimizers[0].param_groups[0]['lr']
 
         if wandb_run is not None and step % args.wandb_log_interval == 0:
-            wandb_run.log({
+            # tqdm's own smoothed rate, i.e. exactly the it/s shown on the bar. It
+            # is None on the very first iteration, before any interval is timed.
+            rate = pbar.format_dict.get('rate')
+            payload = {
                 'step': step,
                 'epoch': epoch_at(step),
                 'tokens': step * args.tokens_per_step,
@@ -826,23 +884,48 @@ def main(argv=None):
                 'train/ema_loss': ema_loss,
                 'train/perplexity': math.exp(min(ema_loss, 20.0)),
                 'train/learning_rate': lr,
-            })
+            }
+            if rate:
+                payload['train/steps_per_sec'] = rate
+                payload['train/tokens_per_sec'] = rate * args.tokens_per_step
+            wandb_run.log(payload)
 
         if step % args.validation_interval == 0:
             pbar.set_description('Validating')
-            val_loss, val_acc = evaluate(model, val_set, val_starts, args, cfg, device)
+            val = evaluate(model, val_set, val_starts, args, cfg, device)
+            val_loss, val_acc = val['loss'], val['acc']
             perplexity = math.exp(min(val_loss, 20.0)) if val_loss == val_loss \
                 else float('nan')
+            ppl_no_unk = (math.exp(min(val['loss_no_unk'], 20.0))
+                          if val['loss_no_unk'] == val['loss_no_unk'] else float('nan'))
             last = {'loss': val_loss, 'ppl': perplexity, 'acc': val_acc}
 
             with open(args.loss_file, 'a') as f:
                 f.write(f"{step}, {epoch_at(step):.4f}, {step * args.tokens_per_step}, "
-                        f"{val_loss:.6f}, {perplexity:.2f}, {val_acc:.6f}\n")
-            tqdm.write(f"\n--- step {step:,} | ppl={perplexity:.2f} | "
-                       f"loss={val_loss:.3f} | acc={val_acc:.3f} ---")
+                        f"{val_loss:.6f}, {perplexity:.2f}, {val_acc:.6f}, "
+                        f"{val['loss_no_unk']:.6f}, {ppl_no_unk:.2f}, "
+                        f"{val['acc_no_unk']:.6f}\n")
+            line = (f"\n--- step {step:,} | ppl={perplexity:.2f} | "
+                    f"loss={val_loss:.3f} | acc={val_acc:.3f}")
+            if val['count_no_unk']:
+                line += (f" | no-unk ppl={ppl_no_unk:.2f} "
+                         f"acc={val['acc_no_unk']:.3f}")
+            tqdm.write(line + ' ---')
 
             validations += 1
-            improved = val_acc == val_acc and val_acc > best['acc']
+            # POS selects on accuracy, which is the metric it is judged by. LM selects on
+            # validation loss: perplexity is the LM metric, loss is the more sensitive
+            # signal (DECISIONS.md), and early LM accuracy improves at nearly every
+            # validation -- which on a full-vocabulary model means writing a ~1.1 GB
+            # checkpoint each time.
+            if args.best_checkpoint_metric == 'auto':
+                metric = 'acc' if cfg.POS_task else 'loss'
+            else:
+                metric = args.best_checkpoint_metric
+            if metric == 'acc':
+                improved = val_acc == val_acc and val_acc > best['acc']
+            else:
+                improved = val_loss == val_loss and val_loss < best['loss']
             if improved:
                 best.update(acc=val_acc, loss=val_loss, step=step, epoch=epoch_at(step))
 
@@ -854,13 +937,19 @@ def main(argv=None):
                 if improved:
                     save_checkpoint(best_model_path(args.save_model), model, cfg,
                                     optimizers, schedulers, step, args)
-                    tqdm.write(f"  new best val accuracy {val_acc:.4f} -> "
+                    shown = val_acc if metric == 'acc' else val_loss
+                    tqdm.write(f"  new best val {metric} {shown:.4f} -> "
                                f"{checkpoint_path(best_model_path(args.save_model))}")
             if wandb_run is not None:
                 wandb_run.log({'step': step, 'epoch': epoch_at(step),
                                'tokens': step * args.tokens_per_step,
                                'val/loss': val_loss, 'val/perplexity': perplexity,
-                               'val/accuracy': val_acc})
+                               'val/accuracy': val_acc,
+                               'val/loss_no_unk': val['loss_no_unk'],
+                               'val/perplexity_no_unk': ppl_no_unk,
+                               'val/accuracy_no_unk': val['acc_no_unk'],
+                               'val/scored_tokens': val['count'],
+                               'val/scored_tokens_no_unk': val['count_no_unk']})
             pbar.set_description('Training')
 
         postfix = {'lr': f"{lr:.4f}",

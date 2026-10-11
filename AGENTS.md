@@ -29,6 +29,34 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
   output head (`--output-code-dim`), three arms (uncoded baseline, learned code, frozen
   binary code) at the GPU sweep's best cell. Its header explains why the baseline must be
   rerun from that script and why validation loss, not just accuracy, decides the result.
+- `run_files/torch_LM_output_code_gpu.sh`, `torch_LM_schedule_probe_gpu.sh`,
+  `torch_LM_code_width_gpu.sh`, `torch_LM_depth_gpu.sh`, `torch_LM_lr_budget_gpu.sh`: the
+  full-vocabulary (`V = 14,398`) coded-head experiments, in the order they were run. The
+  settled configuration and every number behind it are in DECISIONS.md Part II; the short
+  version is `--output-code-dim 112 --output-code learned --output-code-bias --epochs 30
+  --lr-scheduler cosine --cosine-min-lr-ratio 0.01 --warmup-frac 0.0095`.
+  **All five share a preamble that exists because of two cluster faults -- copy it into any
+  new run script rather than writing a bare `source .venv/bin/activate`:**
+    - *Per-node venv selection.* A venv does not contain a Python: `.venv/bin/python` is a
+      symlink to `/usr/bin/python3`, so it runs **whatever version the node has**, and looks
+      for packages in `lib/python<version>/site-packages`. `.venv` has only
+      `lib/python3.11`, `.venv313` only `lib/python3.13`. The cluster is being re-imaged
+      from 3.11 to 3.13 node by node, so on a 3.11 node `.venv` works and `.venv313` fails,
+      and on a 3.13 node the reverse -- neither is wrong, the node decides. The scripts try
+      each in turn and take the first whose interpreter can `import numpy, torch`, keep the
+      winner in `PY`, and record it in `config.txt` as `venv=`. Do not use bare `python`
+      after that point; use `"${PY}"`, so the provenance and the trainer cannot disagree.
+    - *GPU preflight and `--exclude`.* The re-imaged nodes ship **no NVIDIA driver
+      userspace** -- `nvidia-smi` is absent, so `libcuda.so` is missing and
+      `torch.cuda.is_available()` is False. SLURM advertises their A10s and allocates them
+      anyway (`gres/gpu:a10=1` in `sacct -o AllocTRES`), so a job lands, takes a GPU it
+      cannot use, and dies inside argparse with a usage dump whose last line is the real
+      error. Reproducer: `srun -w arion-01 --gres=gg:g0:1 --pty nvidia-smi` ->
+      `No such file or directory`. The scripts carry
+      `#SBATCH --exclude=arion-01,binky-01,creek-01,dumfries-004,drape-01,incitatus-01` and
+      assert `torch.cuda.is_available()` right after picking the venv, failing with one
+      legible line. Prune the exclude list as nodes are repaired; the preflight is what
+      catches the ones not yet on it.
 - `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
 - `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
 - `run_files/run_POS_one_PE_only.sh`: PE-only ablation.
@@ -36,7 +64,35 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 - `run_files/run_POS_load_smoke.sh` and `run_files/run_POS_one_load_ckpt.sh`: checkpoint-load checks/templates; inspect paths before running.
 - `run_files/run_nanoGPT_POS.sh`: PyTorch baseline. Inspect its working-directory assumptions before copying paths.
 - `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
-- `loss.csv`: `step, loss, perplexity, accuracy`.
+- `loss.csv`: `step, epoch, tokens, loss, perplexity, accuracy, loss_no_unk, perplexity_no_unk, accuracy_no_unk` (9 columns). The `_no_unk` triple scores the same predictions with `<unk>` targets excluded; nothing is masked in training, both scorings are reported. `perplexity` is exactly `exp(loss)` — but W&B's `train/perplexity` is `exp(EMA loss)` while `train/loss` is the raw last-minibatch mean, so those two panels rank runs differently.
+
+## Where checkpoints live
+
+**Checkpoints belong on `/cs/snapless`, not in `results/`.** `results/` is on the lab
+filesystem, which is quota'd lab-wide (`/cse/labs/roys`, 9,216 GB for everyone), and a
+single LUT checkpoint runs to tens of gigabytes -- one `main.py` `.npz` was 43 GB. When
+that quota fills, running jobs stop being able to write `loss.csv` and `config.txt`, so
+this is a correctness problem and not only a tidiness one.
+
+The current run scripts already do the right thing: `CHECKPOINT_ROOT` points at
+`/cs/snapless/roys/yuval.rubin/LUT_checkpoints` and each run records `checkpoint_dir=` in
+its `config.txt`. **No code change is needed** -- `main.py` and `lut_torch` both write
+wherever `--save-model` says, and the scripts say snapless.
+
+Historical checkpoints (the `main.py`-era `.npz` files under `results/POS*` and the older
+`results/POS_torch_gpu/*.pt`) were relocated to
+`/cs/snapless/roys/yuval.rubin/LUT_checkpoints/legacy/<same path under results/>`, with a
+**symlink left at every original path**. `infer_lut_pos.py`, the `analyze_*` / `compare_*`
+tools and any `--load-model` path in an old `config.txt` therefore keep working unchanged.
+Each affected run also has `checkpoint_moved_to=` appended to its `config.txt`, so the
+location survives even if a symlink is broken or the tree is copied without following
+links. Do not "clean up" those symlinks -- they are the checkpoints.
+
+Related: `sbatch_outputs/*.txt` were 5.2 GB, of which 99.9% was tqdm carriage-return
+animation frames (one 130 MB log held 900k `\r` against 1.1k `\n`). They are now pruned to
+the last segment of each line -- exactly what the terminal displayed -- for 67 MB total.
+New logs accumulate the same way; prune rather than gzip, which keeps them greppable and
+is ~28x smaller than gzipping the frames.
 
 ## The `lut_torch/` PyTorch Port
 

@@ -28,10 +28,13 @@ this package deliberately dropped.
 | `data.py` | Tokenizer/POS loading (shares `main.py`'s cache filenames) and window batching. |
 | `train.py` | CLI trainer: loop, validation, optimizers, schedule, checkpoints, W&B. |
 | `bench_cpu.py` | CPU scaling benchmark (`python -m lut_torch.bench_cpu`). |
+| `run_index.py` | Finds trained runs from `results/*/*/config.txt`. Stdlib only — no torch. |
+| `inference.py` | Loads a checkpoint and samples from it. The generation half of the chat UI. |
+| `chat_server.py` + `chat_ui/` | Web chat interface (`python -m lut_torch.chat_server`). |
 | `_testing.py` | pytest shim so tests run on either interpreter here. |
 
 Tests live at the repository root: `test_torch_lut_primitive.py`, `test_torch_parity.py`,
-`test_torch_training.py`.
+`test_torch_training.py`, `test_torch_chat.py`.
 
 ## The core idea
 
@@ -275,15 +278,25 @@ on the machine you will actually train on — a shared login node gives noisy nu
   the default shape and POS's 18 classes that is 73,728 → 20,480 floats, which is not worth
   having on its own; the flag exists because the same head at `V = 14,398` is 59M → 57k, and
   POS is where the accuracy cost of the change can be measured cheaply.
+  **Settled value at `V = 14,398`: `--output-code-dim 112 --output-code learned
+  --output-code-bias`** — 133.4 perplexity from a 3,461,982-parameter head, 68x smaller than
+  the dense 235,896,832-entry one. `learned` saturates there (`D = 224/448/1000` are within
+  1.1%, and their train/val gap grows monotonically, so the extra width only memorises);
+  `D = 56` costs 1.2% if the head must be smaller still. See DECISIONS.md Part II.
   Three things to know. **The logits are `y @ C.T` and that is not a relaxation**: scoring
   class `k` by treating the `D` coordinates as independent bit comparisons,
   `sum_b [c_kb log sigma(y_b) + (1-c_kb) log sigma(-y_b)]`, differs from `sum_b c_kb y_b`
   only by a term independent of `k`, which the softmax cancels — so the "compare each
   coordinate against zero" head *is* a linear readout, with no thresholding in the loss and
-  no surrogate needed for it (`test_torch_output_code.py`). **`binary` has minimum Hamming
-  distance 1** at `D = ceil(log2 V)`: neighbouring codewords differ in one coordinate, so a
-  single coordinate's sign decides between two classes. Widen `D` if that shows up as an
-  accuracy gap against `learned`. **It caps the logit matrix at rank `D`** — for an argmax
+  no surrogate needed for it (`test_torch_output_code.py`). **Use `learned`; `binary` and
+  `random` are controls, not options.** Measured at `V = 14,398` (DECISIONS.md, Decision L3),
+  learned `D = 14` beats frozen binary `D = 1000` — a >70x width disadvantage with no
+  crossover at any `D` tested. Widening `D` does not rescue a frozen code: frozen random at
+  `D = 28` scores the same as frozen binary at `D = 14` despite a far larger minimum
+  distance, so it is the freezing that costs, not the code's Hamming distance. (`binary`'s
+  minimum distance is in any case stuck at 2 for every `D` from 28 to 1000 — a defect in
+  `ecoc_masks`' greedy construction, not a property of the vocabulary. Fixing it is not
+  expected to change the ranking.) **It caps the logit matrix at rank `D`** — for an argmax
   metric like POS accuracy that may cost nothing, but perplexity feels it directly, so
   report validation loss alongside accuracy or the result will not extrapolate to full
   vocabulary.
@@ -304,6 +317,24 @@ on the machine you will actually train on — a shared login node gives noisy nu
   The flag has no `main.py` counterpart and so cannot enter `test_torch_parity.CONFIGS`;
   what protects parity is that the code matrix is drawn last and only when the flag is set,
   leaving every existing configuration bit-identical (`test_default_head_unchanged`).
+- `--lm-validate-last-position-only` — LM validation scores every position by default
+  now, not just the last. `main.py`'s `StandardOutputHead.validation_loss` scores only the
+  last, and this flag restores that. The forward computes all `CS` positions either way, so
+  the old default discarded 31 of 32 predictions and left `--testing-length` scored tokens
+  in total. **The two modes are not comparable**: the last position is the only one with a
+  full context, so its loss is systematically lower. Any LM number recorded before this
+  change was measured the old way.
+- `--best-checkpoint-metric {auto,acc,loss}` — `auto` selects on accuracy for POS and on
+  validation loss for LM. Perplexity is the LM metric and loss is the more sensitive
+  signal; it also improves far less often than accuracy early in a run, which matters when
+  a full-vocabulary checkpoint is ~1.1 GB and the best copy is written on every
+  improvement.
+- **`<unk>` in LM validation.** `<unk>` is 6.9% of this corpus and the LM branch trains on
+  it as an ordinary target (POS masks targets whose *input* was `<unk>`, `data.py:88`;
+  LM does not). `evaluate` therefore returns both scorings — `loss`/`acc` over every
+  target, and `loss_no_unk`/`acc_no_unk` over the same targets with `<unk>` removed — and
+  both reach `loss.csv` and W&B. Training is untouched, so nothing is committed to. Use
+  the no-unk pair to compare runs; a headline perplexity is not comparable across the two.
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
 - `--device {cpu,cuda,cuda:N,auto}` — see "GPU" below. `--kernels` is silently a no-op on
   GPU.
@@ -399,6 +430,53 @@ Every number behind these choices, the experiments that produced them, the wrong
 and what is still open are in `DECISIONS.md` at the repo root. Change these defaults only
 against that file.
 
+## Talking to a trained model
+
+```bash
+srun --gres=gg:g0:1 --mem=16g -c4 --time=2:00:00 --pty run_files/chat_server.sh
+python -m lut_torch.chat_server --device cpu    # or wherever the venv works
+```
+
+`srun` and not `sbatch` — unlike everything else in `run_files/`, this is a service you
+sit in front of rather than a run you collect afterwards, so the tunnel line belongs on
+your terminal and Ctrl-C should stop it. `sbatch` is still there for leaving it up
+overnight, at the price of an allocation held for the full `--time` whether or not
+anyone is using it.
+
+A browser chat over the LM checkpoints. Stdlib `http.server` plus three static files
+under `chat_ui/` — nothing to install, which is the point on a node with no internet.
+
+Three things about the model decide the design, and all three are easy to get wrong:
+
+1. **It is a next-token model, not an assistant.** A "conversation" is one growing piece
+   of text: the UI keeps the transcript verbatim, sends it as the prompt, and the reply
+   is the continuation. Nothing in the corpus taught it turns.
+
+2. **The context is fixed and there is no KV cache.** A prompt shorter than
+   `context_size` goes at positions `0..n-1` and the prediction is read at `n-1`; longer,
+   and the window slides. Trailing padding is invisible because attention is causal, and
+   `test_short_prompt_ignores_padding` checks that against the model rather than trusting
+   it. Left-padding would be wrong twice: the PE is absolute, and position 0 receives no
+   attention output at all. Each generated token costs a full forward over the window.
+
+3. **`model.eval()` is mandatory.** `LutLayer._residual_dropout` is live in `train()`
+   mode, so a forgotten `eval()` samples every reply from a different perturbed model —
+   and nothing raises.
+
+Listing the runs never opens a checkpoint. `run_index.py` reads `config.txt` and
+`loss.csv` only, and classifies a run by **the recorded command** — LM is
+`lut_torch.train` without `--POS-task` — because sweep directory names drift and
+`results/GPT_POS` is not this trainer at all. Opening a 1.1 GB baseline checkpoint per
+dropdown entry is the thing that rule exists to avoid.
+
+A live run rewrites `model_best.pt` on every validation improvement, so loading can lose
+that race; `load_checkpoint_file` retries and the server falls back to the periodic copy.
+
+`<unk>` is suppressed by default during sampling. It is 6.9% of wiki2 and its single most
+frequent token, so unsuppressed sampling emits little else. The input tokenizer view is
+there for the same reason from the other direction: the vocabulary keeps only types seen
+10+ times, and a reply that ignores half the prompt usually has that as its cause.
+
 ## Testing
 
 ```bash
@@ -408,6 +486,7 @@ against that file.
 .venv/bin/python test_torch_kernels.py
 .venv/bin/python test_torch_stacking.py
 .venv/bin/python test_torch_graphs.py     # skips itself without a GPU
+.venv/bin/python test_torch_chat.py       # its torch-free half runs anywhere
 ```
 
 The venv has torch but no pytest; the cluster python has pytest but no torch. The tests
@@ -423,6 +502,7 @@ import `parametrize`/`run_all` from `_testing.py` so they run under either
 | `test_torch_kernels` | the fused Numba backend against the torch path, both layouts |
 | `test_torch_stacking` | stacked heads vs unstacked: exact forward, exact single-layer gradients, float32-epsilon bound deeper, call-count reduction, checkpoint conversion |
 | `test_torch_graphs` | CUDA-graph replay vs eager over *consecutive* steps, dropout redraw, and the zero_grad misuse guard. Skips itself without a GPU |
+| `test_torch_chat` | run discovery and LM/POS classification, incremental decoding against `WordTokenizer.decode`, sampling filters, the causal-padding assumption, and the server's routes against a stub. The run-index and HTTP halves need no torch |
 
 `test_torch_stacking` is the reason stacking is safe to trust: parity pins unstacked
 against `main.py`, and stacking pins stacked against unstacked, so the guarantee carries

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LUT chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#129518;</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <h1>LUT&nbsp;chat</h1>
+      <p class="muted" id="env-line">loading…</p>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-title">
+        <span>Language models</span>
+        <button id="refresh" class="icon-button" title="Rescan results/">&#8635;</button>
+      </div>
+      <p class="hint">Runs of <code>lut_torch.train</code> without <code>--POS-task</code>,
+        found under <code id="results-root">results/</code>.</p>
+      <div id="run-list" class="run-list"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-model">
+        <div id="active-name" class="active-name">No model selected</div>
+        <div id="active-meta" class="muted small">Pick one on the left to load it.</div>
+      </div>
+      <div class="topbar-actions">
+        <button id="toggle-settings" class="ghost-button">Settings</button>
+        <button id="clear-chat" class="ghost-button">Clear chat</button>
+      </div>
+    </header>
+
+    <section id="settings" class="settings hidden">
+      <div class="field">
+        <label for="temperature">Temperature <span class="value" id="temperature-value">0.90</span></label>
+        <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.9">
+        <p class="hint">0 is greedy.</p>
+      </div>
+      <div class="field">
+        <label for="top-k">Top-k <span class="value" id="top-k-value">40</span></label>
+        <input type="range" id="top-k" min="0" max="200" step="1" value="40">
+        <p class="hint">0 disables.</p>
+      </div>
+      <div class="field">
+        <label for="top-p">Top-p <span class="value" id="top-p-value">0.95</span></label>
+        <input type="range" id="top-p" min="0.05" max="1" step="0.01" value="0.95">
+      </div>
+      <div class="field">
+        <label for="max-tokens">Max new tokens <span class="value" id="max-tokens-value">48</span></label>
+        <input type="range" id="max-tokens" min="1" max="256" step="1" value="48">
+      </div>
+      <div class="field">
+        <label for="seed">Seed</label>
+        <input type="text" id="seed" placeholder="random" inputmode="numeric">
+        <p class="hint">Fix it to reproduce a reply.</p>
+      </div>
+      <div class="field checkboxes">
+        <label><input type="checkbox" id="suppress-unk" checked> Suppress <code>&lt;unk&gt;</code></label>
+        <p class="hint">It is 6.9% of wiki2 and the corpus's most frequent token, so
+          unsuppressed sampling emits it constantly.</p>
+        <label><input type="checkbox" id="stop-at-eol"> Stop at <code>&lt;eol&gt;</code></label>
+        <label><input type="checkbox" id="whole-transcript" checked> Continue the whole transcript</label>
+        <p class="hint">Off means only your latest message is the prompt. Either way the
+          model sees at most its context window of tokens.</p>
+      </div>
+    </section>
+
+    <div id="transcript" class="transcript">
+      <div class="placeholder" id="placeholder">
+        <h2>A next-token model, not an assistant</h2>
+        <p>These checkpoints were trained on WikiText-2 to predict the next word. They
+          have no notion of a question, an instruction or a turn — they
+          <em>continue text</em>. Whatever you write becomes the prefix, and the reply is
+          the continuation the model considers likely.</p>
+        <p>The context window is small (32 tokens on these runs) and there is no KV
+          cache, so each generated word is a fresh forward pass over the last 32 tokens.
+          Everything before that has genuinely fallen out of view.</p>
+      </div>
+    </div>
+
+    <footer class="composer">
+      <div id="token-strip" class="token-strip hidden"></div>
+      <div class="composer-row">
+        <textarea id="input" rows="1" placeholder="Write something for the model to continue…" autocomplete="off"></textarea>
+        <button id="send" class="send-button" disabled>Send</button>
+        <button id="stop" class="stop-button hidden">Stop</button>
+      </div>
+      <div class="composer-foot">
+        <span id="token-count" class="muted small">&nbsp;</span>
+        <span class="muted small">Enter sends · Shift+Enter is a newline</span>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
