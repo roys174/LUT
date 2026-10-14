@@ -57,6 +57,12 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
       assert `torch.cuda.is_available()` right after picking the venv, failing with one
       legible line. Prune the exclude list as nodes are repaired; the preflight is what
       catches the ones not yet on it.
+- `gpt_baseline_train.py` + `run_files/GPT_LM_baseline_gpu.sh`: nanoGPT LM baseline for the
+  LUT LM. The trainer wraps `nanoGPT_POS/model.py`'s `GPT` but takes data, validation
+  windows, `evaluate()` and the epoch/cosine schedule from `lut_torch`, so at the same
+  `--seed`/`--testing-length` its `loss.csv` scores the same snippets as a `lut_torch` LM
+  run (`test_gpt_baseline.py`). The optimizer is the transformer's own (AdamW). The script
+  sweeps width x depth x dropout at seed 42; results go to `results/GPT_LM_baseline/`.
 - `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
 - `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
 - `run_files/run_POS_one_PE_only.sh`: PE-only ablation.

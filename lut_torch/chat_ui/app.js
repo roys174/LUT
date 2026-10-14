@@ -100,7 +100,20 @@ function runCard(run) {
   if (run.run_id === state.runId) card.classList.add('selected');
 
   const head = el('div', 'arm');
-  head.append(el('span', null, run.arm || run.name));
+  const name = el('span', null, run.arm || run.name);
+  // Which network, not which sweep. Two engines share this list because they share a
+  // corpus, a tokenizer and a validation window set, which is exactly what makes their
+  // perplexities comparable — but you should never be unsure which one just replied.
+  if (run.engine) {
+    const badge = el('span', 'engine-badge ' + run.engine,
+      run.engine === 'nanogpt' ? 'GPT' : 'LUT');
+    badge.title = run.engine === 'nanogpt'
+      ? 'nanoGPT transformer baseline (gpt_baseline_train.py)'
+      : 'LUT model (lut_torch.train)';
+    name.append(document.createTextNode(' '));
+    name.append(badge);
+  }
+  head.append(name);
   head.append(el('span', 'seed', run.seed ? 'seed ' + run.seed : run.timestamp));
   card.append(head);
 
@@ -166,14 +179,18 @@ async function selectRun(runId, kind) {
     const info = await postJSON('/api/model', { run_id: runId, kind });
     const m = info.model;
     const parts = [
+      m.engine === 'nanogpt' ? 'nanoGPT transformer' : 'LUT',
       `${m.num_layers}L × ${m.num_heads}H`,
       `context ${m.context_size}`,
       `vocab ${m.vocab_size.toLocaleString()}`,
-      `${(m.table_entries / 1e6).toFixed(1)}M table entries`,
-      m.output_code ? `code ${m.output_code}` : 'uncoded head',
-      `step ${m.step.toLocaleString()}`,
-      m.device,
     ];
+    if (m.engine === 'nanogpt') {
+      parts.push(`width ${m.n_embd}`, `${(m.parameters / 1e6).toFixed(2)}M params`);
+    } else {
+      parts.push(`${(m.table_entries / 1e6).toFixed(1)}M table entries`,
+        m.output_code ? `code ${m.output_code}` : 'uncoded head');
+    }
+    parts.push(`step ${m.step.toLocaleString()}`, m.device);
     if (info.checkpoint_kind !== kind) {
       state.kind = info.checkpoint_kind;
       parts.unshift(`fell back to the ${info.checkpoint_kind} checkpoint`);

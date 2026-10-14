@@ -472,10 +472,40 @@ Three things about the model decide the design, and all three are easy to get wr
    and nothing raises.
 
 Listing the runs never opens a checkpoint. `run_index.py` reads `config.txt` and
-`loss.csv` only, and classifies a run by **the recorded command** — LM is
-`lut_torch.train` without `--POS-task` — because sweep directory names drift and
-`results/GPT_POS` is not this trainer at all. Opening a 1.1 GB baseline checkpoint per
-dropdown entry is the thing that rule exists to avoid.
+`loss.csv` only, and classifies a run by **the recorded command** — because sweep
+directory names drift and `results/GPT_POS` is not this trainer at all. Opening a 1.1 GB
+baseline checkpoint per dropdown entry is the thing that rule exists to avoid.
+
+### Both engines, one picker
+
+The chat offers the LUT runs *and* the `gpt_baseline_train.py` transformer baseline, as
+`engine` `lut` and `nanogpt`. That is only legitimate because the two are genuinely
+comparable: same corpus, same `WordTokenizer` and vocabulary file, same `context_size`,
+and — at the same seed — the same 1,000 validation windows, so their `loss.csv`
+perplexities sit on the same scale. Putting one prompt into each is the cheapest honest
+comparison available.
+
+Almost nothing had to be generalised, because three things already lined up:
+
+- **The checkpoint identifies itself.** `gpt_baseline_train.save_checkpoint` writes
+  `kind: 'nanogpt_lm'`; LUT checkpoints predate the field, so its absence means LUT.
+  `load_model` is a one-line branch, not a guess.
+- **The forward contract already matched.** `gpt_baseline_train.FullLogits` exists because
+  `evaluate` wants `(B, T, V)`, and `GPT.forward` without targets keeps only the last
+  position. Generation reads position `n-1` of a padded window, so that same wrapper is
+  exactly what it needs — reuse it, never call `GPT.forward` directly here.
+- **GPT is causal too**, so the short-prompt padding scheme holds unchanged.
+  `gpt_load_test` checked it against the real checkpoint rather than assuming.
+
+What does differ is `describe()`, and it is kept apart on purpose: "64 trees x 2^8 rows
+with a learned:448 code" and "256-wide, 8 heads, 8.4M params" are not one quantity in two
+costumes, and flattening them into a shared schema would invent a comparison that does
+not exist. `GptSpec` stands in for `LutConfig` and carries only the names the chat client
+reads.
+
+Loading the GPT state dict uses a plain copy, **not** `assign=True` like the LUT path:
+nanoGPT ties `lm_head.weight` to `wte.weight` and the state dict holds both keys, so
+copying preserves the shared tensor where assigning would silently split it in two.
 
 A live run rewrites `model_best.pt` on every validation improvement, so loading can lose
 that race; `load_checkpoint_file` retries and the server falls back to the periodic copy.
@@ -510,7 +540,7 @@ import `parametrize`/`run_all` from `_testing.py` so they run under either
 | `test_torch_kernels` | the fused Numba backend against the torch path, both layouts |
 | `test_torch_stacking` | stacked heads vs unstacked: exact forward, exact single-layer gradients, float32-epsilon bound deeper, call-count reduction, checkpoint conversion |
 | `test_torch_graphs` | CUDA-graph replay vs eager over *consecutive* steps, dropout redraw, and the zero_grad misuse guard. Skips itself without a GPU |
-| `test_torch_chat` | run discovery and LM/POS classification, incremental decoding against `WordTokenizer.decode`, sampling filters, the causal-padding assumption, and the server's routes against a stub. The run-index and HTTP halves need no torch |
+| `test_torch_chat` | run discovery, LM/POS classification and engine detection (LUT vs the nanoGPT baseline), incremental decoding against `WordTokenizer.decode`, sampling filters, the causal-padding assumption, checkpoint-kind dispatch, and the server's routes against a stub. The run-index and HTTP halves need no torch |
 
 `test_torch_stacking` is the reason stacking is safe to trust: parity pins unstacked
 against `main.py`, and stacking pins stacked against unstacked, so the guarantee carries

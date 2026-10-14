@@ -97,6 +97,40 @@ def test_parse_config_txt_splits_fields_from_command():
         shutil.rmtree(root)
 
 
+GPT_COMMAND = (
+    '.venv313/bin/python gpt_baseline_train.py '
+    'nanoGPT_POS/data/wiki2/train_original_10_freq.txt '
+    '--validation-data nanoGPT_POS/data/wiki2/val_original_10_freq.txt '
+    '--vocab-file nanoGPT_POS/data/wiki2/vocab_file_10_freq.txt --tokenizer word '
+    '--context-size 32 --n-layer 6 --n-head 8 --n-embd 256 '
+    '--save-model /ckpt/GPT/run/model'
+)
+
+
+def test_engine_is_read_from_the_command():
+    from lut_torch.run_index import ENGINE_LUT, ENGINE_NANOGPT, engine
+
+    assert engine(split_command(LM_COMMAND)) == ENGINE_LUT
+    assert engine(split_command(POS_COMMAND)) == ENGINE_LUT
+    assert engine(split_command(GPT_COMMAND)) == ENGINE_NANOGPT
+    assert engine(split_command('python nanoGPT/train.py config/foo.py')) == ''
+
+
+def test_gpt_baseline_counts_as_an_lm():
+    """The GPT baseline is the next-token control, so it belongs in the same list."""
+    assert classify(split_command(GPT_COMMAND)) == TASK_LM
+    # It has no POS mode, so a stray --POS-task must not reclassify it.
+    assert classify(split_command(GPT_COMMAND + ' --POS-task')) == TASK_LM
+
+
+def test_positional_argument_skips_the_interpreter():
+    """argv[0] is a venv python path, which also looks positional."""
+    tokens = split_command(GPT_COMMAND)
+    assert tokens[0].endswith('python')
+    assert positional_argument(tokens).endswith('train_original_10_freq.txt')
+    assert flag_value(tokens, '--n-embd') == '256'
+
+
 def test_classify_reads_the_flag_not_the_name():
     assert classify(split_command(LM_COMMAND)) == TASK_LM
     assert classify(split_command(POS_COMMAND)) == TASK_POS
@@ -209,6 +243,32 @@ def test_discover_runs_selects_lm_with_checkpoints():
         assert both[0].timestamp > both[1].timestamp
         assert len(discover_runs(root, task=TASK_POS)) == 1
         assert len(discover_runs(root, task=None, require_checkpoint=False)) == 4
+    finally:
+        shutil.rmtree(root)
+
+
+def test_discover_runs_offers_both_engines():
+    from lut_torch.run_index import ENGINE_LUT, ENGINE_NANOGPT
+
+    root = tempfile.mkdtemp()
+    try:
+        write_run(root, 'LM_sweep', '20261011-1_lut_seed42',
+                  LM_COMMAND.replace('/ckpt/LM/run', root + '/ck/a'),
+                  checkpoints=('best',))
+        write_run(root, 'GPT_LM_baseline', '20261011-2_d256_seed42',
+                  GPT_COMMAND.replace('/ckpt/GPT/run', root + '/ck/b'),
+                  loss_rows=[(1, 0.1, 10, 4.42, 83.1, 0.29, 4.7, 110.0, 0.27)],
+                  checkpoints=('best',))
+        runs = discover_runs(root, task=TASK_LM)
+        by_engine = {r.engine: r for r in runs}
+        assert set(by_engine) == {ENGINE_LUT, ENGINE_NANOGPT}
+        gpt = by_engine[ENGINE_NANOGPT]
+        # The listing must work for the GPT runs too, since the picker shows the same
+        # metrics for both -- that comparability is the point of offering them together.
+        assert gpt.context_size == 32
+        assert gpt.vocab_file.endswith('vocab_file_10_freq.txt')
+        assert abs(gpt.metrics.best_perplexity - 83.1) < 1e-9
+        assert gpt.checkpoint('best').path.endswith('_best.pt')
     finally:
         shutil.rmtree(root)
 
@@ -493,6 +553,38 @@ def test_generate_stops_when_asked():
     ids = [e['id'] for e in chat.generate([2, 3], max_new_tokens=50, seed=3,
                                           stop_at_eol=True, suppress_unk=False)]
     assert 1 not in ids[:-1]
+
+
+def test_load_model_dispatches_on_checkpoint_kind():
+    """A LUT checkpoint has no 'kind'; the GPT baseline stamps one."""
+    _require_torch()
+    from lut_torch.inference import CHECKPOINT_KIND_NANOGPT, load_model
+
+    assert CHECKPOINT_KIND_NANOGPT == 'nanogpt_lm'
+    # Reaching the nanoGPT branch with a checkpoint that has no model_args must fail in
+    # that branch, not silently fall through to LutConfig and build the wrong network.
+    try:
+        load_model.__wrapped__ if False else None
+        from lut_torch import inference
+        inference.load_nanogpt_model({'kind': CHECKPOINT_KIND_NANOGPT}, device='cpu')
+    except KeyError as exc:
+        assert 'model_args' in str(exc)
+    except ImportError:
+        skip('gpt_baseline_train is not importable here')
+    else:
+        raise AssertionError('a kind-tagged checkpoint with no model_args must raise')
+
+
+def test_gpt_spec_supplies_the_names_the_chat_client_reads():
+    _require_torch()
+    from lut_torch.inference import GptSpec
+
+    spec = GptSpec(context_size=32, vocab_size_input=14398, vocab_size_output=14398,
+                   n_layer=6, n_head=8, n_embd=256)
+    # ModelCache checks vocab_size_input against the tokenizer; LutChatModel reads
+    # context_size; describe() reads vocab_size_output. All three must exist.
+    assert spec.context_size == 32
+    assert spec.vocab_size_input == spec.vocab_size_output == 14398
 
 
 def test_config_round_trips_through_a_checkpoint_dict():

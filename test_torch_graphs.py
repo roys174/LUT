@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from lut_torch._testing import run_all, skip
+from lut_torch._testing import parametrize, run_all, skip
 from lut_torch.config import LutConfig
 from lut_torch.data import IGNORE_INDEX
 from lut_torch.modules import LutModel
@@ -34,8 +34,8 @@ CFG_KWARGS = dict(
 )
 
 
-def make(seed=3, dropout=0.0, batch=2):
-    cfg = LutConfig(dropout=dropout, **CFG_KWARGS)
+def make(seed=3, dropout=0.0, batch=2, **overrides):
+    cfg = LutConfig(dropout=dropout, **{**CFG_KWARGS, **overrides})
     torch.manual_seed(seed)
     np.random.seed(seed)
     import random
@@ -45,6 +45,8 @@ def make(seed=3, dropout=0.0, batch=2):
         gen = torch.Generator(device='cuda').manual_seed(seed)
         for table in model.table_parameters():
             table.copy_(torch.randn(table.shape, generator=gen, device='cuda') * 0.3)
+        for w in model.tree_weight_parameters():   # away from 1, or a bug could hide
+            w.copy_(torch.rand(w.shape, generator=gen, device='cuda') + 0.5)
     model.train()
     rng = np.random.default_rng(seed)
     batches = []
@@ -73,7 +75,8 @@ def eager_step(model, cfg, inp, tgt, batch):
     return float(total.detach()) / count, correct, count, grads
 
 
-def test_graph_matches_eager_over_consecutive_steps():
+@parametrize('tree_weights', [False, True])
+def test_graph_matches_eager_over_consecutive_steps(tree_weights):
     """The property that catches accumulate-instead-of-overwrite: it would look right on
     replay 1 and drift from replay 2 onwards."""
     if not HAS_CUDA:
@@ -81,10 +84,10 @@ def test_graph_matches_eager_over_consecutive_steps():
     from lut_torch.graphs import GraphedTrainStep
 
     batch = 2
-    model_e, cfg, batches = make(batch=batch)
+    model_e, cfg, batches = make(batch=batch, tree_weights=tree_weights)
     expected = [eager_step(model_e, cfg, i, t, batch) for i, t in batches]
 
-    model_g, _, batches_g = make(batch=batch)
+    model_g, _, batches_g = make(batch=batch, tree_weights=tree_weights)
     graphed = GraphedTrainStep(model_g, batches_g[0][0], batches_g[0][1],
                                cfg.vocab_size_output, IGNORE_INDEX, batch)
     for step, ((inp, tgt), (want_loss, want_correct, want_count, want_grads)) in enumerate(
@@ -103,7 +106,8 @@ def test_graph_matches_eager_over_consecutive_steps():
                                        msg=f'step {step}, {name}')
 
 
-def test_optimizer_steps_apply_through_the_graph():
+@parametrize('tree_weights', [False, True])
+def test_optimizer_steps_apply_through_the_graph(tree_weights):
     """A full loop -- replay, opt.step(), replay -- must track the eager equivalent.
 
     Catches the case where gradients land somewhere the optimizer never reads: training
@@ -114,13 +118,13 @@ def test_optimizer_steps_apply_through_the_graph():
     from lut_torch.graphs import GraphedTrainStep
 
     batch = 2
-    model_e, cfg, batches = make(batch=batch)
+    model_e, cfg, batches = make(batch=batch, tree_weights=tree_weights)
     opt_e = torch.optim.SGD(list(model_e.parameters()), lr=0.05)
     for inp, tgt in batches:
         eager_step(model_e, cfg, inp, tgt, batch)
         opt_e.step()
 
-    model_g, _, batches_g = make(batch=batch)
+    model_g, _, batches_g = make(batch=batch, tree_weights=tree_weights)
     opt_g = torch.optim.SGD(list(model_g.parameters()), lr=0.05)
     graphed = GraphedTrainStep(model_g, batches_g[0][0], batches_g[0][1],
                                cfg.vocab_size_output, IGNORE_INDEX, batch)

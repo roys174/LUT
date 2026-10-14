@@ -12,9 +12,14 @@ plain text; ``loss.csv`` carries the validation curve. The checkpoint is opened 
 a model is actually selected.
 
 The task test is the *command*, not the directory name: a run is a language model when it
-invoked ``lut_torch.train`` without ``--POS-task``. Naming conventions drift between
-sweeps (and ``results/GPT_POS`` is not this trainer at all); the flag that decided
-``vocab_size_output`` does not.
+invoked ``lut_torch.train`` without ``--POS-task``, or ``gpt_baseline_train.py`` at all
+(that trainer has no POS mode). Naming conventions drift between sweeps -- and
+``results/GPT_POS`` is a third thing again, nanoGPT's own trainer, which is neither --
+while the flag that decided ``vocab_size_output`` does not.
+
+Two trainers appear here because their runs are directly comparable: same corpus, same
+``WordTokenizer``, same context size, and the same validation windows at the same seed.
+``engine`` records which one, so a client can say so without re-parsing the command.
 """
 
 import csv
@@ -27,8 +32,17 @@ TASK_LM = 'LM'
 TASK_POS = 'POS'
 TASK_OTHER = 'other'
 
-# The trainer module, as it appears in the recorded command line.
+# Which network a run trained. Both engines write the same `config.txt` and the same
+# nine-column `loss.csv`, draw the same validation windows at the same seed, and use the
+# same WordTokenizer -- so for everything this module does they differ only by name, and
+# a chat client can offer them side by side. They part company at the checkpoint, which
+# is why `engine` is carried on RunInfo rather than re-derived later.
+ENGINE_LUT = 'lut'
+ENGINE_NANOGPT = 'nanogpt'
+
+# The trainers, as they appear in the recorded command line.
 TRAIN_MODULE = 'lut_torch.train'
+GPT_TRAIN_SCRIPT = 'gpt_baseline_train.py'
 
 
 @dataclass
@@ -74,6 +88,7 @@ class RunInfo:
     sweep: str
     name: str
     task: str
+    engine: str
     run_dir: str
     checkpoint_dir: str
     arm: str = ''
@@ -139,13 +154,27 @@ def split_command(command):
         return command.split()
 
 
+def engine(tokens):
+    """Which trainer produced the run, or ``''`` if it was neither of ours."""
+    joined = ' '.join(tokens)
+    if GPT_TRAIN_SCRIPT in joined:
+        return ENGINE_NANOGPT
+    if TRAIN_MODULE in joined:
+        return ENGINE_LUT
+    return ''
+
+
 def classify(tokens):
     """The run's task, from the command line that produced it."""
     if not tokens:
         return TASK_OTHER
-    joined = ' '.join(tokens)
-    if TRAIN_MODULE not in joined:
+    which = engine(tokens)
+    if not which:
         return TASK_OTHER
+    # The GPT baseline exists only to be the next-token control for the LUT LM runs; it
+    # has no POS mode, so there is no flag to consult.
+    if which == ENGINE_NANOGPT:
+        return TASK_LM
     # argparse's dest is POS_task and the flag is spelled --POS-task; accept either
     # casing so a hand-edited command still classifies.
     for token in tokens:
@@ -166,10 +195,18 @@ def flag_value(tokens, *names):
 
 
 def positional_argument(tokens):
-    """The trainer's one positional argument: the training corpus."""
-    try:
-        start = tokens.index(TRAIN_MODULE) + 1
-    except ValueError:
+    """The trainer's one positional argument: the training corpus.
+
+    Scans from the trainer itself, which is ``-m lut_torch.train`` for one engine and a
+    script path ending in ``gpt_baseline_train.py`` for the other -- never from argv[0],
+    because that is an interpreter path that also looks positional.
+    """
+    start = None
+    for index, token in enumerate(tokens):
+        if token == TRAIN_MODULE or token.endswith(GPT_TRAIN_SCRIPT):
+            start = index + 1
+            break
+    if start is None:
         return ''
     index = start
     while index < len(tokens):
@@ -299,6 +336,7 @@ def run_from_config(config_path, results_root, with_metrics=True):
 
     tokens = split_command(command)
     task = classify(tokens)
+    which = engine(tokens)
     checkpoint_dir = fields.get('checkpoint_dir', '')
     save_model = flag_value(tokens, '--save-model')
     context = flag_value(tokens, '--context-size')
@@ -308,6 +346,7 @@ def run_from_config(config_path, results_root, with_metrics=True):
         sweep=sweep or fields.get('sweep_name', ''),
         name=name,
         task=task,
+        engine=which,
         run_dir=run_dir,
         checkpoint_dir=checkpoint_dir,
         arm=fields.get('arm', ''),

@@ -22,19 +22,26 @@ Three things about this model shape the whole file:
 """
 
 import os
+import sys
 import threading
 import time
+from dataclasses import dataclass
 
 import torch
 
 from .config import LutConfig
 from .modules import LutModel
+from .run_index import ENGINE_LUT, ENGINE_NANOGPT
 from .stacking import looks_unstacked, stack_state_dict
 
 # Kept in sync with data.py / word_tokenizer.py.
 UNK_TOKEN_ID = 0
 EOL_TOKEN_ID = 1
 EOL = '<eol>'
+
+# Written by gpt_baseline_train.save_checkpoint. LUT checkpoints carry no 'kind' at all,
+# so its absence is what identifies them.
+CHECKPOINT_KIND_NANOGPT = 'nanogpt_lm'
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -126,8 +133,72 @@ def load_tokenizer(tokenizer_name, vocab_file):
     return tiktoken.get_encoding(tokenizer_name)
 
 
+@dataclass
+class GptSpec:
+    """The handful of fields :class:`LutChatModel` needs from a nanoGPT checkpoint.
+
+    Deliberately not a ``GPTConfig``: this stands in for ``LutConfig`` on the chat side,
+    so it carries the two names that code reads (``context_size``, ``vocab_size_*``) plus
+    the shape, and nothing else. Keeping it separate means the chat client never has to
+    know which engine it is holding except where it genuinely differs -- the description
+    panel.
+    """
+
+    context_size: int
+    vocab_size_input: int
+    vocab_size_output: int
+    n_layer: int
+    n_head: int
+    n_embd: int
+    dropout: float = 0.0
+    bias: bool = True
+
+
+def load_nanogpt_model(ckpt, device='cpu'):
+    """Rebuild the GPT baseline from its checkpoint.
+
+    Reuses ``gpt_baseline_train``'s own ``load_nanogpt`` and ``FullLogits`` rather than
+    re-deriving them. ``FullLogits`` matters: ``GPT.forward`` keeps only the last
+    position when it is given no targets, and this chat client reads position ``n-1`` of
+    a padded window, so the sampling shortcut would hand back the wrong row.
+    """
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    from gpt_baseline_train import FullLogits, load_nanogpt
+
+    margs = dict(ckpt['model_args'])
+    nanogpt = load_nanogpt()
+    gpt = nanogpt.GPT(nanogpt.GPTConfig(**margs))
+
+    state = ckpt['model']
+    if any(k.startswith('_orig_mod.') for k in state):
+        # A checkpoint saved from the torch.compile wrapper rather than the module.
+        state = {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
+    # Plain copy, not assign=True: nanoGPT ties lm_head.weight to wte.weight, and the
+    # state dict holds both keys. Copying preserves the shared tensor; assigning would
+    # quietly split it into two.
+    gpt.load_state_dict(state)
+
+    model = FullLogits(gpt)
+    model.to(device)
+    model.eval()
+    model.requires_grad_(False)
+    cfg = GptSpec(context_size=margs['block_size'],
+                  vocab_size_input=margs['vocab_size'],
+                  vocab_size_output=margs['vocab_size'],
+                  n_layer=margs['n_layer'], n_head=margs['n_head'],
+                  n_embd=margs['n_embd'], dropout=margs.get('dropout', 0.0),
+                  bias=margs.get('bias', True))
+    return model, cfg, dict(ckpt.get('args') or {}), int(ckpt.get('step', 0))
+
+
 def load_model(path, device='cpu'):
     """``(model, cfg, args, step)`` for a checkpoint, in ``eval`` mode on ``device``.
+
+    Dispatches on the checkpoint's own ``kind``. The GPT baseline stamps
+    ``nanogpt_lm``; LUT checkpoints predate the field and have none, so absence means
+    LUT. Both come back with the same contract -- a module mapping ``(B, T)`` ids to
+    ``(B, T, V)`` logits, in eval mode, with grad off.
 
     Loading is written for peak memory, not elegance, because the uncoded LM arm is a
     1.1 GB checkpoint whose output table alone is 944 MB. Done naively -- read the whole
@@ -145,6 +216,8 @@ def load_model(path, device='cpu'):
     nothing survives from construction except the shapes.
     """
     ckpt = load_checkpoint_file(path, map_location='cpu')
+    if ckpt.get('kind') == CHECKPOINT_KIND_NANOGPT:
+        return load_nanogpt_model(ckpt, device=device)
     cfg = config_from_checkpoint(ckpt)
     model = LutModel(cfg)
     state = ckpt['model']
@@ -261,9 +334,14 @@ def filter_logits(logits, temperature=1.0, top_k=0, top_p=1.0, banned_ids=()):
 class LutChatModel:
     """One loaded checkpoint plus its tokenizer, wrapped for interactive use."""
 
-    def __init__(self, model, cfg, args, step, tokenizer, device, checkpoint_path):
+    def __init__(self, model, cfg, args, step, tokenizer, device, checkpoint_path,
+                 engine=ENGINE_LUT):
         self.model = model
         self.cfg = cfg
+        # Which network this is. Everything between tokenization and sampling is
+        # identical for both -- same vocabulary, same fixed window, same (B,T,V) logits
+        # -- so this only steers `describe`.
+        self.engine = engine
         self.args = args
         self.step = step
         self.tokenizer = tokenizer
@@ -362,24 +440,44 @@ class LutChatModel:
     # -- description -------------------------------------------------------
 
     def describe(self):
+        """What the UI shows about the loaded model.
+
+        The common half is whatever both engines have; the rest is per-engine, because
+        "64 trees x 2^8 rows with a learned:448 code" and "512-wide, 8 heads" are not the
+        same quantity wearing different labels and should not be forced into one schema.
+        """
         cfg = self.cfg
-        return {
+        common = {
+            'engine': self.engine,
             'checkpoint': self.checkpoint_path,
             'step': self.step,
             'device': str(self.device),
             'context_size': cfg.context_size,
             'vocab_size': cfg.vocab_size_output,
-            'num_layers': cfg.num_layers,
-            'num_heads': cfg.num_heads,
-            'n_t': cfg.n_t,
-            'n_c': cfg.n_c,
-            'output_code': (None if cfg.output_code_dim is None
-                            else f"{cfg.output_code}:{cfg.output_code_dim}"
-                                 f"{'+bias' if cfg.output_code_bias else ''}"),
-            'table_entries': sum(p.numel() for p in self.model.table_parameters()),
+            'num_layers': cfg.n_layer if self.engine == ENGINE_NANOGPT else cfg.num_layers,
+            'num_heads': cfg.n_head if self.engine == ENGINE_NANOGPT else cfg.num_heads,
+            'parameters': sum(p.numel() for p in self.model.parameters()),
             'tokenizer': self.args.get('tokenizer', 'word'),
             'vocab_file': self.args.get('vocab_file', ''),
         }
+        if self.engine == ENGINE_NANOGPT:
+            common.update({
+                'n_embd': cfg.n_embd,
+                'dropout': cfg.dropout,
+                'n_t': None, 'n_c': None, 'output_code': None, 'table_entries': None,
+            })
+        else:
+            common.update({
+                'n_t': cfg.n_t,
+                'n_c': cfg.n_c,
+                'output_code': (None if cfg.output_code_dim is None
+                                else f"{cfg.output_code}:{cfg.output_code_dim}"
+                                     f"{'+bias' if cfg.output_code_bias else ''}"),
+                'table_entries': sum(p.numel()
+                                     for p in self.model.table_parameters()),
+                'n_embd': None, 'dropout': None,
+            })
+        return common
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +516,9 @@ class ModelCache:
             raise ValueError(
                 f"vocabulary has {vocab_n} entries but the model was trained with "
                 f"vocab_size_input={cfg.vocab_size_input}; wrong --vocab-file")
-        wrapper = LutChatModel(model, cfg, args, step, enc, self.device, path)
+        engine = ENGINE_NANOGPT if isinstance(cfg, GptSpec) else ENGINE_LUT
+        wrapper = LutChatModel(model, cfg, args, step, enc, self.device, path,
+                               engine=engine)
 
         with self._lock:
             self._entries[path] = wrapper

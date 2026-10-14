@@ -232,32 +232,47 @@ Everything above is POS (18 classes). This part is the **LM** task: wiki2 word-l
 can be replaced by `D` coordinates plus a `(V, D)` code matrix -- `logits = y @ C.T + b` --
 instead of one table column per class.
 
-Measured across three sweeps, ~45 GPU-h: `LM_torch_output_code_E10` (does it work at all),
+Measured across six sweeps, ~280 GPU-h: `LM_torch_output_code_E10` (does it work at all),
 `LM_torch_schedule_probe` (budget and LR shape), `LM_torch_code_width` (how wide must `D` be,
-and does a frozen code ever catch up).
+and does a frozen code ever catch up), `LM_torch_lr_budget` (peak LR x budget, two rounds),
+`LM_torch_depth` (where the freed parameters should go, plus a deeper ladder to L60).
 
 ## The settled LM configuration
 
 ```
---output-code-dim 112 --output-code learned --output-code-bias
---epochs 60                         # 30 is the cheap point; 60 is 5.1% better
+--output-code learned --output-code-bias
+--output-code-dim 112               # settled at L6 (Decision L3); the depth runs used 448,
+                                    # and the deep cell has not been repeated at 112 (Open L7)
+--num-layers 32                     # or 48 -- see Decision L5. n_c stays 8
+--epochs 30                         # NOT more at depth: L24 at E=60 is worse than at E=30
 --lr-scheduler cosine --cosine-min-lr-ratio 0.01
 --warmup-frac 0.0095
---max-learning-rate 0.00125          # x batch 32 = 0.04 effective. CONFIRMED at E>=30
-                                    # for the CODED head; the dense head wants 0.0025
+--max-learning-rate 0.00125          # x batch 32 = 0.04 effective, coded head, E>=30
 --lr-batch-scaling linear --lr-reference-batch-size 1
 --validation-interval-epochs 0.1
 ```
 
-Best measured: **`D112_E60_lr04` at 126.52 perplexity** (val loss 4.8404, acc 0.2467,
-no-unk ppl 157.7) in 4.79 h, with a **3,461,982-parameter head -- 68x smaller** than the
-dense 235,896,832-entry head, which is 83% of the uncoded model.
+Best measured: **`L60_nc8_lr04` (D448) at 107.46 perplexity** (min 106.88; acc 0.2631,
+no-unk ppl 133.1), 493.5M parameters, 26.2 h. The recommended point is **`L32` at 113.53**
+(269.7M, 14.1 h) -- the deepest cell still smaller than the dense baseline -- or `L48` at
+109.20 (397.6M, 21.6 h) if parameters are not the constraint.
 
-**The compression claim is "68x smaller at equal wall clock", not "smaller and better at
-equal epochs".** At 30 epochs with each head at its own best LR the dense head wins
-(128.39 against 133.38, 3.9%). The coded head is 1.7x faster per epoch (0.080 h/epoch
-against 0.137), so at ~4.5 h of GPU it reaches 126.52 against the dense head's 128.39 --
-see Decision L4.
+Best dense baseline: **`dense_E60_lr04` at 120.65** (283.9M, 8.8 h).
+
+**The headline is "deeper coded models beat the dense head at equal parameters", not "the
+coded head is smaller at equal wall clock".** The earlier wall-clock claim (126.52 coded at
+4.8 h vs 128.39 dense at 4.1 h) did not survive giving the dense head 60 epochs: at 120.65 it
+beats every 6-layer coded run, including `D112_E120_lr04` (125.38 in 10.8 h). A 6-layer coded
+head is smaller but worse. What holds up, all single-seed:
+
+```
+equal parameters   L32 coded  269.7M  14.1 h  113.53   vs  dense E60  283.9M  8.8 h  120.65   (-5.9%)
+equal wall clock   L18 coded  157.7M   8.0 h  120.42   vs  dense E60  283.9M  8.8 h  120.65   (tie, -44% params)
+```
+
+The coded model costs 1.6x the wall clock at equal parameters (depth is serial), and wins
+nothing at equal wall clock except size. See Decisions L4 and L5.
+
 
 ## Decision L1 -- the coded head is a real replacement, and `learned` is the only version that works
 
@@ -365,21 +380,42 @@ first and re-test**. Its minimum Hamming distance is stuck at 2 for every `D` fr
 1000 (a greedy-construction defect, not a property of the vocabulary), but the frozen
 random `D = 28` control in Decision L1 shows distance is not the binding constraint.
 
-## Decision L4 -- peak LR 0.04 for the coded head, 0.08 for the dense one; budget beats both
+## Decision L4 -- peak LR 0.04 at E>=30 for both heads; at L6 the dense head wins
 
 `LM_torch_lr_budget`, all cosine to 1%, `--warmup-frac 0.0095`, seed 42. `D = 112` learned
 + bias. The `E=30 / 0.04` cell is `L_D112` from the width sweep (identical command line
-apart from `--epochs`).
+apart from `--epochs`). Round 2 (`20260918-*`) added `D112_E120_lr04` and the two dense
+`E=60` arms. Final-step perplexity:
 
 | `D = 112` | peak 0.04 | peak 0.08 |
 |---|---|---|
 | E = 30 | 133.38 | 142.38 |
-| E = 60 | **126.52** | 137.20 |
-| E = 120 | *not run* | 132.59 |
+| E = 60 | 126.52 | 137.20 |
+| E = 120 | **125.38** (min 124.57 @ ep 114) | 132.59 |
 
 | dense (`V` logits) | peak 0.04 | peak 0.08 |
 |---|---|---|
 | E = 30 | 132.29 | **128.39** |
+| E = 60 | **120.65** (min 119.93 @ ep 59) | *crashed at ep 37.5* |
+
+**Round 2 overturns this decision's original headline.** Round 1 concluded that the coded
+head reaches 126.52 in 4.8 h against the dense head's 128.39 in 4.1 h, and so was "68x
+smaller at matched wall clock". Given 60 epochs, the dense head reaches **120.65 in 8.8 h**,
+which beats every `L6` coded run, including `D112_E120_lr04` (125.38 in 10.8 h). At `L6`
+the coded head is smaller but worse at any matched budget. Its advantage comes from spending
+the freed parameters on depth (Decision L5), not from the head alone.
+
+**The coded head's budget is exhausted near E=60.** E=60 -> E=120 at 0.04 is 126.52 ->
+125.38, 0.9% for 2x compute, against the ~3.4% the previous revision extrapolated (it
+predicted ~122). The train/val gap reached +0.64. More epochs at `L6` / `D = 112` are not
+worth running.
+
+**The dense head's LR preference also reverses with budget, tentatively.** At E=30 it
+prefers 0.08; at E=60, 0.04 leads 0.08 at the last common point (123.90 against 125.23 at
+epoch 37.5, same cosine schedule, so the same LR fraction). `dense_E60_lr08` died at its
+final checkpoint save because its `/cs/snapless/.../LM_torch_lr_budget/<run>` directory did
+not exist. That is an infrastructure fault, not divergence. Its 37.5-epoch value is not a
+result.
 
 **The `E=10` LR probe did not transfer, and it reversed.** At 10 epochs, 0.08 beat 0.04 by
 8.4%; at 30 epochs it *loses* by 6.7% and at 60 by 8.4%. This is the same budget-depth
@@ -388,20 +424,21 @@ peak -- but pointing the other way, and it invalidates the prediction in this fi
 previous revision that the width sweep was understated by being run at 0.04. It was not;
 0.04 was right. Nothing here diverged, including 120 epochs at 0.08.
 
-**The two heads want different LRs, in opposite directions.** Coded prefers 0.04, dense
-prefers 0.08 (128.39 against 132.29). Had the dense control been run at one LR only -- the
-POS `new-MHA=off` mistake -- the comparison would have been wrong whichever LR was chosen.
+**At E=30 the two heads want opposite LRs.** Coded prefers 0.04 and dense prefers 0.08
+(128.39 against 132.29). Had the dense control been run at one LR only -- the POS
+`new-MHA=off` mistake -- the comparison would have been wrong whichever LR was chosen. At
+E=60 the dense preference appears to move to 0.04 too (above), the same reversal the coded
+head showed between E=10 and E=30. Re-bracket LR whenever the budget changes.
 
-**`E=120` underperformed because it was only run at 0.08, not because the budget stopped
-paying.** At 0.08 the model converges to ~132 regardless of budget (137.20 at E=60,
-132.59 at E=120, and flat over its last 10 epochs: 132.55 -> 132.59). At 0.04, E=60 alone
-reaches 126.52 and was still improving. `E=120 / 0.04` is unrun and is the best remaining
-cell; scaling E=60->E=120's 3.4% gain onto it puts it near 122.
+**At 0.08 the coded model converges to ~132 regardless of budget** (137.20 at E=60, 132.59
+at E=120, flat over its last 10 epochs: 132.55 -> 132.59). At 0.04 it goes lower but
+saturates by E=120 too (above).
 
-**Overfitting is now visible and is the coming constraint.** Train/val gap at `D = 112`:
-+0.217 at E=30, +0.383 at E=60, +0.583 at E=120 -- and `E=60/0.04` peaked at epoch 51.5 of
-60. The dense head's gaps are far smaller (+0.07 at 0.04, +0.15 at 0.08). So the next
-budget increase probably wants more dropout or more data alongside it, not epochs alone.
+**Overfitting is the constraint.** Train/val gap at `D = 112` / 0.04 (val loss minus train
+EMA loss): +0.217 at E=30, +0.383 at E=60, +0.637 at E=120 (+0.583 at E=120 / 0.08). The
+dense head's gaps are far smaller: +0.07 and +0.15 at E=30, +0.22 at E=60 / 0.04. The coded
+head memorises more readily, so more budget wants more dropout or more data with it, not
+epochs alone.
 
 ## Decision L5 -- depth is where the freed budget goes; `n_c` is not
 
@@ -420,8 +457,42 @@ Validation perplexity:
 | L24 | **113.9** | 119.0 | 127.6 | 129.5 |
 | dense L6 | 131.7 | -- | 127.9 | -- |
 
-**Depth is monotone in all four ladders, with no flattening at 24.** The deepest cell wins
-every column. Four independent ladders agreeing matters more than the size of any one gap.
+**Depth is monotone in all four ladders.** The deepest cell wins every column. Four
+independent ladders agreeing matters more than the size of any one gap.
+
+**The deeper ladder (`20260918-103308_*`, `run_files/torch_LM_deeper_gpu.sh`)** extended the
+winning column (`n_c=8 / 0.04`, same flags apart from `--num-layers`) and refilled `L18`. Min
+val perplexity, as in the table above (finals in brackets), with the train/val gap computed
+from the final val loss:
+
+| layers | ppl | total params | wall clock | gap | step gain |
+|---|---|---|---|---|---|
+| L6 | 130.1 (130.69) | 61.8M | 2.4 h | -- | -- |
+| L12 | 123.2 (123.80) | 109.7M | 4.8 h | -- | -5.3% |
+| L18 | 119.2 (120.42) | 157.7M | 8.0 h | +0.410 | -3.2% |
+| L24 | 113.9 (114.45) | 205.7M | 10.7 h | +0.405 | -4.5% |
+| L32 | 113.2 (113.53) | 269.7M | 14.1 h | +0.422 | -0.6% |
+| L48 | 108.8 (109.20) | 397.6M | 21.6 h | +0.453 | -3.9% |
+| **L60** | **106.9 (107.46)** | 493.5M | 26.2 h | +0.463 | -1.7% |
+
+**Depth still pays at 60 but has started to flatten**, from ~5% per 6 layers early to
+~1.7% for the last 12, while cost is linear in layers. The `L24 -> L32` step (-0.6%) is out
+of line with its neighbours. It is probably seed noise, which is unmeasured (Open L4), not a
+plateau, since L48 resumes the trend. The train/val gap rises only slowly with depth
+(+0.41 -> +0.46), so the extra layers are mostly going to generalisation, not
+memorisation. Lower layers show no starvation through L60.
+
+**`L32` is the last depth smaller than the dense baseline** (269.7M against 283.9M). Past
+it the claim changes from "better and smaller" to "better". `L48` and `L60` are 1.4x and
+1.7x the dense model.
+
+**Budget does not pay at depth: `L24_E60` (119.82, min 119.50) is worse than `L24` at E=30
+(114.45).** With the same cosine shape stretched over 60 epochs, the run is at 122.7 at
+epoch 30 and only reaches 119.5 near the end. Its train/val gap is +0.768 against +0.405,
+so the extra 30 epochs went into memorisation. This matches Decision L4 at `L6`: on this
+data, budget past ~30 epochs feeds overfitting, and depth is the axis that still
+generalises. Do not raise epochs at depth without regularisation. If anything, try
+*fewer* (E=15-20) at L32/L48, which would also cut their wall clock.
 
 **`n_c = 10` is worse than `n_c = 8` at every matched depth**, by 4-10%, at both LRs. Four
 times the rows per table, reliably worse -- so the exponential axis is not the one to
@@ -439,14 +510,24 @@ L6  n_c=10  ->  135.2      capacity
 the ~222M the coded head frees buys ~27 layers, and they are worth more than the same
 bytes as table rows.
 
-**The coded head now wins outright, not just on size.** Best coded cell 113.9 at 205.7M
-entries against best dense 127.9 at 283.9M: **11% better perplexity at 28% fewer
-parameters.** It also beats `LM_torch_lr_budget`'s `D112 / E=60 / 0.04` (125.5) at half the
-budget, so depth at `E = 30` is worth more than 2x epochs at `L6`.
+**The coded head wins outright once depth is added, but by less than first measured.**
+Against the E=30 dense head (127.9) the coded `L24` was 11% better at 28% fewer parameters.
+The fair baseline is now `dense_E60_lr04` at 120.65 (Decision L4), the best dense run
+measured. Against it:
 
-**Decision L4's LR split replicates independently.** Coded cells prefer 0.04 in all eight
-pairs; the dense baseline prefers 0.08 (127.9 against 131.7). Two experiments, two head
-types, same answer in both directions.
+```
+L24 coded   205.7M  10.7 h  114.45   -5.1%  at 28% fewer params
+L32 coded   269.7M  14.1 h  113.53   -5.9%  at  5% fewer params
+L18 coded   157.7M   8.0 h  120.42   tie    at 44% fewer params, equal wall clock
+```
+
+Depth at E=30 is still worth more than 2x epochs at `L6`: `L24` beats `D112 / E=60 / 0.04`
+(125.5) and `D112 / E=120 / 0.04` (125.38). The dense head has not been given depth, so this
+compares "coded + freed layers" against "dense at 6 layers", which is the intended trade
+but not a same-depth comparison.
+
+**Decision L4's E=30 LR split replicates independently.** Coded cells prefer 0.04 in all
+eight pairs; the dense baseline prefers 0.08 at E=30 (127.9 against 131.7).
 
 **First LM replicate floor: ~0.11%.** `base_L6_lr08` here and `dense_E30_lr08` in
 `LM_torch_lr_budget` are byte-identical command lines at seed 42 -- verified flag by flag --
@@ -457,37 +538,123 @@ here (4-16%) are two orders of magnitude clear of noise, while the `L24 n_c=8` v
 `L24 n_c=10` accuracy tie (0.2548 vs 0.2554) is not.
 
 **Caveats.** Run at `D = 448`, not the `D = 112` of Decision L3 -- chosen before L3 settled,
-and it should be repeated at 112 before `D` and depth are quoted together. `L18 / n_c=8 /
-0.04` was killed at epoch 7.9 on the `killable` partition and is the one hole in the grid,
-in the winning family. Single seed throughout.
+and it should be repeated at 112 before `D` and depth are quoted together. The original
+`L18 / n_c=8 / 0.04` was killed at epoch 7.9 on the `killable` partition. The deeper ladder
+refilled it (`20260918-103308_L18_nc8_lr04_seed42`), so the stub run is superseded.
+Single seed throughout.
+
+## Decision L6 -- the nanoGPT baseline: best no-unk ppl 96.9, and a 1.2M-parameter GPT ties L60
+
+`GPT_LM_baseline` (`gpt_baseline_train.py`, `run_files/GPT_LM_baseline_gpu.sh`): an
+unmodified nanoGPT `GPT` with data, validation windows, `evaluate()` and the epoch/cosine
+schedule taken from `lut_torch`. Same wiki2 10-freq data (`V = 14,398`), ctx 32, batch 32,
+30 epochs, cosine to 1%, `--warmup-frac 0.0095`. The optimizer is the transformer's own
+(AdamW 0.9/0.95, wd 0.1, clip 1, bf16). Seed 42 and `--testing-length 1000`, so these runs
+score **the same 1,000 windows as the `LM_torch_depth` runs** (`test_gpt_baseline.py`
+asserts the window equality), and the `loss.csv` files compare directly. Single seed.
+
+Final val (min in brackets where it differs), all 12 cells:
+
+| cell | params | ppl | no-unk ppl | wall clock |
+|---|---|---|---|---|
+| **d256 / L12 / do0.3** | 13.1M | **81.38** | **96.93** (96.74) | 0.34 h |
+| d512 / L6 / do0.3 | 26.3M | 82.96 (82.93) | 97.63 (97.24) | 0.32 h |
+| d256 / L6 / do0.1 | 8.4M | 83.11 | 97.89 (97.77) | 0.16 h |
+| d256 / L12 / do0.1 | 13.1M | 85.69 | 101.70 (101.02) | 0.23 h |
+| d512 / L12 / do0.3 | 45.1M | 83.80 | 98.50 (98.26) | 0.45 h |
+| d256 / L6 / do0.3 | 8.4M | 88.29 | 104.58 (104.46) | 0.16 h |
+| d128 / L6 / do0.1 | 3.0M | 89.69 | 107.91 | 0.49 h |
+| d512 / L6 / do0.1 | 26.3M | 96.30 (93.26) | 109.68 (107.41) | 0.26 h |
+| d128 / L6 / do0.3 | 3.0M | 104.12 | 125.87 | 0.48 h |
+| d64 / L6 / do0.1 (LUT shape) | 1.2M | 108.19 | 132.37 | 0.41 h |
+| d64 / L6 / do0.3 | 1.2M | 129.83 | 160.36 | 0.50 h |
+| d512 / L12 / do0.1 | 45.1M | 130.11 (97.01) | 142.97 (115.14) | 0.37 h |
+| *LUT `L60_nc8_lr04`* | *493.5M* | *107.46* | *133.07* | *26.2 h* |
+| *LUT `L32_nc8_lr04`* | *269.7M* | *113.53* | *140.99* | *14.1 h* |
+
+**Size saturates at ~8M parameters; past that, more transformer does not help.** Best
+cell per size: 1.2M -> 108.2, 3.0M -> 89.7, 8.4M -> 83.1, 13.1M -> 81.4, 26.3M -> 82.9,
+45.1M -> 83.8. From 8M to 45M (5.4x) the spread is 2.7 ppl, about the size of the
+dropout effect inside one size. The dropout pattern is the classic data-limited signature:
+small models want 0.1 (do0.3 costs d64 +21.6 and d128 +14.4), large ones need 0.3 (do0.1
+costs d512/L6 +13.3, and d512/L12 overfits from 97.0 at epoch 11.8 to 130.1). The optimal
+regulariser grows with size while the best score stays flat. A larger transformer is not
+the missing piece; more data (or longer context) is.
+
+**The best no-unk perplexity is 96.9 (`d256_L12_h8_do0.3`).** It reads high, but most of
+the number comes from how and on what we score, not from the model:
+
+- **Short context, every position scored.** Per-position loss of that checkpoint on the
+  same 1,000 windows: ppl 202 at position 0 (one word of context), 155 at position 1, 114
+  at position 2, and ~67-80 from position 8 on. Positions >= 16 alone give **ppl 72.5 /
+  no-unk 86.2**, so the 32-word window with every position averaged costs ~11% on its
+  own. The single-position values are noisy (1,000 tokens each); the >= 16 pool is not.
+- **No-unk is a harder metric than standard WT2 perplexity.** `<unk>` is 8.8% of val
+  targets and is easy to predict (ppl 13.2 on those targets), so removing it raises the
+  number. Published WikiText-2 figures include `<unk>` targets, use a 33k vocabulary, and
+  carry state across segments (AWD-LSTM is ~68 val with all of that). The closest
+  comparable number here is the with-unk 81.4, or 72.5 with context. These are not
+  apples to apples (smaller vocab, short window), so treat that as a sanity range, not a
+  benchmark.
+
+**"The data is not good enough": partly yes, as quantity, not as quality.** 2.16M training
+tokens is what limits the larger models, and the sweep shows it. Every large or
+lightly-regularised cell overfits: d512/L12/do0.1 bottoms at 97.0 at epoch 11.8 and ends
+at 130.1, and d512/L6/do0.1 peaks at epoch 20.6. The best cells are the high-dropout ones,
+and they are still improving at epoch 30. That is a data-size ceiling, consistent with
+`L24_E60` memorising in Decision L5. Nothing here points to a *quality* problem with the
+data: the tokens are verified identical to the LUT stream, and the per-position curve has
+the shape expected of clean text. A larger corpus (WikiText-103, same pipeline) is the
+test that would separate "small data" from "our models", for both model families.
+
+**What matters for the LUT story is the gap, not the absolute number.** On identical windows:
+
+```
+GPT d64/L6 (LUT body shape)    1.2M params  0.41 h   108.19 / no-unk 132.37
+LUT L60_nc8_lr04             493.5M params  26.2 h   107.46 / no-unk 133.07
+GPT best (d256/L12/do0.3)     13.1M params  0.34 h    81.38 / no-unk  96.93
+```
+
+**A transformer with the LUT body's shape and 1/400 of its parameters ties the best LUT.**
+The tuned transformer is 24% better in ppl (27% in no-unk), with 1/38 of the parameters,
+in 1/77 of the wall clock. The LUT's "better at equal parameters" result (Decision L5) is
+measured against a LUT dense head, not against a transformer. Quote it that way.
 
 ## Still open (LM)
 
+- **L8 -- seed the GPT baseline (Decision L6).** All 12 cells are done. Seeds 43/44 for the best cell and for d64/L6 (array indices +12, +24).
+  The best cells were still improving at epoch 30, so the baseline is probably under-, not
+  over-, estimated. Also try dropout 0.4-0.5 at d256-d512. WikiText-103 through the same
+  pipeline is the test for "data-limited".
+
 - **L1 -- RESOLVED (Decision L4).** 0.04 is correct for the coded head at E >= 30; the
-  `E=10` probe's preference for 0.08 reversed with budget. The dense head wants 0.08.
-- **L2 -- RESOLVED (Decision L4).** The 30-epoch dense baseline exists: 128.39 at its best
-  LR. The compression claim is now "68x smaller at matched wall clock", not "smaller and
-  better at matched epochs".
-- **L3 -- `E = 120` at peak 0.04 is the highest-value unrun cell**, ~9.6 h, expected near
-  122. The dense head at `E = 60` is the other one: it would say whether the coded head's
-  wall-clock win at ~4.5 h survives giving the dense head the same wall clock (~8.2 h).
-  Run both before quoting any head-vs-head result. **Superseded in part by Decision L5**:
-  the coded head already beats the dense one at matched epochs once the freed budget is
-  spent on depth, so the head-vs-head claim no longer rests on wall clock.
-- **L6 -- depth has not saturated.** `L24` is the deepest cell run and wins every ladder,
-  with `L12 -> L24` still buying 9.3 ppl at 0.04 / `n_c=8`. `L32` and `L48` are the
-  highest-value unrun cells. Note the stack carries 2 unnormalised residual adds per layer
-  and no LayerNorm, and the surrogate decays as `1/(1+|u|)^2`, so a deep stack could in
-  principle starve its lower layers -- 24 layers shows no sign of it, but log mean `|u|`
-  per layer if a deeper ladder flattens, before concluding depth stopped paying.
-- **L7 -- the depth grid ran at `D = 448`, Decision L3 settled on `D = 112`.** Repeat the
-  best depth cell at 112 before quoting `D` and depth together.
+  `E=10` probe's preference for 0.08 reversed with budget. The dense head wants 0.08 at
+  E=30 and, tentatively, 0.04 at E=60.
+- **L2 -- RESOLVED (Decision L4).** Dense baselines exist at E=30 (128.39) and E=60
+  (120.65). The "68x smaller at matched wall clock" claim is retracted. At `L6` the dense
+  head wins; the coded head wins only with the freed parameters spent on depth.
+- **L3 -- RESOLVED (Decision L4).** `D112_E120_lr04` = 125.38, not the ~122 predicted: the
+  `L6` coded budget saturates near E=60. `dense_E60_lr04` = 120.65. **Still missing:
+  `dense_E60_lr08`**, which died at its final save because its snapless checkpoint
+  directory was missing (`sbatch_outputs/LM_TUNE2-*`). Rerun it after recreating the
+  directory, or accept 0.04 on the epoch-37.5 lead.
+- **L6 -- depth: flattening but not saturated (Decision L5).** L60 = 107.46 is the best
+  cell, but the last 12 layers bought only 1.7% for +24% wall clock. No lower-layer
+  starvation is visible through L60 (gap rises only +0.41 -> +0.46). Further depth is
+  low-value. **The open questions at depth are now budget and regularisation:** `L24_E60`
+  lost to `L24_E30` through memorisation (gap +0.77), so try E=15-20 and/or higher dropout
+  at L32/L48 rather than more epochs or more layers.
+- **L7 -- the depth grid ran at `D = 448`, Decision L3 settled on `D = 112`.** Repeat `L32`
+  (and ideally `L48`) at 112 before quoting `D` and depth together. A narrower head may
+  also overfit less, which is now the binding constraint.
 - **L4 -- everything is seed 42, single seed.** The *repeat* floor is now ~0.11%
   (Decision L5, two byte-identical dense runs 0.14 ppl apart), but SEED variance remains
   unmeasured and the POS floors in Part I do not transfer to a different task and metric. The
   `D = 112` vs `D = 224` difference (133.4 vs 133.1) is certainly inside it, which is why
   `D = 112` is chosen over `D = 224` -- it is the smaller of two arms that are tied, not a
-  measured winner.
+  measured winner. The `L24 -> L32` step (-0.6%, against ~4% for its neighbours) and the
+  L18-vs-dense-E60 tie also need seeds before they mean anything. Two extra seeds for L24,
+  L32, L48 and dense E60 is the cheapest way to know.
 - **L5 -- `learnedD64_bias` (`LM_torch_output_code_E10`) and `R2_randomD64`
   (`LM_torch_schedule_probe`) never produced a `loss.csv`.** The `random_code_matrix`
   `n_bits >= 63` int64 overflow that killed them is fixed; the runs were not repeated.
@@ -527,8 +694,9 @@ in the winning family. Single seed throughout.
 | `results/LM_torch_output_code_E10/` | LM, does the coded head work: dense baseline, learned D14/D28/D64, binary D14. `learnedD64_bias` has no `loss.csv` |
 | `results/LM_torch_schedule_probe/` | LM, budget and LR shape at D28: `A*` budget/warmup, `B*` peak LR, `C*` anneal shape, `R*` frozen-random controls. `R2_randomD64` never ran; `A1` and `C1` preempted at epoch 23.5 |
 | `results/LM_torch_code_width/` | LM, `D` in {14,56,112,224,448,1000} x {learned, binary} at the C2 schedule, 30 epochs. Learned `D28` is absent -- it is `C2_E30_cosine` in the schedule probe |
-| `results/LM_torch_depth/` | LM, layer count x `n_c` x peak LR at learned D448, 30 epochs, 18 cells. Decision L5. `L18_nc8_lr04` killed at epoch 7.9 |
-| `results/LM_torch_lr_budget/` | LM, peak LR x budget at D112 plus the 30-epoch dense control. Decision L4 |
+| `results/LM_torch_depth/` | LM, layer count x `n_c` x peak LR at learned D448, 30 epochs, 18 cells, plus the deeper ladder (`20260918-103308_*`: L18 refill, L32, L48, L60, `L24_E60`). Decision L5. The `20260917-205223_L18_nc8_lr04` stub (killed at epoch 7.9) is superseded. Directories without `loss.csv` are aborted submissions |
+| `results/LM_torch_lr_budget/` | LM, peak LR x budget at D112 plus dense controls at E=30 and E=60 (round 2: `20260918-*`). Decision L4. `dense_E60_lr08` crashed at epoch 37.5 on a missing checkpoint dir |
+| `results/GPT_LM_baseline/` | LM, nanoGPT baseline (`gpt_baseline_train.py`): width {64..512} x depth {6,12} x dropout {0.1,0.3}, seed 42, same windows as the LUT LM runs. Decision L6. Arm label is in the directory name and `config.txt` (`arm=`) |
 
 Each run's `config.txt` records its swept axis under `swept_*` keys and the full command;
 trust those over directory names. Preempted runs say `DUE TO PREEMPTION` in the sbatch
