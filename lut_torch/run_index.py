@@ -18,8 +18,12 @@ invoked ``lut_torch.train`` without ``--POS-task``, or ``gpt_baseline_train.py``
 while the flag that decided ``vocab_size_output`` does not.
 
 Two trainers appear here because their runs are directly comparable: same corpus, same
-``WordTokenizer``, same context size, and the same validation windows at the same seed.
+tokenizer, same context size, and the same validation windows at the same seed.
 ``engine`` records which one, so a client can say so without re-parsing the command.
+
+What is *not* comparable across runs is a raw perplexity, once BPE runs
+(``--tokenizer gpt2``, the WikiText-103 sweeps) sit in the same list as word-level ones.
+``RunInfo.headline_metric`` picks the column that is; see the note on ``METRIC_PER_WORD``.
 """
 
 import csv
@@ -33,12 +37,25 @@ TASK_POS = 'POS'
 TASK_OTHER = 'other'
 
 # Which network a run trained. Both engines write the same `config.txt` and the same
-# nine-column `loss.csv`, draw the same validation windows at the same seed, and use the
-# same WordTokenizer -- so for everything this module does they differ only by name, and
+# `loss.csv` columns, draw the same validation windows at the same seed, and take the
+# same `--tokenizer` -- so for everything this module does they differ only by name, and
 # a chat client can offer them side by side. They part company at the checkpoint, which
 # is why `engine` is carried on RunInfo rather than re-derived later.
 ENGINE_LUT = 'lut'
 ENGINE_NANOGPT = 'nanogpt'
+
+# Which column of `loss.csv` a run should be judged by.
+#
+# A perplexity is per *token*, and "token" is not one unit across these runs: the word
+# tokenizer emits one per whitespace word, GPT-2 BPE emits ~1.16 per word on this corpus.
+# Dividing the same total NLL by a larger count gives a smaller number, so ranking a BPE
+# run against a word-level one by `perplexity` hands the BPE run a discount it did not
+# earn -- the comparison measures tokenization, not modelling. The `_per_word` columns
+# exist precisely to put both on one scale: same numerator (NLL over the same text), same
+# denominator (whitespace words). They are written only where they are meaningful, which
+# is why the choice is per run and not a global setting.
+METRIC_PER_WORD = 'per_word'
+METRIC_PER_TOKEN = 'per_token'
 
 # The trainers, as they appear in the recorded command line.
 TRAIN_MODULE = 'lut_torch.train'
@@ -74,10 +91,17 @@ class RunMetrics:
     best_accuracy: Optional[float] = None
     # The same headline numbers with <unk> targets removed. <unk> is 6.9% of this corpus
     # and its single most frequent token, so the two pairs differ enough to be worth
-    # showing side by side rather than picking one.
+    # showing side by side rather than picking one. Word tokenizer only: under BPE id 0
+    # is a real token and the trainer writes NaN here, which `_to_float` turns into None.
     best_loss_no_unk: Optional[float] = None
     best_perplexity_no_unk: Optional[float] = None
     best_accuracy_no_unk: Optional[float] = None
+    # Total NLL per whitespace-delimited *word* rather than per token -- the last two
+    # columns, added 2026-10-14. The mirror image of the pair above: written only for BPE
+    # runs, NaN (-> None) for the word tokenizer, and None for every run that predates the
+    # column. A nine-column file simply has no such key and `row.get` returns None.
+    best_loss_per_word: Optional[float] = None
+    best_perplexity_per_word: Optional[float] = None
 
 
 @dataclass
@@ -104,9 +128,55 @@ class RunInfo:
     checkpoints: List[CheckpointInfo] = field(default_factory=list)
     metrics: RunMetrics = field(default_factory=RunMetrics)
 
+    @property
+    def headline_metric(self):
+        """``'per_word'`` for a BPE run, ``'per_token'`` for a word-level one.
+
+        The tokenizer decides, not the presence of the column: a BPE run that has not yet
+        written a per-word number is still a run whose per-token perplexity means
+        something different from a word run's, and saying so is the whole point.
+        """
+        # `tokenizer` defaults to 'word' when the command recorded no --tokenizer, which
+        # is what every pre-BPE run looks like. Anything else here is a sub-word scheme.
+        return METRIC_PER_TOKEN if (self.tokenizer or 'word') == 'word' else METRIC_PER_WORD
+
+    @property
+    def headline_fallback(self):
+        """True when :attr:`headline_loss` had to return a per-token number anyway.
+
+        Only a BPE run can land here -- one still on its first validation, or one from
+        before the columns existed. A client that labels the fallback "per word" is
+        understating the perplexity by the tokens-per-word ratio (~1.16x on WikiText), so
+        the flag is exposed rather than left for the caller to rediscover by comparing
+        `headline_loss` against `best_loss`.
+        """
+        return (self.headline_metric == METRIC_PER_WORD
+                and self.metrics.best_loss_per_word is None)
+
+    @property
+    def headline_loss(self):
+        if (self.headline_metric == METRIC_PER_WORD
+                and self.metrics.best_loss_per_word is not None):
+            return self.metrics.best_loss_per_word
+        return self.metrics.best_loss
+
+    @property
+    def headline_perplexity(self):
+        if (self.headline_metric == METRIC_PER_WORD
+                and self.metrics.best_perplexity_per_word is not None):
+            return self.metrics.best_perplexity_per_word
+        return self.metrics.best_perplexity
+
     def to_json(self):
         data = asdict(self)
         data['checkpoints'] = [dict(asdict(c), label=c.label) for c in self.checkpoints]
+        # `asdict` walks fields, not properties, so the headline choice has to be written
+        # in explicitly or the web UI would have to re-derive it from `tokenizer` -- and
+        # the two copies of that rule would drift.
+        data['headline_metric'] = self.headline_metric
+        data['headline_loss'] = self.headline_loss
+        data['headline_perplexity'] = self.headline_perplexity
+        data['headline_fallback'] = self.headline_fallback
         return data
 
     def checkpoint(self, kind):
@@ -248,6 +318,11 @@ def read_metrics(path):
             count = 0
             for row in reader:
                 row = {(k or '').strip(): (v or '').strip() for k, v in row.items()}
+                # Still selected on per-token loss even for a BPE run: within one run the
+                # validation windows are fixed, so tokens and words are the same counts in
+                # every row and `loss_per_word` is `loss` times a constant > 0. The argmin
+                # is therefore identical, and a run that wrote no per-word column still
+                # gets a best row.
                 loss = _to_float(row.get('loss'))
                 last_row = row
                 count += 1
@@ -272,6 +347,8 @@ def read_metrics(path):
         metrics.best_loss_no_unk = _to_float(best_row.get('loss_no_unk'))
         metrics.best_perplexity_no_unk = _to_float(best_row.get('perplexity_no_unk'))
         metrics.best_accuracy_no_unk = _to_float(best_row.get('accuracy_no_unk'))
+        metrics.best_loss_per_word = _to_float(best_row.get('loss_per_word'))
+        metrics.best_perplexity_per_word = _to_float(best_row.get('perplexity_per_word'))
     return metrics
 
 

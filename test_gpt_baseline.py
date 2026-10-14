@@ -93,12 +93,14 @@ def test_tiny_run_writes_lut_format_loss_csv():
         with open(loss_file) as f:
             lines = f.read().strip().splitlines()
         assert lines[0] == ('step, epoch, tokens, loss, perplexity, accuracy, '
-                            'loss_no_unk, perplexity_no_unk, accuracy_no_unk')
+                            'loss_no_unk, perplexity_no_unk, accuracy_no_unk, '
+                            'loss_per_word, perplexity_per_word')
         rows = [[float(x) for x in line.split(',')] for line in lines[1:]]
         # Validates at steps 0, 2, 4 (interval) -- 4 is also the final step.
         assert [int(r[0]) for r in rows] == [0, 2, 4]
         for r in rows:
-            assert len(r) == 9
+            assert len(r) == 11
+            assert math.isnan(r[9]) and math.isnan(r[10])  # word tokenizer
             assert abs(r[4] - math.exp(r[3])) / r[4] < 1e-3
         # Near-uniform at initialisation over a 14,398-word vocabulary.
         assert abs(rows[0][3] - math.log(14398)) < 0.5

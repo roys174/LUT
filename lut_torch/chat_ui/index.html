@@ -64,10 +64,16 @@
         <p class="hint">Fix it to reproduce a reply.</p>
       </div>
       <div class="field checkboxes">
-        <label><input type="checkbox" id="suppress-unk" checked> Suppress <code>&lt;unk&gt;</code></label>
-        <p class="hint">It is 6.9% of wiki2 and the corpus's most frequent token, so
-          unsuppressed sampling emits it constantly.</p>
-        <label><input type="checkbox" id="stop-at-eol"> Stop at <code>&lt;eol&gt;</code></label>
+        <!-- Both of these name a token, and only the word vocabulary has those tokens.
+             app.js hides the <unk> pair and renames the stop token for a BPE model,
+             which has no <unk> at all and ends a line with a byte inside an ordinary
+             piece. -->
+        <label id="unk-option"><input type="checkbox" id="suppress-unk" checked> Suppress <code>&lt;unk&gt;</code></label>
+        <p class="hint" id="unk-hint">It is 6.9% of wiki2 and the corpus's most frequent
+          token, so unsuppressed sampling emits it constantly.</p>
+        <p class="hint hidden" id="unk-na">This model's tokenizer encodes any text, so it
+          has no <code>&lt;unk&gt;</code> to suppress — nothing is out of vocabulary.</p>
+        <label><input type="checkbox" id="stop-at-eol"> Stop at <code id="eol-name">&lt;eol&gt;</code></label>
         <label><input type="checkbox" id="whole-transcript" checked> Continue the whole transcript</label>
         <p class="hint">Off means only your latest message is the prompt. Either way the
           model sees at most its context window of tokens.</p>
@@ -77,12 +83,13 @@
     <div id="transcript" class="transcript">
       <div class="placeholder" id="placeholder">
         <h2>A next-token model, not an assistant</h2>
-        <p>These checkpoints were trained on WikiText-2 to predict the next word. They
-          have no notion of a question, an instruction or a turn — they
+        <p>These checkpoints were trained on WikiText (2 or 103) to predict the next
+          token — a whole word on the word-vocabulary runs, a GPT-2 BPE piece on the
+          others. They have no notion of a question, an instruction or a turn — they
           <em>continue text</em>. Whatever you write becomes the prefix, and the reply is
           the continuation the model considers likely.</p>
         <p>The context window is small (32 tokens on these runs) and there is no KV
-          cache, so each generated word is a fresh forward pass over the last 32 tokens.
+          cache, so each generated token is a fresh forward pass over the last 32.
           Everything before that has genuinely fallen out of view.</p>
       </div>
     </div>

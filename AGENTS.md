@@ -63,6 +63,13 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
   `--seed`/`--testing-length` its `loss.csv` scores the same snippets as a `lut_torch` LM
   run (`test_gpt_baseline.py`). The optimizer is the transformer's own (AdamW). The script
   sweeps width x depth x dropout at seed 42; results go to `results/GPT_LM_baseline/`.
+- `prepare_wikitext103.py` -> `nanoGPT_POS/data/wiki103/`: WikiText-103 raw, GPT-2 BPE
+  `.bin` token files (full train, 2M/8M/32M-word article-aligned prefixes, val, test),
+  each with a `.bin.json` manifest. Both trainers take a `.bin` wherever they take a text
+  file, with `--tokenizer gpt2`. The val set is WikiText-2's, word for word (checked;
+  recorded in `val_gpt2.bin.json`). Decisions W1-W4 in DECISIONS.md Part III.
+  Runs: `run_files/GPT_LM_wt103_gpu.sh` (12-cell GPT data x size ladder) and
+  `run_files/torch_LM_wt103_gpu.sh` (LUT; arm 0 = smoke, arms 1-4 = wave 2).
 - `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
 - `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
 - `run_files/run_POS_one_PE_only.sh`: PE-only ablation.
@@ -70,7 +77,7 @@ Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, ove
 - `run_files/run_POS_load_smoke.sh` and `run_files/run_POS_one_load_ckpt.sh`: checkpoint-load checks/templates; inspect paths before running.
 - `run_files/run_nanoGPT_POS.sh`: PyTorch baseline. Inspect its working-directory assumptions before copying paths.
 - `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
-- `loss.csv`: `step, epoch, tokens, loss, perplexity, accuracy, loss_no_unk, perplexity_no_unk, accuracy_no_unk` (9 columns). The `_no_unk` triple scores the same predictions with `<unk>` targets excluded; nothing is masked in training, both scorings are reported. `perplexity` is exactly `exp(loss)` — but W&B's `train/perplexity` is `exp(EMA loss)` while `train/loss` is the raw last-minibatch mean, so those two panels rank runs differently.
+- `loss.csv`: `step, epoch, tokens, loss, perplexity, accuracy, loss_no_unk, perplexity_no_unk, accuracy_no_unk, loss_per_word, perplexity_per_word` (11 columns; runs before 2026-10-14 have only the first 9). The `_no_unk` triple scores the same predictions with `<unk>` targets excluded; nothing is masked in training, both scorings are reported. It is word-tokenizer only and NaN under BPE. The `_per_word` pair is the exact per-word loss for BPE runs (DECISIONS.md W2) and the headline there; it is NaN for the word tokenizer. `perplexity` is exactly `exp(loss)` — but W&B's `train/perplexity` is `exp(EMA loss)` while `train/loss` is the raw last-minibatch mean, so those two panels rank runs differently.
 
 ## Where checkpoints live
 

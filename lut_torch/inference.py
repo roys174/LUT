@@ -19,8 +19,14 @@ Three things about this model shape the whole file:
 
 * **Dropout is alive in ``train()`` mode** (``LutLayer._residual_dropout``), so the model
   must be put in ``eval()`` or every reply is sampled from a different perturbed model.
+
+A fourth thing shapes it since the WikiText-103 runs: **there are two tokenizers**, and
+nothing about the word one generalises -- not id 0, not id 1, not ``tokens_from_ids``,
+not the spacing rules. :class:`TokenizerAdapter` is the single place that difference
+lives; everything below it asks the adapter rather than assuming.
 """
 
+import codecs
 import os
 import sys
 import threading
@@ -34,7 +40,12 @@ from .modules import LutModel
 from .run_index import ENGINE_LUT, ENGINE_NANOGPT
 from .stacking import looks_unstacked, stack_state_dict
 
-# Kept in sync with data.py / word_tokenizer.py.
+# **Word-tokenizer ids**, kept in sync with data.py / word_tokenizer.py -- they are the
+# first two entries of a vocabulary file, not universal facts. Under GPT-2 BPE id 0 is
+# ``!`` and id 1 is ``"``, both ordinary tokens, so acting on these under BPE bans an
+# exclamation mark and truncates any prompt ending in a quotation mark. Nothing outside
+# the word tokenizer's own adapter may use them; they stay module-level because other
+# modules import ``UNK_TOKEN_ID``.
 UNK_TOKEN_ID = 0
 EOL_TOKEN_ID = 1
 EOL = '<eol>'
@@ -120,7 +131,15 @@ def resolve_repo_path(path):
 
 
 def load_tokenizer(tokenizer_name, vocab_file):
-    """The encoder the run was trained with. ``word`` needs its exact vocabulary file."""
+    """The raw encoder the run was trained with.
+
+    ``word`` needs its exact vocabulary file; a BPE name (``gpt2``) carries its own
+    vocabulary, so ``vocab_file`` is empty for those runs and is ignored here rather than
+    demanded. Returns the encoder itself -- :func:`make_tokenizer_adapter` is what wraps
+    it in the uniform interface the chat path uses.
+    """
+    if not tokenizer_name:
+        tokenizer_name = 'word'
     if tokenizer_name == 'word':
         from word_tokenizer import WordTokenizer
         resolved = resolve_repo_path(vocab_file)
@@ -242,13 +261,28 @@ def load_model(path, device='cpu'):
 # Decoding
 # ---------------------------------------------------------------------------
 
+def encode_bpe_prompt(enc, text):
+    """Encode ``text`` with a tiktoken encoder, verbatim.
+
+    No trimming: see :func:`encode_prompt`. BPE has no end-of-line token to strip, and a
+    newline is carried inside ordinary pieces.
+
+    ``disallowed_special=()`` turns off tiktoken's default, which *raises* when the text
+    contains a special-token spelling such as ``<|endoftext|>``. A chat box is arbitrary
+    user text, so that default would turn typing ``<|endoftext|>`` into a server error;
+    encoding it as the ordinary bytes it looks like is the only sensible reading here.
+    """
+    return [int(i) for i in enc.encode(text, disallowed_special=())]
+
+
 def encode_prompt(tokenizer, text):
     """Encode ``text`` as a prefix to be continued, not as a finished document.
 
-    ``WordTokenizer._split`` appends ``<eol>`` after every non-empty line *including the
-    last*, because it was written to encode whole corpora, where the final newline is
-    real. For a chat prompt it is not: it tells the model the sentence is over and the
-    next token starts a fresh line, and in WikiText-2 a fresh line is very often a
+    **Word tokenizer only** -- the trim below is wrong for BPE, see the end of this
+    docstring. ``WordTokenizer._split`` appends ``<eol>`` after every non-empty line
+    *including the last*, because it was written to encode whole corpora, where the final
+    newline is real. For a chat prompt it is not: it tells the model the sentence is over
+    and the next token starts a fresh line, and in WikiText-2 a fresh line is very often a
     heading. Measured on ``learnedD14_bias``, the prompt "The first game in the series
     was released in" put ``<eol>`` at 20% -- the single most likely continuation -- and
     greedy decoding answered with ``= = =``.
@@ -256,7 +290,17 @@ def encode_prompt(tokenizer, text):
     So the trailing ``<eol>`` is kept only when the user actually ended with a newline.
     The encoder emits exactly one either way (``"abc"`` and ``"abc\\n"`` both give
     ``[abc, <eol>]``), so the raw text is the only thing that can tell them apart.
+
+    This takes an adapter, a ``WordTokenizer`` or a tiktoken encoder, and dispatches,
+    because callers (and ``test_torch_chat``) hand it a raw encoder. Under BPE the trim
+    must not happen: id 1 there is ``"``, so trimming would delete the closing quotation
+    mark of every prompt that ends in one.
     """
+    if isinstance(tokenizer, TokenizerAdapter):
+        return tokenizer.encode_prompt(text)
+    if not hasattr(tokenizer, 'tokens_from_ids'):
+        # Duck-typed as "not the word tokenizer": tiktoken has no such method.
+        return encode_bpe_prompt(tokenizer, text)
     ids = [int(i) for i in tokenizer.encode(text)]
     if ids and ids[-1] == EOL_TOKEN_ID and not text.endswith('\n'):
         ids.pop()
@@ -264,7 +308,8 @@ def encode_prompt(tokenizer, text):
 
 
 class IncrementalDecoder:
-    """Stream ``WordTokenizer.decode`` one token at a time.
+    """Stream ``WordTokenizer.decode`` one token at a time. **Word tokenizer only** --
+    BPE streams through :class:`ByteStreamDecoder`, which concatenates instead.
 
     Reproduces that method's spacing rule exactly -- ``<eol>`` becomes a newline, a
     single non-alphanumeric character attaches to what precedes it, everything else takes
@@ -301,6 +346,223 @@ class IncrementalDecoder:
         return piece
 
 
+def token_bytes(enc, token_id):
+    """The raw bytes of one BPE id, or ``None`` for an id the encoder does not assign.
+
+    A model may be built with a padded ``vocab_size_input`` above the encoder's
+    ``n_vocab`` (GPT-2's is an awkward 50,257, and training pads it). Nothing bans the
+    extra ids, so sampling can emit one, and tiktoken raises ``KeyError`` for it rather
+    than returning empty bytes. Every display path has to survive that.
+    """
+    try:
+        return enc.decode_single_token_bytes(int(token_id))
+    except KeyError:
+        return None
+
+
+class ByteStreamDecoder:
+    """Stream a BPE sequence one token at a time, buffering by bytes.
+
+    Two differences from :class:`IncrementalDecoder`, both from the same fact -- a BPE
+    piece is a byte string that already carries its own leading space:
+
+    * **No spacing rules.** Rendering is plain concatenation; the word tokenizer's
+      "prepend a space unless it is punctuation" would insert spaces that are not there.
+    * **No prompt seeding.** A continuation is spaced correctly without knowing what
+      preceded it, which is exactly what ``IncrementalDecoder.continuing`` exists for.
+
+    A single UTF-8 character can span two tokens, so decoding each token's bytes on their
+    own would turn one character into two replacement characters. ``codecs``' incremental
+    decoder holds an incomplete sequence back until the byte completing it arrives, which
+    is what makes the concatenated stream equal ``decode()`` of the whole sequence. A
+    sequence left incomplete at the end stays buffered and emits nothing -- correct, and
+    also what a reply cut off mid-character should look like.
+    """
+
+    def __init__(self, enc):
+        self.enc = enc
+        self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
+
+    def feed(self, token_id):
+        return self._decoder.decode(token_bytes(self.enc, token_id) or b'')
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer adapters
+# ---------------------------------------------------------------------------
+
+class TokenizerAdapter:
+    """The tokenizer facts the chat path needs, for either tokenizer.
+
+    The chat stack was written against ``word_tokenizer.WordTokenizer`` and assumed four
+    of its properties at every call site: that id 0 is ``<unk>``, that id 1 is ``<eol>``,
+    that ``tokens_from_ids`` exists, and that displaying a token means re-deriving the
+    spacing the tokenizer discarded. Not one of the four survives GPT-2 BPE -- id 0 is
+    ``!``, id 1 is ``"``, tiktoken has no ``tokens_from_ids``, and a BPE piece carries its
+    own leading space. Two of those fail *silently* (banning ``!`` from every reply;
+    deleting the final character of any prompt that ends in a quotation mark), which is
+    why they are behind this interface rather than behind an ``if tokenizer == 'word'``
+    repeated at each site.
+
+    Implementations provide:
+
+    ``name``
+        the ``--tokenizer`` value the run was trained with.
+    ``n_vocab``
+        how many ids the encoder can produce. A model may have been built *wider* than
+        this (see :meth:`ModelCache.get`); it may not have been built narrower.
+    ``has_unk`` / ``unk_id``
+        whether an out-of-vocabulary id exists at all, and which one. False/``None`` for
+        BPE, which encodes anything -- so ``exclude_unk`` and ``suppress_unk`` have
+        nothing to act on there and must become no-ops rather than banning id 0.
+    ``pad_id``
+        the id that fills positions ``n..CS-1`` of a short window. **Any id is safe**:
+        attention is causal, so nothing after position ``n-1`` can reach the position the
+        prediction is read from, and ``test_short_prompt_ignores_padding`` checks that
+        against the model rather than trusting it.
+    """
+
+    name = ''
+    has_unk = False
+    unk_id = None
+    pad_id = 0
+
+    @property
+    def n_vocab(self):
+        raise NotImplementedError
+
+    def encode_prompt(self, text):
+        """Ids for ``text`` treated as a prefix to be continued."""
+        raise NotImplementedError
+
+    def pieces(self, ids):
+        """One display string per id, for the token strip and the top-k panel."""
+        raise NotImplementedError
+
+    def decode(self, ids):
+        """The text of a whole sequence."""
+        raise NotImplementedError
+
+    def is_newline(self, token_id):
+        """Does this token end a line? (``--stop-at-eol`` and nothing else.)"""
+        raise NotImplementedError
+
+    def stream(self, prompt_ids=()):
+        """An incremental decoder with ``.feed(token_id) -> str``, seeded so that its
+        first piece continues ``prompt_ids`` correctly."""
+        raise NotImplementedError
+
+
+class WordTokenizerAdapter(TokenizerAdapter):
+    """``word_tokenizer.WordTokenizer``: the behaviour this file had before adapters."""
+
+    name = 'word'
+    has_unk = True
+    unk_id = UNK_TOKEN_ID
+    # Padding with <unk> is what this file always did; it is arbitrary (see pad_id above)
+    # and kept only so word runs are byte-for-byte unchanged.
+    pad_id = UNK_TOKEN_ID
+
+    def __init__(self, enc):
+        self.enc = enc
+
+    @property
+    def n_vocab(self):
+        return self.enc.n_vocab
+
+    def encode_prompt(self, text):
+        return encode_prompt(self.enc, text)
+
+    def pieces(self, ids):
+        return self.enc.tokens_from_ids([int(i) for i in ids])
+
+    def decode(self, ids):
+        return self.enc.decode([int(i) for i in ids])
+
+    def is_newline(self, token_id):
+        return int(token_id) == EOL_TOKEN_ID
+
+    def stream(self, prompt_ids=()):
+        return IncrementalDecoder.continuing(self.enc, list(prompt_ids))
+
+
+class BpeTokenizerAdapter(TokenizerAdapter):
+    """A tiktoken encoder (``gpt2``), whose pieces are bytes rather than words."""
+
+    # Any id would do; 0 is "!" here and is as invisible as anything else behind causal
+    # attention.
+    pad_id = 0
+
+    def __init__(self, enc, name='gpt2'):
+        self.enc = enc
+        self.name = name
+
+    @property
+    def n_vocab(self):
+        return self.enc.n_vocab
+
+    def encode_prompt(self, text):
+        return encode_bpe_prompt(self.enc, text)
+
+    def pieces(self, ids):
+        """Per-token strings. A character split across two tokens shows as replacement
+        characters in *this* view and not in the stream, which is inherent to showing a
+        byte-level tokenizer's tokens individually, not a decoding bug."""
+        out = []
+        for i in ids:
+            raw = token_bytes(self.enc, i)
+            # An id past the encoder's table has no bytes at all; show the number so the
+            # strip stays aligned with `ids` instead of silently losing an entry.
+            out.append(raw.decode('utf-8', 'replace') if raw is not None
+                       else f'<{int(i)}>')
+        return out
+
+    def decode(self, ids):
+        # Byte-join rather than enc.decode, which raises on a padded-vocabulary id. The
+        # result is identical otherwise: tiktoken's decode is this with errors='replace'.
+        raw = b''.join(token_bytes(self.enc, i) or b'' for i in ids)
+        return raw.decode('utf-8', 'replace')
+
+    def is_newline(self, token_id):
+        # There is no <eol>: a newline is a byte inside an ordinary piece, and plenty of
+        # GPT-2 tokens carry one (e.g. b'.\n').
+        raw = token_bytes(self.enc, token_id)
+        return raw is not None and b'\n' in raw
+
+    def stream(self, prompt_ids=()):
+        return ByteStreamDecoder(self.enc)
+
+
+def make_tokenizer_adapter(tokenizer_name, vocab_file=''):
+    """The adapter for a run, from the two fields its ``config.txt`` records.
+
+    ``vocab_file`` is empty for BPE runs, which is why it is not required there.
+    """
+    name = tokenizer_name or 'word'
+    enc = load_tokenizer(name, vocab_file)
+    if name == 'word':
+        return WordTokenizerAdapter(enc)
+    return BpeTokenizerAdapter(enc, name)
+
+
+def as_tokenizer_adapter(tokenizer, name=None):
+    """Wrap a raw encoder, or pass an adapter through.
+
+    Callers that already hold an encoder (the server's tokenizer cache, the tests' stub)
+    should not have to reload one. ``tokens_from_ids`` is the discriminator: it is the
+    word tokenizer's, and tiktoken has nothing like it.
+    """
+    if isinstance(tokenizer, TokenizerAdapter):
+        return tokenizer
+    if hasattr(tokenizer, 'tokens_from_ids'):
+        return WordTokenizerAdapter(tokenizer)
+    if name in (None, '', 'word'):
+        # The object and the recorded name disagree; the object is the one that will do
+        # the decoding, so take its own name (tiktoken encoders carry one).
+        name = getattr(tokenizer, 'name', 'gpt2')
+    return BpeTokenizerAdapter(tokenizer, name)
+
+
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
@@ -332,7 +594,7 @@ def filter_logits(logits, temperature=1.0, top_k=0, top_p=1.0, banned_ids=()):
 
 
 class LutChatModel:
-    """One loaded checkpoint plus its tokenizer, wrapped for interactive use."""
+    """One loaded checkpoint plus its tokenizer adapter, wrapped for interactive use."""
 
     def __init__(self, model, cfg, args, step, tokenizer, device, checkpoint_path,
                  engine=ENGINE_LUT):
@@ -344,7 +606,10 @@ class LutChatModel:
         self.engine = engine
         self.args = args
         self.step = step
-        self.tokenizer = tokenizer
+        # Always an adapter: every id below (padding, the <unk> ban, the end-of-line
+        # stop) means something different under BPE, and nothing here may decide that
+        # for itself. A raw encoder is accepted and wrapped for callers that hold one.
+        self.tokenizer = as_tokenizer_adapter(tokenizer, args.get('tokenizer'))
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.context_size = cfg.context_size
@@ -355,13 +620,13 @@ class LutChatModel:
     # -- tokenization ------------------------------------------------------
 
     def encode(self, text):
-        return encode_prompt(self.tokenizer, text)
+        return self.tokenizer.encode_prompt(text)
 
     def decode(self, ids):
         return self.tokenizer.decode([int(i) for i in ids])
 
     def token_strings(self, ids):
-        return self.tokenizer.tokens_from_ids([int(i) for i in ids])
+        return self.tokenizer.pieces([int(i) for i in ids])
 
     # -- forward -----------------------------------------------------------
 
@@ -371,7 +636,7 @@ class LutChatModel:
         window = [int(i) for i in ids][-self.context_size:]
         if not window:
             raise ValueError('need at least one token to predict from')
-        padded = window + [UNK_TOKEN_ID] * (self.context_size - len(window))
+        padded = window + [self.tokenizer.pad_id] * (self.context_size - len(window))
         tokens = torch.tensor([padded], dtype=torch.int64, device=self.device)
         return tokens, len(window) - 1
 
@@ -385,9 +650,11 @@ class LutChatModel:
     @torch.no_grad()
     def top_next(self, ids, k=10, exclude_unk=False):
         logits = self.next_logits(ids)
-        if exclude_unk:
+        # No-op without an <unk>: under BPE there is no out-of-vocabulary id to exclude,
+        # and acting on the request anyway would blank out "!".
+        if exclude_unk and self.tokenizer.has_unk:
             logits = logits.clone()
-            logits[UNK_TOKEN_ID] = float('-inf')
+            logits[self.tokenizer.unk_id] = float('-inf')
         probs = torch.softmax(logits, dim=-1)
         values, indices = torch.topk(probs, min(k, probs.numel()))
         tokens = self.token_strings(indices.tolist())
@@ -412,8 +679,11 @@ class LutChatModel:
         generator = None
         if seed is not None:
             generator = torch.Generator(device='cpu').manual_seed(int(seed))
-        banned = (UNK_TOKEN_ID,) if suppress_unk else ()
-        decoder = IncrementalDecoder.continuing(self.tokenizer, ids)
+        # Same no-op as in top_next: `suppress_unk` is on by default because <unk> is
+        # wiki2's most frequent token, but BPE has no <unk> and id 0 there is "!".
+        banned = ((self.tokenizer.unk_id,)
+                  if suppress_unk and self.tokenizer.has_unk else ())
+        decoder = self.tokenizer.stream(ids)
 
         for _ in range(max_new_tokens):
             if should_stop is not None and should_stop():
@@ -434,7 +704,7 @@ class LutChatModel:
             token = self.token_strings([next_id])[0]
             yield {'id': next_id, 'token': token, 'text': decoder.feed(next_id),
                    'prob': probability}
-            if stop_at_eol and next_id == EOL_TOKEN_ID:
+            if stop_at_eol and self.tokenizer.is_newline(next_id):
                 return
 
     # -- description -------------------------------------------------------
@@ -457,8 +727,17 @@ class LutChatModel:
             'num_layers': cfg.n_layer if self.engine == ENGINE_NANOGPT else cfg.num_layers,
             'num_heads': cfg.n_head if self.engine == ENGINE_NANOGPT else cfg.num_heads,
             'parameters': sum(p.numel() for p in self.model.parameters()),
-            'tokenizer': self.args.get('tokenizer', 'word'),
-            'vocab_file': self.args.get('vocab_file', ''),
+            # From the adapter, not from `args`: the adapter is what the decoding path
+            # actually used, and the UI changes behaviour on `has_unk` (no <unk> toggle,
+            # no <unk> highlighting in the token strip when there is no such token).
+            'tokenizer': self.tokenizer.name,
+            'has_unk': self.tokenizer.has_unk,
+            # Only when it is the file that was actually read. A BPE run's `args` still
+            # carries argparse's default ('word_vocab.txt' -- checked on the WT103
+            # checkpoints), which nothing opened and which the UI would otherwise show
+            # beside 'gpt2' as if it had.
+            'vocab_file': (self.args.get('vocab_file', '')
+                           if isinstance(self.tokenizer, WordTokenizerAdapter) else ''),
         }
         if self.engine == ENGINE_NANOGPT:
             common.update({
@@ -509,15 +788,22 @@ class ModelCache:
                 return self._entries[path]
 
         model, cfg, args, step = load_model(path, device=self.device)
-        enc = load_tokenizer(tokenizer_name or args.get('tokenizer', 'word'),
-                             vocab_file or args.get('vocab_file', ''))
-        vocab_n = getattr(enc, 'n_vocab', None)
-        if vocab_n is not None and vocab_n != cfg.vocab_size_input:
+        adapter = make_tokenizer_adapter(tokenizer_name or args.get('tokenizer', 'word'),
+                                         vocab_file or args.get('vocab_file', ''))
+        # Only *too small* is an error. A wider model is legitimate: GPT-2's awkward
+        # 50,257 is routinely padded up for alignment (upstream nanoGPT uses 50,304;
+        # these trainers pass enc.n_vocab straight through, but a checkpoint from
+        # anywhere else may not), and the extra rows are simply never a target. Too small
+        # is the real mismatch -- the tokenizer can emit an id the model has no row for
+        # -- and the likeliest cause is the wrong vocabulary file, so say that.
+        vocab_n = adapter.n_vocab
+        if vocab_n > cfg.vocab_size_input:
             raise ValueError(
-                f"vocabulary has {vocab_n} entries but the model was trained with "
-                f"vocab_size_input={cfg.vocab_size_input}; wrong --vocab-file")
+                f"tokenizer {adapter.name!r} has {vocab_n} entries but the model was "
+                f"trained with vocab_size_input={cfg.vocab_size_input}; it cannot score "
+                f"every token this tokenizer produces (wrong --vocab-file?)")
         engine = ENGINE_NANOGPT if isinstance(cfg, GptSpec) else ENGINE_LUT
-        wrapper = LutChatModel(model, cfg, args, step, enc, self.device, path,
+        wrapper = LutChatModel(model, cfg, args, step, adapter, self.device, path,
                                engine=engine)
 
         with self._lock:

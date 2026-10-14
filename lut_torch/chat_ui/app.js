@@ -5,6 +5,14 @@
  * literally — the user's messages and the model's continuations concatenated in order —
  * and it, not the bubble list, is what gets tokenized and sent. The bubbles are only how
  * it is displayed.
+ *
+ * The second: a token is not a word, and on half these runs it is not even close. The
+ * word-vocabulary runs have an `<unk>` and report perplexity per token; the GPT-2 BPE
+ * runs have no `<unk>` at all (id 0 there is "!") and report it per word, because ~1.17
+ * BPE tokens per whitespace word would otherwise make them look 2.5x better than the
+ * word-level runs in the same list. Nothing here may assume either case: `has_unk` from
+ * /api/model and /api/tokenize decides the `<unk>` wording, and `headline_metric` from
+ * /api/runs decides what the run picker prints.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -17,6 +25,8 @@ const state = {
   lastPrompt: null,   // prompt behind the most recent reply, for Regenerate
   lastContext: null,  // state.context as it stood before that reply
   lastTurn: null,     // the DOM node that reply lives in, so Regenerate can replace it
+  tokenizer: null,    // the loaded model's tokenizer name ('word', 'gpt2', …)
+  hasUnk: true,       // does that tokenizer have an <unk>? false under BPE
   generating: false,
   controller: null,
 };
@@ -29,6 +39,10 @@ function fmt(value, digits = 4) {
 
 function fmtPct(value) {
   return (value === null || value === undefined) ? '—' : (value * 100).toFixed(1) + '%';
+}
+
+function fmtPpl(value) {
+  return (value === null || value === undefined) ? '—' : Number(value).toFixed(1);
 }
 
 function fmtSize(bytes) {
@@ -113,26 +127,58 @@ function runCard(run) {
     name.append(document.createTextNode(' '));
     name.append(badge);
   }
+  // Which vocabulary this run was trained on. It changes what every number below means,
+  // so it belongs on the card and not only in the tooltip.
+  const tokenizer = run.tokenizer || 'word';
+  const tokBadge = el('span', 'tok-badge', tokenizer);
+  tokBadge.title = tokenizer === 'word'
+    ? 'word vocabulary: ' + (run.vocab_file || '(unrecorded)')
+    : 'sub-word tokenizer: no <unk>, and perplexity below is per word, not per token';
+  name.append(document.createTextNode(' '));
+  name.append(tokBadge);
   head.append(name);
   head.append(el('span', 'seed', run.seed ? 'seed ' + run.seed : run.timestamp));
   card.append(head);
 
   const m = run.metrics || {};
   const metrics = el('div', 'metrics');
-  const add = (label, value) => {
+  const add = (label, value, title) => {
     const span = el('span', null, label + ' ');
     span.append(el('b', null, value));
+    if (title) span.title = title;
     metrics.append(span);
   };
-  add('val loss', fmt(m.best_loss));
-  add('ppl', m.best_perplexity === null || m.best_perplexity === undefined
-    ? '—' : Number(m.best_perplexity).toFixed(1));
-  add('acc', fmtPct(m.best_accuracy));
+  // A BPE run's per-token perplexity is not on the same axis as a word run's — it is the
+  // per-word number raised to 1/1.17 — so the headline the server picked is printed with
+  // its unit rather than as a bare "ppl" in a column of word-level runs. `headline_*`
+  // comes from run_index, which decides it from the tokenizer; re-deriving it here would
+  // be a second copy of that rule.
+  const perWord = run.headline_metric === 'per_word' && !run.headline_fallback;
+  add(perWord ? 'loss/word' : 'val loss', fmt(run.headline_loss),
+    perWord ? 'total validation NLL divided by whitespace-delimited words'
+      : 'mean validation NLL per token');
+  add(perWord ? 'ppl/word' : 'ppl', fmtPpl(run.headline_perplexity),
+    perWord ? 'per-word perplexity — comparable with the word-level runs in this list'
+      : 'per-token perplexity');
+  add('acc', fmtPct(m.best_accuracy), 'next-token accuracy (always per token)');
   if (m.best_epoch !== null && m.best_epoch !== undefined) {
     add('epoch', Number(m.best_epoch).toFixed(2));
   }
   card.append(metrics);
 
+  if (run.headline_metric === 'per_word') {
+    // The per-token number stays on the card: it is what the trainer printed and what
+    // W&B shows, and hiding it would just make this list disagree with those. It is
+    // labelled as not comparable instead.
+    const line = el('div', 'metrics footnote');
+    line.append(el('span', null, run.headline_fallback
+      ? 'sub-word run with no per-word column yet — the figures above are still per token'
+      : `per token: ppl ${fmtPpl(m.best_perplexity)} · loss ${fmt(m.best_loss)} — not comparable with word-level runs`));
+    card.append(line);
+  }
+
+  // Word runs only: the columns behind this are NaN for a BPE run (there is no <unk> to
+  // exclude), which run_index turns into null — so the absent value is the condition.
   if (m.best_perplexity_no_unk !== null && m.best_perplexity_no_unk !== undefined) {
     const nounk = el('div', 'metrics');
     const span = el('span', null, 'without <unk>: ppl ');
@@ -190,6 +236,12 @@ async function selectRun(runId, kind) {
       parts.push(`${(m.table_entries / 1e6).toFixed(1)}M table entries`,
         m.output_code ? `code ${m.output_code}` : 'uncoded head');
     }
+    applyTokenizer(m.tokenizer, m.has_unk);
+    parts.push(m.tokenizer === 'word' ? 'word vocab' : m.tokenizer + ' BPE');
+    // The path only when there is one: a BPE run's args still carry argparse's default
+    // vocabulary file, which nothing opened, and the server sends '' for exactly that
+    // reason. Printing it would claim a file was read that was not.
+    $('active-meta').title = m.vocab_file || '';
     parts.push(`step ${m.step.toLocaleString()}`, m.device);
     if (info.checkpoint_kind !== kind) {
       state.kind = info.checkpoint_kind;
@@ -205,6 +257,20 @@ async function selectRun(runId, kind) {
 }
 
 /* ------------------------------------------------------------- tokenizing */
+
+/* Two settings name tokens that only a word vocabulary has, and the server treats both
+ * as no-ops for a model without them. A control that does nothing must not look like one
+ * that does, so the <unk> toggle is replaced by a line saying why there is nothing to
+ * suppress, and the stop token is called what it actually is under BPE: a newline byte
+ * inside an ordinary piece, not a token named <eol>. */
+function applyTokenizer(name, hasUnk) {
+  state.tokenizer = name || 'word';
+  state.hasUnk = Boolean(hasUnk);
+  $('unk-option').classList.toggle('hidden', !state.hasUnk);
+  $('unk-hint').classList.toggle('hidden', !state.hasUnk);
+  $('unk-na').classList.toggle('hidden', state.hasUnk);
+  $('eol-name').textContent = state.tokenizer === 'word' ? '<eol>' : 'newline';
+}
 
 let tokenTimer = null;
 
@@ -238,21 +304,34 @@ async function showTokens() {
     return;
   }
   strip.textContent = '';
+  // `has_unk` and not `unk[index]` alone: the server already sends all-false under BPE,
+  // and this keeps the vocabulary wording out of the tooltips there too.
+  const hasUnk = Boolean(data.has_unk);
   data.tokens.forEach((token, index) => {
     const chip = el('span', 'tok-chip', token === '<eol>' ? '' : token);
-    if (data.unk[index]) chip.classList.add('unk');
+    const unk = hasUnk && data.unk[index];
+    if (unk) chip.classList.add('unk');
     if (token === '<eol>') chip.classList.add('eol');
     if (index < data.dropped) chip.classList.add('dropped');
     chip.title = `id ${data.ids[index]}`
-      + (data.unk[index] ? ' — not in the vocabulary' : '')
+      + (unk ? ' — not in the vocabulary' : '')
       + (index < data.dropped ? ' — outside the context window' : '');
     strip.append(chip);
   });
   strip.classList.remove('hidden');
 
   const bits = [`${data.count} tokens`];
-  if (data.unk_count) {
+  if (hasUnk && data.unk_count) {
     bits.push(`${data.unk_count} became <unk> — not in the vocabulary`);
+  } else if (!hasUnk) {
+    // Nothing can fall out of a BPE vocabulary, so the useful number from the other
+    // direction is how many pieces the text cost: it is the ratio the run's per-word
+    // perplexity divides by, and it is what makes a 32-token window shorter than it
+    // looks. Whitespace words, the same count the trainer's loss_per_word uses.
+    const words = (text.trim().match(/\S+/g) || []).length;
+    bits[0] = `${data.count} ${data.tokenizer} tokens for ${words} `
+      + `word${words === 1 ? '' : 's'}`
+      + (words ? ` (${(data.count / words).toFixed(2)} tokens per word)` : '');
   }
   if (data.dropped) {
     bits.push(`the first ${data.dropped} fall outside the ${data.context_size}-token window`);
@@ -286,7 +365,9 @@ function renderInspector(turn, start) {
   strip.style.maxHeight = '84px';
   for (const item of start.context) {
     const chip = el('span', 'tok-chip', item.token === '<eol>' ? '' : item.token);
-    if (item.id === 0) chip.classList.add('unk');
+    // The server decides this, from the run's tokenizer. Testing `item.id === 0` here
+    // was a word-vocabulary fact: id 0 under GPT-2 BPE is "!".
+    if (item.unk) chip.classList.add('unk');
     if (item.token === '<eol>') chip.classList.add('eol');
     strip.append(chip);
   }
@@ -320,7 +401,10 @@ function options(prompt) {
     temperature: Number($('temperature').value),
     top_k: Number($('top-k').value),
     top_p: Number($('top-p').value),
-    suppress_unk: $('suppress-unk').checked,
+    // The checkbox keeps its state while a BPE model is selected (switching back to a
+    // word run should not silently un-set it), but the request says false, so nothing
+    // downstream has to re-derive that there is no <unk> to ban.
+    suppress_unk: state.hasUnk && $('suppress-unk').checked,
     stop_at_eol: $('stop-at-eol').checked,
     seed: seed === '' ? null : Number(seed),
   };

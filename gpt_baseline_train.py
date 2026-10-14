@@ -7,14 +7,16 @@ The model is ``nanoGPT_POS/model.py``'s ``GPT``, unmodified. Everything around i
 borrowed from ``lut_torch.train`` rather than reimplemented, so the only thing that
 differs from a ``lut_torch`` LM run is the network:
 
-* data: ``lut_torch.data.load_datasets`` -- the same ``WordTokenizer`` stream and the same
+* data: ``lut_torch.data.load_datasets`` -- the same ``WordTokenizer`` (or tiktoken, with
+  ``--tokenizer gpt2``, text or pre-tokenized ``.bin``) stream and the same
   ``SnippetDataset`` windows (inputs ``tokens[s:s+CS]``, targets ``tokens[s+1:s+CS+1]``);
 * validation windows: drawn with Python ``random`` right after seeding, exactly as
   ``lut_torch.train.main`` draws them, so at the same ``--seed`` and ``--testing-length``
   this run and a ``lut_torch`` run score the *same* snippets (asserted in
   ``test_gpt_baseline.py``) and their ``loss.csv`` files are directly comparable;
 * metrics: ``lut_torch.train.evaluate`` -- every position scored, ``<unk>`` counted as a
-  target, plus the ``_no_unk`` scoring; same 9-column ``loss.csv``;
+  target, plus the ``_no_unk`` scoring; same 11-column ``loss.csv`` (the ``_no_unk`` triple is NaN under BPE, the
+  ``_per_word`` pair NaN under the word tokenizer);
 * schedule: ``lut_torch.train.derive_schedule`` and ``lr_lambda_factory`` -- an
   ``--epochs`` budget, ``--warmup-frac``, cosine to ``--cosine-min-lr-ratio``.
 
@@ -102,7 +104,10 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('training_data')
     p.add_argument('--validation-data', required=True)
-    p.add_argument('--vocab-file', required=True)
+    p.add_argument('--tokenizer', default='word',
+                   help="'word' (needs --vocab-file) or a tiktoken encoding name such as "
+                        "gpt2, as in lut_torch.")
+    p.add_argument('--vocab-file', default=None, help='Required for --tokenizer word.')
     p.add_argument('--context-size', type=int, default=32)
 
     g = p.add_argument_group('model (nanoGPT GPTConfig)')
@@ -180,9 +185,10 @@ def validate_args(args, parser):
     args.inverse_sqrt_alpha = 0.5
     # evaluate() reads these.
     args.lm_validate_last_position_only = False
-    # load_datasets() reads these.
+    # load_datasets() reads this.
     args.POS_task = False
-    args.tokenizer = 'word'
+    if args.tokenizer == 'word' and not args.vocab_file:
+        parser.error('--vocab-file is required for --tokenizer word')
 
 
 def resolve_runtime(args):
@@ -239,9 +245,13 @@ def main(argv=None):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    from word_tokenizer import WordTokenizer
-    enc = WordTokenizer(args.vocab_file)
-    vocab_size = enc.n_vocab
+    if args.tokenizer == 'word':
+        from word_tokenizer import WordTokenizer
+        enc = WordTokenizer(args.vocab_file)
+    else:
+        import tiktoken
+        enc = tiktoken.get_encoding(args.tokenizer)
+    vocab_size = enc.n_vocab    # 50257 for gpt2; nanoGPT's tied embedding handles it
 
     train_set, val_set = load_datasets(args, enc)
     # Immediately after load_datasets, with no Python-RNG use in between: this is the
@@ -313,7 +323,8 @@ def main(argv=None):
 
     with open(args.loss_file, 'w') as f:
         f.write('step, epoch, tokens, loss, perplexity, accuracy, '
-                'loss_no_unk, perplexity_no_unk, accuracy_no_unk\n')
+                'loss_no_unk, perplexity_no_unk, accuracy_no_unk, '
+                'loss_per_word, perplexity_per_word\n')
 
     best = {'loss': float('inf'), 'acc': float('nan'), 'step': -1, 'epoch': 0.0}
     last = {}
@@ -357,15 +368,21 @@ def main(argv=None):
             val = evaluate(model, val_set, val_starts, args, eval_cfg, device)
             ppl = math.exp(min(val['loss'], 20.0))
             ppl_nu = math.exp(min(val['loss_no_unk'], 20.0))
+            ppl_word = math.exp(min(val['loss_per_word'], 20.0))
             last = {'ppl': ppl, 'loss': val['loss'], 'acc': val['acc']}
             with open(args.loss_file, 'a') as f:
                 f.write(f"{step}, {epoch_at(step):.4f}, {step * args.tokens_per_step}, "
                         f"{val['loss']:.6f}, {ppl:.2f}, {val['acc']:.6f}, "
                         f"{val['loss_no_unk']:.6f}, {ppl_nu:.2f}, "
-                        f"{val['acc_no_unk']:.6f}\n")
-            tqdm.write(f"\n--- step {step:,} | ppl={ppl:.2f} | loss={val['loss']:.3f} | "
-                       f"acc={val['acc']:.3f} | no-unk ppl={ppl_nu:.2f} "
-                       f"acc={val['acc_no_unk']:.3f} ---")
+                        f"{val['acc_no_unk']:.6f}, "
+                        f"{val['loss_per_word']:.6f}, {ppl_word:.2f}\n")
+            msg = (f"\n--- step {step:,} | ppl={ppl:.2f} | loss={val['loss']:.3f} | "
+                   f"acc={val['acc']:.3f}")
+            if val['count_no_unk']:
+                msg += f" | no-unk ppl={ppl_nu:.2f} acc={val['acc_no_unk']:.3f}"
+            if val['words']:
+                msg += f" | ppl/word={ppl_word:.2f}"
+            tqdm.write(msg + ' ---')
             improved = val['loss'] < best['loss']
             if improved:
                 best.update(loss=val['loss'], acc=val['acc'], step=step,
@@ -382,7 +399,10 @@ def main(argv=None):
                                'val/perplexity_no_unk': ppl_nu,
                                'val/accuracy_no_unk': val['acc_no_unk'],
                                'val/scored_tokens': val['count'],
-                               'val/scored_tokens_no_unk': val['count_no_unk']})
+                               'val/scored_tokens_no_unk': val['count_no_unk'],
+                               'val/loss_per_word': val['loss_per_word'],
+                               'val/perplexity_per_word': ppl_word,
+                               'val/scored_words': val['words']})
 
         postfix = {'lr': f"{lr:.2e}", 'train_ppl': f"{math.exp(min(ema_loss, 20.0)):.1f}"}
         if last:

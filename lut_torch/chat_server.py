@@ -56,8 +56,8 @@ class ChatService:
         self._tokenizer_lock = threading.Lock()
         # Imported here so that --help and a bad --results-root fail before torch is
         # paid for (it is a multi-second import on a cold filesystem).
-        from .inference import ModelCache, load_tokenizer, resolve_device
-        self._load_tokenizer = load_tokenizer
+        from .inference import ModelCache, make_tokenizer_adapter, resolve_device
+        self._make_adapter = make_tokenizer_adapter
         self.device = resolve_device(device)
         self.cache = ModelCache(device=self.device, capacity=cache_size)
 
@@ -105,35 +105,48 @@ class ChatService:
             return run, fallback, self.cache.get(fallback.path)
 
     def tokenizer(self, run_id):
-        """The run's tokenizer alone -- no checkpoint read.
+        """The run's tokenizer adapter alone -- no checkpoint read.
 
         Tokenizing the input box on every keystroke must not depend on a gigabyte of
-        tables being resident, so this goes through the recorded ``--vocab-file`` rather
-        than through a loaded model.
+        tables being resident, so this goes through the two fields ``config.txt``
+        records rather than through a loaded model. The key keeps the vocabulary file in
+        it, so a word run still reads exactly its own vocabulary while a BPE run (whose
+        ``vocab_file`` is empty) reads none at all.
+
+        An adapter and not a raw encoder: tiktoken has no ``tokens_from_ids`` and no
+        ``<unk>``, so every caller below would otherwise have to know which tokenizer it
+        is holding.
         """
         run = self.run(run_id)
         key = (run.tokenizer or 'word', run.vocab_file)
         with self._tokenizer_lock:
             if key not in self._tokenizers:
-                self._tokenizers[key] = self._load_tokenizer(*key)
+                self._tokenizers[key] = self._make_adapter(*key)
             return self._tokenizers[key]
 
     def tokenize(self, run_id, text):
         # The same entry point generation uses, so the strip under the input box shows
         # exactly the tokens that will be sent -- trailing <eol> included or not.
-        from .inference import UNK_TOKEN_ID, encode_prompt
-
-        enc = self.tokenizer(run_id)
-        ids = encode_prompt(enc, text)
-        tokens = enc.tokens_from_ids(ids)
+        adapter = self.tokenizer(run_id)
+        ids = adapter.encode_prompt(text)
+        # Only a tokenizer that *has* an out-of-vocabulary id can produce one. Comparing
+        # against a hard-coded 0 here is what made the strip wrong under BPE, where id 0
+        # is "!" -- an ordinary token that would have been flagged as missing vocabulary
+        # (and in the frontend, counted into "N became <unk>").
+        unk = ([int(i) == adapter.unk_id for i in ids] if adapter.has_unk
+               else [False] * len(ids))
         run = self.run(run_id)
         context = run.context_size or 32
         return {
             'ids': ids,
-            'tokens': tokens,
-            'unk': [i == UNK_TOKEN_ID for i in ids],
+            'tokens': adapter.pieces(ids),
+            'unk': unk,
             'count': len(ids),
-            'unk_count': sum(1 for i in ids if i == UNK_TOKEN_ID),
+            'unk_count': sum(unk),
+            # The UI drops the <unk> wording entirely rather than reporting zero of them,
+            # so it needs the capability and not just the count.
+            'has_unk': adapter.has_unk,
+            'tokenizer': adapter.name,
             'context_size': context,
             # How many leading tokens the window throws away. Only the last `context`
             # reach the model; the UI strikes the rest through, because "the model
@@ -297,6 +310,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         context_ids = [int(i) for i in prompt_ids][-model.context_size:]
+        # Whether a context id is <unk> is the tokenizer's own answer. The inspector used
+        # to decide it with `id === 0`, which under GPT-2 BPE marks every "!" as missing
+        # vocabulary. Ask the adapter rather than restating the word vocabulary's ids
+        # here: this module should not know which id that is, only that the adapter does.
+        adapter = model.tokenizer
+        has_unk = bool(adapter.has_unk)
         with self.service.generation_lock:
             try:
                 emit({
@@ -304,7 +323,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                     'run_id': run.run_id,
                     'checkpoint_kind': ckpt.kind,
                     'prompt_tokens': len(prompt_ids),
-                    'context': [{'id': i, 'token': t}
+                    'has_unk': has_unk,
+                    'context': [{'id': i, 'token': t,
+                                 'unk': has_unk and i == adapter.unk_id}
                                 for i, t in zip(context_ids,
                                                 model.token_strings(context_ids))],
                     'top_next': model.top_next(prompt_ids, k=8,

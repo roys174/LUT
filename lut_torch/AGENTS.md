@@ -147,6 +147,12 @@ These are the things that will not raise an error but will quietly change result
 5. **The token embedding is frozen** (a buffer, not a parameter) because `main.py` never
    updates it — the embedder update is commented out in `model_backward`.
 
+6. **`SnippetDataset.tokens` keeps its input dtype**: int32 from text, or a uint16 memmap
+   from `.bin`. Only the gathered window is widened to int64, in `batch()`, so callers get
+   int64 exactly as before. Do not convert the whole stream with `np.asarray(...,
+   np.int64)`: for WT103 that is a ~1 GB copy per process, and it would load the whole
+   memmap into memory.
+
 ## Table gradients
 
 A LUT's gradient touches one row per **visit** — one per (batch, position-or-pair, tree).
@@ -335,6 +341,23 @@ on the machine you will actually train on — a shared login node gives noisy nu
   target, and `loss_no_unk`/`acc_no_unk` over the same targets with `<unk>` removed — and
   both reach `loss.csv` and W&B. Training is untouched, so nothing is committed to. Use
   the no-unk pair to compare runs; a headline perplexity is not comparable across the two.
+  **Word tokenizer only:** the triple is NaN under BPE, where id 0 is a real token (`"!"`
+  in GPT-2). `load_datasets` records this as `dataset.unk_id = None`.
+- **Pre-tokenized `.bin` input** (DECISIONS.md W3). A positional training path or
+  `--validation-data` ending in `.bin` is memory-mapped instead of read and encoded. It
+  needs a `<file>.bin.json` manifest (`format: lut-token-bin-v1`, `tokenizer`, `dtype`,
+  `n_tokens`, ...; written by `prepare_wikitext103.py`), checked by
+  `read_token_bin_manifest`: the file size must match and `tokenizer` must equal
+  `--tokenizer`. Both splits must be `.bin` or both text, and POS rejects `.bin` because it
+  needs the text. The text path is unchanged.
+- **Per-word loss for BPE** (DECISIONS.md W2: the exact version). `evaluate` returns
+  `loss_per_word` = summed NLL of every scored target / number of scored targets that
+  start a whitespace word, plus `words`. `data.WordTables` decides word starts from each
+  token's bytes: it has a non-whitespace byte AND (it starts with whitespace OR the
+  previous token, `inputs[:, i]`, ends with whitespace). Over a whole stream the count
+  equals `len(text.split())` exactly (`test_token_bin.py`). `loss.csv` has two more columns
+  at the end, `loss_per_word, perplexity_per_word`, so 11 in all; they are NaN for the word
+  tokenizer. For BPE runs, `perplexity_per_word` is the number to compare.
 - `--tree-weights` — every table (Q, K, V, Final, FFN, MHA_O, output) gets a learned weight
   per tree slot, `y = sum_t w[t] * S[trees[t], j_t]` (`lut_lookup(..., tree_weights=)`).
   Initialised to 1, so a fresh model is the unweighted one. One weight per *logical* slot,
@@ -515,6 +538,36 @@ frequent token, so unsuppressed sampling emits little else. The input tokenizer 
 there for the same reason from the other direction: the vocabulary keeps only types seen
 10+ times, and a reply that ignores half the prompt usually has that as its cause.
 
+### Two tokenizers, one chat client
+
+Everything above was written for `WordTokenizer`, and every word-vocabulary fact in it is
+false under GPT-2 BPE. The dangerous part is that they are false *quietly*:
+
+| word vocabulary | GPT-2 BPE |
+|---|---|
+| id 0 is `<unk>` | id 0 is `!` — suppressing it bans an ordinary token |
+| id 1 is `<eol>` | id 1 is `"` — the trailing-`<eol>` trim **deletes a real character** from any prompt ending in a quote |
+| `tokens_from_ids` | does not exist; tiktoken raises `AttributeError` |
+| a piece needs a leading space added | pieces already carry it (`['The', ' first', ' game']`) |
+| `enc.encode` takes anything | raises on `<|endoftext|>`, so arbitrary chat input is a 500 unless `disallowed_special=()` |
+
+So every one of those facts now lives behind `make_tokenizer_adapter()` in
+`inference.py`, and nothing outside the word adapter may act on id 0 or id 1. The adapter
+carries `has_unk`, `pad_id`, `pieces`, `encode_prompt`, `is_newline` and a `stream()`
+whose BPE implementation is a *byte*-level incremental decoder — a character split across
+two tokens (an emoji, an accented letter) must not become two replacement characters.
+
+The trailing-`<eol>` trim is still correct and still load-bearing **for the word
+tokenizer**; it is simply confined there.
+
+**Which perplexity is the headline depends on the tokenizer**, and getting this wrong
+flatters BPE runs. GPT-2 emits 1.1664 tokens per whitespace word on this corpus (measured,
+and identical across all 15 BPE runs), so a BPE run's per-token perplexity is ~2.5x rosier
+than its per-word one and is not comparable to a word-level run in the same list.
+`RunInfo.headline_metric` picks `per_word` for BPE and `per_token` for word runs, and
+`headline_fallback` says when a BPE run has not written a per-word value yet — without
+that flag a UI labels a per-token number "per word" and understates it by that ratio.
+
 ## Testing
 
 ```bash
@@ -525,6 +578,7 @@ there for the same reason from the other direction: the vocabulary keeps only ty
 .venv/bin/python test_torch_stacking.py
 .venv/bin/python test_torch_graphs.py     # skips itself without a GPU
 .venv/bin/python test_torch_chat.py       # its torch-free half runs anywhere
+.venv/bin/python test_token_bin.py        # .bin input, word-start counting, per-word loss
 ```
 
 The venv has torch but no pytest; the cluster python has pytest but no torch. The tests
@@ -799,6 +853,8 @@ path above -- only for a future custom-kernel port.
   margin source's own shape.
 - **Inference** has no entry point here. `infer_lut_pos.py` reads `main.py`'s `.npz` files
   and cannot load these checkpoints.
+- ~~The chat UI / `run_index.py` assume the word tokenizer.~~ **Fixed 2026-10-14** — see
+  "Two tokenizers, one chat client" below.
 - **Old attention** (hard and soft) is not ported. If it is ever wanted, it is the same
   primitive with three margin groups (Q, K, PE) instead of Final's two — `LutGroup` already
   covers the shape.

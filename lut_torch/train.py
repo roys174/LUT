@@ -638,8 +638,18 @@ def evaluate(model, dataset, starts, args, cfg, device):
     """Validation loss / accuracy, as a dict.
 
     Returns ``loss``/``acc`` over every scored target plus ``loss_no_unk``/``acc_no_unk``
-    over the same targets excluding ``<unk>`` (NaN for POS), and the token counts behind
-    each.
+    over the same targets excluding ``<unk>`` (NaN for POS and for BPE tokenizers, which
+    have no ``<unk>``: id 0 is a real token there), and the token counts behind each.
+
+    For BPE tokenizers it also returns ``loss_per_word`` and ``words``: the summed NLL of
+    every scored target divided by the number of scored targets that *start* a
+    whitespace-delimited word (``dataset.word_tables``; NaN/0 for the word tokenizer).
+    This is the standard tokenizer-independent conversion: the total NLL of a text does not
+    depend on how it is cut into tokens, so dividing by words instead of tokens gives a
+    per-word perplexity comparable to word-level models. The numerator includes every
+    scored token (whitespace-only ones such as "\\n" too); a token whose word began before
+    the window is still in the numerator but not the denominator, which is exact for the
+    scored targets, since the preceding token is always ``inputs`` at the same position.
 
     POS scores every valid position. Language modelling scores every position too unless
     ``--lm-validate-last-position-only`` is set, which restores ``main.py``'s
@@ -664,7 +674,10 @@ def evaluate(model, dataset, starts, args, cfg, device):
     # reported rather than one being chosen, because that choice is reversible only while
     # both have been recorded. POS is excluded: its targets are tag ids, where id 0 is
     # ADJ, not <unk> (data.py already masks POS targets whose *input* was <unk>).
-    score_no_unk = not cfg.POS_task
+    unk_id = getattr(dataset, 'unk_id', UNK_TOKEN_ID)
+    score_no_unk = not cfg.POS_task and unk_id is not None
+    tables = None if cfg.POS_task else getattr(dataset, 'word_tables', None)
+    words = 0
     loss_sum_nu = 0.0
     correct_nu = 0
     count_nu = 0
@@ -687,8 +700,11 @@ def evaluate(model, dataset, starts, args, cfg, device):
                                           reduction='sum'))
         correct += int(hit[valid].sum())
         count += int(valid.sum())
+        if tables is not None:
+            starts_word = tables.starts_word(inputs, targets)
+            words += int(starts_word[targets != IGNORE_INDEX].sum())
         if score_no_unk:
-            keep_nu = valid & (flat_targets != UNK_TOKEN_ID)
+            keep_nu = valid & (flat_targets != unk_id)
             if bool(keep_nu.any()):
                 loss_sum_nu += float(F.cross_entropy(flat[keep_nu],
                                                      flat_targets[keep_nu],
@@ -704,6 +720,8 @@ def evaluate(model, dataset, starts, args, cfg, device):
         'loss_no_unk': loss_sum_nu / count_nu if count_nu else nan,
         'acc_no_unk': correct_nu / count_nu if count_nu else nan,
         'count_no_unk': count_nu,
+        'loss_per_word': loss_sum / words if tables is not None and words else nan,
+        'words': words,
     }
 
 
@@ -837,9 +855,11 @@ def main(argv=None):
     validations = 0
 
     with open(args.loss_file, 'w') as f:
-        # The last three are LM-only and NaN for POS; see evaluate().
+        # The no_unk triple is word-tokenizer LM only and the per_word pair is BPE LM
+        # only; both are NaN otherwise. See evaluate().
         f.write('step, epoch, tokens, loss, perplexity, accuracy, '
-                'loss_no_unk, perplexity_no_unk, accuracy_no_unk\n')
+                'loss_no_unk, perplexity_no_unk, accuracy_no_unk, '
+                'loss_per_word, perplexity_per_word\n')
 
     model.train()
     ema_loss = None
@@ -912,18 +932,23 @@ def main(argv=None):
                 else float('nan')
             ppl_no_unk = (math.exp(min(val['loss_no_unk'], 20.0))
                           if val['loss_no_unk'] == val['loss_no_unk'] else float('nan'))
+            ppl_word = (math.exp(min(val['loss_per_word'], 20.0))
+                        if val['loss_per_word'] == val['loss_per_word'] else float('nan'))
             last = {'loss': val_loss, 'ppl': perplexity, 'acc': val_acc}
 
             with open(args.loss_file, 'a') as f:
                 f.write(f"{step}, {epoch_at(step):.4f}, {step * args.tokens_per_step}, "
                         f"{val_loss:.6f}, {perplexity:.2f}, {val_acc:.6f}, "
                         f"{val['loss_no_unk']:.6f}, {ppl_no_unk:.2f}, "
-                        f"{val['acc_no_unk']:.6f}\n")
+                        f"{val['acc_no_unk']:.6f}, "
+                        f"{val['loss_per_word']:.6f}, {ppl_word:.2f}\n")
             line = (f"\n--- step {step:,} | ppl={perplexity:.2f} | "
                     f"loss={val_loss:.3f} | acc={val_acc:.3f}")
             if val['count_no_unk']:
                 line += (f" | no-unk ppl={ppl_no_unk:.2f} "
                          f"acc={val['acc_no_unk']:.3f}")
+            if val['words']:
+                line += f" | ppl/word={ppl_word:.2f}"
             tqdm.write(line + ' ---')
 
             validations += 1
@@ -963,7 +988,10 @@ def main(argv=None):
                                'val/perplexity_no_unk': ppl_no_unk,
                                'val/accuracy_no_unk': val['acc_no_unk'],
                                'val/scored_tokens': val['count'],
-                               'val/scored_tokens_no_unk': val['count_no_unk']})
+                               'val/scored_tokens_no_unk': val['count_no_unk'],
+                               'val/loss_per_word': val['loss_per_word'],
+                               'val/perplexity_per_word': ppl_word,
+                               'val/scored_words': val['words']})
             pbar.set_description('Training')
 
         postfix = {'lr': f"{lr:.4f}",

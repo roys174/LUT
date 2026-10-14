@@ -246,11 +246,20 @@ and does a frozen code ever catch up), `LM_torch_lr_budget` (peak LR x budget, t
 --num-layers 32                     # or 48 -- see Decision L5. n_c stays 8
 --epochs 30                         # NOT more at depth: L24 at E=60 is worse than at E=30
 --lr-scheduler cosine --cosine-min-lr-ratio 0.01
+--lr-cooldown-frac 0.2              # applied in every Part II run (see note below)
 --warmup-frac 0.0095
 --max-learning-rate 0.00125          # x batch 32 = 0.04 effective, coded head, E>=30
 --lr-batch-scaling linear --lr-reference-batch-size 1
 --validation-interval-epochs 0.1
 ```
+
+**Note (found 2026-10-14):** the Part II scripts kept the POS template's fixed flags
+(`--lr-scheduler inverse-sqrt --lr-cooldown-frac 0.2 --warmup-steps 200 --epochs 10`) and
+appended the arm's cosine flags after them. argparse keeps the last value, so cosine,
+warmup-frac and the epoch count took effect. `--lr-cooldown-frac` was never overridden, so
+**every Part II run is cosine to 1% multiplied by a linear ramp over the last 20%**. The
+trainers print `lr_cooldown_frac = 0.2`. The block above now lists it; earlier copies
+omitted it. New scripts must pass each flag once (`run_files/torch_LM_wt103_gpu.sh` does).
 
 Best measured: **`L60_nc8_lr04` (D448) at 107.46 perplexity** (min 106.88; acc 0.2631,
 no-unk ppl 133.1), 493.5M parameters, 26.2 h. The recommended point is **`L32` at 113.53**
@@ -676,6 +685,110 @@ measured against a LUT dense head, not against a transformer. Quote it that way.
   `--table-grad sparse --cuda-graphs off`. Four cells of the *first* sweep failed the
   same way and were recorded only as "incomplete".
 - **Everything is single-seed.** Differences under ~0.003 need 3+ seeds to mean anything.
+
+---
+
+# Part III -- WikiText-103 with GPT-2 BPE (decided 2026-10-14, runs pending)
+
+Decision L6 left two questions: is the WT2 LM data-limited, and is the tokenizer part of
+the problem? This part records the decisions made before running anything, so the
+reasoning survives whatever the numbers turn out to be.
+
+## Decision W1 -- the tokenizer was not the problem, but the LM line leaves it anyway
+
+Measured on the WT2 pipeline (`d256_L12_h8_do0.3`, the 1,000 shared windows):
+
+- The source file is WikiText-2 *v1*, which is already tokenized (33,277 types, rare
+  words already `<unk>`, 2.5% of tokens). `word_tokenizer.py` tokenizes it again with
+  `<unk>|<eol>|\w+|[^\w\s]` and `min_freq 10`. That more than doubles `<unk>` (6.8% of
+  train, 8.8% of val targets), splits `@-@` / `@,@` / `@.@` into three tokens, and splits
+  `'s` into two.
+- Those artifacts are *easy* targets: `<unk>` ppl 13.2, `@` 2.8, `=` 1.4, `<eol>` 3.3,
+  together 13.4% of targets. On real words + punctuation (86.6%) the same model is at
+  **ppl 117.9**, against 81.4 overall. So the tokenizer flatters the headline. It does
+  not explain it, and it cannot explain the GPT/LUT gap, because both see the identical
+  stream.
+
+Decided:
+
+- **LM (both GPT and LUT) uses GPT-2 BPE (tiktoken `gpt2`, V = 50,257) on the *raw*
+  WikiText-103 text.** It is open-vocabulary (no `<unk>`), standard, needs no new
+  dependency, and is the only option whose vocabulary fits at WT103 scale. WikiText-native
+  word tokens were rejected: V = 267,735 at WT103 needs an adaptive softmax.
+- **POS keeps the word tokenizer unchanged.** The spaCy alignment in
+  `WordTokenizer._encode_pos` is built on it.
+- **Known interaction, set aside for now:** the LUT's input embedding is frozen random
+  vectors (`LutModel.token_embedding`), while the GPT learns its own. Under BPE the LUT
+  has to compose words from random subword vectors. A learned input embedding for the LUT
+  is a separate experiment, deliberately postponed.
+
+## Decision W2 -- the headline metric is EXACT per-word perplexity
+
+BPE perplexity is per *token* (~1.19 GPT-2 tokens per word on this text), so it is lower
+than a per-word perplexity of the same model, and it cannot be set next to word-level
+numbers. The total NLL of a text does not depend on how the text is cut into tokens, so
+dividing it by the number of words gives a tokenizer-independent per-word perplexity.
+
+**We use the exact version, computed inside `evaluate()` for every validation**, not a
+global tokens/words ratio applied afterwards:
+
+```
+loss_per_word = (sum of token NLL over all scored targets)
+              / (number of scored targets that start a word)
+```
+
+A target starts a word iff its bytes contain a non-whitespace byte AND (it begins with
+whitespace OR the previous token ends with whitespace OR it is the first token of the
+stream). Over a whole stream this count equals `len(text.split())` exactly, and a test
+asserts that. Whitespace-only tokens (`"\n"`) count in the numerator, not the
+denominator. A word that starts before a window contributes its tail tokens to the
+numerator but no word to the denominator, which is exact for the targets actually scored.
+The global-ratio alternative was rejected because 1,000 sampled windows do not have the
+corpus-average tokens/word.
+
+Consequences:
+
+- `loss.csv` gains two columns at the end, `loss_per_word, perplexity_per_word`, in both
+  trainers. They are NaN for the word tokenizer. Read BPE runs by `perplexity_per_word`.
+- The `_no_unk` triple is NaN under BPE. It used to test `target == 0`, and in GPT-2 BPE
+  id 0 is `"!"`, so leaving it on would silently drop every `!`.
+- Per-word numbers are exact *within* the BPE pipeline (GPT vs LUT, the data-size
+  ladder). Against the old WT2 word-tokenizer numbers they compare only roughly, because
+  the vocabulary, `<unk>` and text variant all differ.
+
+## Decision W3 -- pre-tokenized `.bin` input, frozen once (loader option B)
+
+`prepare_wikitext103.py` downloads `wikitext-103-raw-v1.zip` (the zip mirror, chosen over
+Hugging Face parquet to avoid a new `pyarrow` dependency). It writes raw splits, nested
+training subsets (2M / 8M / 32M words, cut at article boundaries) and uint16 GPT-2 `.bin`
+token files to `nanoGPT_POS/data/wiki103/`. Each `.bin` has a `<file>.json` manifest
+(token and word counts, source and token SHA-256, tiktoken version).
+
+Both trainers accept a `.bin` path wherever they accept a text file. `load_datasets`
+memory-maps it after validating the manifest, and the text path is unchanged. Chosen over
+encoding at startup (A: ~1.5 min and ~6 GB per job, and the token stream would depend on
+whichever tiktoken a node has) and over an automatic cache (C: 12 array jobs starting
+together race to write it). The run scripts copy both manifests into `config.txt`, so
+every run records the exact token stream it trained on.
+
+WikiText-2 and -103 share the validation articles. The prep script checks this against
+the WT2 val file and records the result in `val_gpt2.bin.json`. Same val `.bin` + same
+seed means the same windows for every run in this part.
+
+## Decision W4 -- two waves, both trainers built together
+
+One implementation pass for both trainers, then:
+
+- **Wave 1:** the GPT data-size x model-size ladder (`run_files/GPT_LM_wt103_gpu.sh`, 12
+  cells: {2M, 8M, 32M, full} x {d256/L12, d512/L12, d768/L12}, epochs 30/15/5/2 and
+  dropout 0.3/0.2/0.1/0.1 by subset). Plus a LUT L6 smoke at 0.1 epoch
+  (`run_files/torch_LM_wt103_gpu.sh` arm 0), which catches LUT pipeline problems early.
+- **Wave 2,** after wave 1 is checked: LUT `L6_2M_E30` (the WT2-sized bridge) and
+  `L6/L18/L32` for 1 epoch of full WT103 (arms 1-4). L32 is ~1-1.5 days.
+
+The question wave 1 answers: if bigger transformers start winning as data grows, WT2 was
+data-limited (Decision L6). Wave 2 asks the same of LUT depth, which at WT2 scale
+memorised (`L24_E60`).
 
 ---
 

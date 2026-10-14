@@ -50,8 +50,13 @@ LM_COMMAND = (
 POS_COMMAND = LM_COMMAND.replace('--tokenizer word', '--tokenizer word --POS-task')
 
 
-def write_run(root, sweep, name, command, loss_rows=(), checkpoints=()):
-    """Materialise a run directory the way the sbatch scripts do."""
+def write_run(root, sweep, name, command, loss_rows=(), checkpoints=(), columns=9):
+    """Materialise a run directory the way the sbatch scripts do.
+
+    ``columns`` is 9 for runs written before 2026-10-14 and 11 after, when the per-word
+    pair was added. Both have to keep parsing: the nine-column files are the entire
+    history of this project's results tree.
+    """
     run_dir = os.path.join(root, sweep, name)
     os.makedirs(run_dir, exist_ok=True)
     save_model = flag_value(split_command(command), '--save-model')
@@ -66,8 +71,11 @@ def write_run(root, sweep, name, command, loss_rows=(), checkpoints=()):
         handle.write(command + ' \n')
     if loss_rows:
         with open(os.path.join(run_dir, 'loss.csv'), 'w') as handle:
-            handle.write('step, epoch, tokens, loss, perplexity, accuracy, '
-                         'loss_no_unk, perplexity_no_unk, accuracy_no_unk\n')
+            header = ('step, epoch, tokens, loss, perplexity, accuracy, '
+                      'loss_no_unk, perplexity_no_unk, accuracy_no_unk')
+            if columns == 11:
+                header += ', loss_per_word, perplexity_per_word'
+            handle.write(header + '\n')
             for row in loss_rows:
                 handle.write(', '.join(str(v) for v in row) + '\n')
     for kind in checkpoints:
@@ -182,6 +190,79 @@ def test_read_metrics_takes_the_minimum_loss_row():
         assert abs(metrics.best_accuracy_no_unk - 0.21) < 1e-9
         # The last row is reported separately, so "best" and "where it is now" both show.
         assert metrics.last_step == 422
+    finally:
+        shutil.rmtree(root)
+
+
+BPE_COMMAND = (
+    '.venv313/bin/python -m lut_torch.train '
+    'nanoGPT_POS/data/wiki103/train_2M_gpt2.bin '
+    '--validation-data nanoGPT_POS/data/wiki103/val_gpt2.bin '
+    '--tokenizer gpt2 --context-size 32 --output-code-dim 112 '
+    '--save-model /ckpt/WT/run/model'
+)
+
+
+def test_headline_metric_follows_the_tokenizer():
+    """A BPE run's per-token perplexity is not comparable to a word run's.
+
+    GPT-2 emits ~1.1664 tokens per whitespace word on this corpus, so reading the
+    per-token column for a BPE run quietly discounts its perplexity by that factor
+    against every word-level run in the same list. The per-word pair exists to put the
+    two on one scale, and is the headline wherever it applies.
+    """
+    root = tempfile.mkdtemp()
+    try:
+        # 11 columns, BPE: the no-unk triple is NaN and the per-word pair is real.
+        bpe_dir = write_run(root, 'LM_torch_wt103', '20261014-1_L6_seed42',
+                            BPE_COMMAND.replace('/ckpt/WT/run', root + '/ck/b'),
+                            loss_rows=[(10, 0.1, 100, 5.5036, 245.57, 0.24,
+                                        'nan', 'nan', 'nan', 6.4191, 613.45)],
+                            checkpoints=('best',), columns=11)
+        # 9 columns, word: no per-word pair exists at all.
+        write_run(root, 'LM_sweep', '20260101-1_lut_seed42',
+                  LM_COMMAND.replace('/ckpt/LM/run', root + '/ck/w'),
+                  loss_rows=[(10, 0.1, 100, 4.40, 81.4, 0.29, 4.57, 96.9, 0.27)],
+                  checkpoints=('best',), columns=9)
+
+        runs = {r.tokenizer: r for r in discover_runs(root, task=TASK_LM)}
+        bpe, word = runs['gpt2'], runs['word']
+
+        assert bpe.headline_metric == 'per_word'
+        assert abs(bpe.headline_perplexity - 613.45) < 1e-9
+        # The trap: the per-token number is still there and is 2.5x rosier.
+        assert abs(bpe.metrics.best_perplexity - 245.57) < 1e-9
+        assert bpe.headline_perplexity > bpe.metrics.best_perplexity
+        # NaN under BPE must read as absent, not as zero.
+        assert bpe.metrics.best_loss_no_unk is None
+
+        assert word.headline_metric == 'per_token'
+        assert abs(word.headline_perplexity - 81.4) < 1e-9
+        # A nine-column file simply has no per-word pair.
+        assert word.metrics.best_perplexity_per_word is None
+        assert read_metrics(os.path.join(bpe_dir, 'loss.csv')).best_loss_per_word
+    finally:
+        shutil.rmtree(root)
+
+
+def test_headline_falls_back_before_the_first_per_word_row():
+    """A BPE run that has not written a per-word value yet must say so.
+
+    `headline_metric` is decided by the tokenizer but `headline_loss` falls back to
+    per-token, so without the flag a UI would label a per-token number "per word" and
+    understate perplexity by the tokens-per-word ratio.
+    """
+    root = tempfile.mkdtemp()
+    try:
+        write_run(root, 'LM_torch_wt103', '20261014-2_L6_seed42',
+                  BPE_COMMAND.replace('/ckpt/WT/run', root + '/ck/b'),
+                  loss_rows=[(0, 0.0, 0, 10.8, 49000.0, 0.0, 'nan', 'nan', 'nan',
+                              'nan', 'nan')],
+                  checkpoints=('best',), columns=11)
+        run = discover_runs(root, task=TASK_LM)[0]
+        assert run.headline_metric == 'per_word'
+        assert run.headline_fallback is True
+        assert run.headline_perplexity == run.metrics.best_perplexity
     finally:
         shutil.rmtree(root)
 
@@ -395,6 +476,83 @@ def test_encode_prompt_keeps_a_trailing_eol_only_when_asked():
     # Line breaks inside the prompt are untouched; only the last one is in question.
     assert encode_prompt(enc, 'the cat\nsat') == [2, 3, 1, 4]
     assert encode_prompt(enc, '') == []
+
+
+def _gpt2_adapter():
+    """The real GPT-2 encoder, or a skip. Nothing here is worth testing against a mock:
+    the whole point is that BPE id 0 and id 1 are ordinary tokens."""
+    _require_torch()
+    try:
+        import tiktoken  # noqa: F401
+    except ImportError:
+        skip('tiktoken is not installed on this interpreter')
+    from lut_torch.inference import make_tokenizer_adapter
+    return make_tokenizer_adapter('gpt2', '')
+
+
+def test_bpe_prompt_survives_a_trailing_quote():
+    """The word tokenizer's trailing-<eol> trim must not reach BPE.
+
+    `<eol>` is id 1 in the word vocabulary; id 1 in GPT-2 is `"`. Applying the trim to a
+    BPE prompt deletes a real character, and only for prompts that happen to end in a
+    quote -- the kind of bug that survives casual testing.
+    """
+    bpe = _gpt2_adapter()
+    import tiktoken
+
+    raw = tiktoken.get_encoding('gpt2')
+    for text in ('he said "hello"', 'The sign read "No entry"', 'no quote here'):
+        assert bpe.encode_prompt(text) == raw.encode(text), text
+    # The ids this is really about.
+    assert raw.decode([0]) == '!' and raw.decode([1]) == '"'
+
+
+def test_bpe_has_no_unk_to_suppress():
+    """Banning id 0 under BPE would ban `!`."""
+    bpe = _gpt2_adapter()
+    assert bpe.has_unk is False
+    assert bpe.unk_id is None
+    assert bpe.pieces([0]) == ['!']
+
+
+def test_bpe_prompt_tolerates_the_special_token_text():
+    """tiktoken's encode raises on `<|endoftext|>` by default.
+
+    A chat box takes arbitrary text, so the default would turn one pasted string into a
+    500 from /api/generate.
+    """
+    bpe = _gpt2_adapter()
+    import tiktoken
+
+    try:
+        tiktoken.get_encoding('gpt2').encode('a <|endoftext|> b')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('tiktoken stopped rejecting special text; revisit this')
+    assert bpe.encode_prompt('a <|endoftext|> b')
+
+
+def test_bpe_streaming_reassembles_multibyte_characters():
+    """A character split across two tokens must not become two replacement chars."""
+    bpe = _gpt2_adapter()
+    import tiktoken
+
+    raw = tiktoken.get_encoding('gpt2')
+    for text in ('The first game was released in', 'café naïve — élève 中文 😀', 'a\nb\n'):
+        ids = raw.encode(text)
+        stream = bpe.stream(())
+        assert ''.join(stream.feed(i) for i in ids) == raw.decode(ids), text
+
+
+def test_is_newline_is_tokenizer_specific():
+    bpe = _gpt2_adapter()
+    import tiktoken
+
+    raw = tiktoken.get_encoding('gpt2')
+    newline = [i for i in raw.encode('a\nb') if '\n' in raw.decode([i])]
+    assert newline and bpe.is_newline(newline[0])
+    assert not bpe.is_newline(raw.encode(' game')[0])
 
 
 def test_filter_logits_bans_and_restricts():
@@ -640,8 +798,24 @@ class _StubCheckpoint:
     path = '/ckpt/model_best.pt'
 
 
+class _StubTokenizer:
+    """The adapter surface the server actually touches.
+
+    Faithful on purpose: when this stub lacked a tokenizer, `/api/generate` had to reach
+    `has_unk` out of `describe()` and restate the word vocabulary's `<unk>` id in the
+    server. A stub that is missing part of the interface pushes that shape into the
+    production code, which is worse than the stub being slightly longer.
+    """
+
+    name = 'word'
+    has_unk = True
+    unk_id = 0
+    pad_id = 0
+
+
 class _StubModel:
     context_size = 4
+    tokenizer = _StubTokenizer()
 
     def encode(self, text):
         return [2, 3, 4] if text.strip() else []
