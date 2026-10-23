@@ -75,8 +75,13 @@ def eager_step(model, cfg, inp, tgt, batch):
     return float(total.detach()) / count, correct, count, grads
 
 
+# Hard attention's gated backward (lut_torch.functional._gate_masks) must capture too.
+HARD = dict(attention='hard', qkpe_direct_sign=False)
+
+
 @parametrize('tree_weights', [False, True])
-def test_graph_matches_eager_over_consecutive_steps(tree_weights):
+@parametrize('attention', ['new', 'hard'])
+def test_graph_matches_eager_over_consecutive_steps(tree_weights, attention):
     """The property that catches accumulate-instead-of-overwrite: it would look right on
     replay 1 and drift from replay 2 onwards."""
     if not HAS_CUDA:
@@ -84,10 +89,11 @@ def test_graph_matches_eager_over_consecutive_steps(tree_weights):
     from lut_torch.graphs import GraphedTrainStep
 
     batch = 2
-    model_e, cfg, batches = make(batch=batch, tree_weights=tree_weights)
+    extra = HARD if attention == 'hard' else {}
+    model_e, cfg, batches = make(batch=batch, tree_weights=tree_weights, **extra)
     expected = [eager_step(model_e, cfg, i, t, batch) for i, t in batches]
 
-    model_g, _, batches_g = make(batch=batch, tree_weights=tree_weights)
+    model_g, _, batches_g = make(batch=batch, tree_weights=tree_weights, **extra)
     graphed = GraphedTrainStep(model_g, batches_g[0][0], batches_g[0][1],
                                cfg.vocab_size_output, IGNORE_INDEX, batch)
     for step, ((inp, tgt), (want_loss, want_correct, want_count, want_grads)) in enumerate(

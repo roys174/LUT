@@ -55,7 +55,7 @@ def main_args_from_config(cfg):
         attn_qk_n_t=cfg.attn_qk_n_t,
         lut_comparison_mode='random',
         fp16=False,
-        new_attention=True,
+        new_attention=cfg.attention == 'new',
         new_MHA=cfg.new_MHA,
         mha_head_dim=cfg.mha_head_dim,
         weight_sharing=cfg.weight_sharing,
@@ -106,6 +106,9 @@ def table_pairs(reference, model, cfg):
         for h in range(cfg.num_heads):
             ref_head = reference.head[l][h]
             new_head = model.layers[l].heads[h]
+            if cfg.attention == 'hard':
+                yield f'head_{l}_{h}_V', ref_head.V, new_head.V
+                continue
             if not cfg.PE_only:
                 yield f'head_{l}_{h}_Q', ref_head.Q, new_head.Q
                 yield f'head_{l}_{h}_K', ref_head.K, new_head.K
@@ -148,11 +151,12 @@ def snapshot(reference, args):
             out[f'mha_o_{l}'] = reference.MHA_O[l].S.copy()
         for h in range(args.num_heads):
             head = reference.head[l][h]
-            if not args.PE_only:
-                out[f'head_{l}_{h}_Q'] = head.Q.S.copy()
-                out[f'head_{l}_{h}_K'] = head.K.S.copy()
             out[f'head_{l}_{h}_V'] = head.V.S.copy()
-            out[f'head_{l}_{h}_Final'] = head.Final.S.copy()
+            if args.new_attention:
+                if not args.PE_only:
+                    out[f'head_{l}_{h}_Q'] = head.Q.S.copy()
+                    out[f'head_{l}_{h}_K'] = head.K.S.copy()
+                out[f'head_{l}_{h}_Final'] = head.Final.S.copy()
             out[f'pe_{l}_{h}'] = head.Positional_encoding.copy()
         if args.layernorm:
             out[f'ln_attn_gamma_{l}'] = reference.ln_attn_gamma[l].copy()
@@ -195,11 +199,12 @@ def torch_grads(model, cfg):
             out[f'mha_o_{l}'] = dense_grad(layer.mha_o)
         for h in range(cfg.num_heads):
             head = layer.heads[h]
-            if not cfg.PE_only:
-                out[f'head_{l}_{h}_Q'] = dense_grad(head.Q)
-                out[f'head_{l}_{h}_K'] = dense_grad(head.K)
             out[f'head_{l}_{h}_V'] = dense_grad(head.V)
-            out[f'head_{l}_{h}_Final'] = dense_grad(head.Final)
+            if cfg.attention == 'new':
+                if not cfg.PE_only:
+                    out[f'head_{l}_{h}_Q'] = dense_grad(head.Q)
+                    out[f'head_{l}_{h}_K'] = dense_grad(head.K)
+                out[f'head_{l}_{h}_Final'] = dense_grad(head.Final)
             pe = head.positional_encoding
             out[f'pe_{l}_{h}'] = (np.zeros_like(pe.detach().numpy())
                                   if pe.grad is None else pe.grad.numpy())
@@ -255,6 +260,15 @@ CONFIGS = {
                        weight_sharing=2, comparisons_per_bit=2,
                        gradient_pair_selection='cosine-distance'),
     'lm_task': dict(POS_task=False),
+    # main.py's original hard attention (no --new-attention). Only the structures
+    # main.py has: --new-MHA, --weight-sharing and --hard-attn-n-c are torch-only
+    # extensions of it and are covered by test_torch_hard_attention.py instead.
+    'hard': dict(attention='hard'),
+    'hard_layernorm': dict(attention='hard', layernorm=True),
+    'hard_fan_in_2': dict(attention='hard', comparisons_per_bit=2),
+    'hard_freeze_pe': dict(attention='hard', freeze_PE=True, PE_init_scale=0.5),
+    'hard_one_head': dict(attention='hard', num_heads=1, n_t=6),
+    'hard_lm_task': dict(attention='hard', POS_task=False, layernorm=True),
 }
 
 
@@ -303,6 +317,8 @@ def test_construction_matches(name):
                 ref_head.Positional_encoding,
                 new_head.positional_encoding.detach().numpy(),
                 err_msg=f'PE {l},{h}')
+            if cfg.attention == 'hard':
+                continue
             np.testing.assert_array_equal(ref_head._qkpe_a_arr, new_head.qkpe_a.numpy())
             np.testing.assert_array_equal(ref_head._qkpe_b_arr, new_head.qkpe_b.numpy())
 

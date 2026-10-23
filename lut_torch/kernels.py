@@ -124,6 +124,10 @@ def supported(S_flat, trees, groups, margins, selection):
     from .functional import SELECTION_CLOSEST
     if selection != SELECTION_CLOSEST:
         return False
+    # The kernels give every group its gradient; gated groups (hard attention) are
+    # torch-path only. Their three-group shape has no _layout anyway -- this is explicit.
+    if any(getattr(g, 'gate', 'always') != 'always' for g in groups):
+        return False
     if S_flat.device.type != 'cpu' or S_flat.dtype != torch.float32:
         return False
     if trees.device.type != 'cpu':

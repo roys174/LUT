@@ -61,6 +61,25 @@ TABLE_GRAD_DENSE = 'dense'
 TABLE_GRAD_SPARSE = 'sparse'
 TABLE_GRAD_MODES = (TABLE_GRAD_AUTO, TABLE_GRAD_DENSE, TABLE_GRAD_SPARSE)
 
+# Which groups of a call receive a margin gradient at a given (batch, pair, tree) visit.
+# The new-attention tables give every group its gradient unconditionally. ``main.py``'s
+# original hard attention does not (``_attention_backward_kernel``): its query and key
+# bits compete, and only the side whose closest margin is smaller is flipped, while the
+# positional bits are flipped only when their closest margin is smaller than both.
+#
+# * ``always``      -- the default; the group's gradient is never gated.
+# * ``exclusive``   -- among all exclusive groups of a call, only the one with the
+#                      smallest ``|u|`` at its selected comparison gets the gradient. Ties go
+#                      to the *earlier* group, the same first-minimum rule as everywhere
+#                      else; list the key group before the query group to reproduce
+#                      ``main.py``'s strict ``|uQ| < |uK|``.
+# * ``conditional`` -- gets the gradient only where its ``|u|`` is strictly smaller than
+#                      every exclusive group's. Requires at least one exclusive group.
+GATE_ALWAYS = 'always'
+GATE_EXCLUSIVE = 'exclusive'
+GATE_CONDITIONAL = 'conditional'
+GATE_MODES = (GATE_ALWAYS, GATE_EXCLUSIVE, GATE_CONDITIONAL)
+
 
 # Tree-axis chunking budget, in elements of a float32 temporary (1<<24 = 64 MB).
 #
@@ -117,6 +136,8 @@ class LutGroup(NamedTuple):
         pair_index: optional ``(P,)`` gather map applied to dim 1 of the margins.  Lets a
             per-position margin tensor feed a per-pair table without the caller
             materialising the expanded ``(B, n_pairs, N_T, R)`` tensor.
+        gate: one of :data:`GATE_MODES`; which visits give this group a margin gradient.
+            Only the original hard attention gates anything.
     """
 
     n_bits: int
@@ -128,10 +149,57 @@ class LutGroup(NamedTuple):
     # by the torch backward path; only the fused-kernel backend reads these.
     pair_ptr: Optional[torch.Tensor] = None
     pair_list: Optional[torch.Tensor] = None
+    gate: str = GATE_ALWAYS
 
     @property
     def raw_count(self) -> int:
         return self.n_bits * self.fan_in
+
+
+def _is_gated(groups) -> bool:
+    return any(g.gate != GATE_ALWAYS for g in groups)
+
+
+def _check_gates(groups, selection):
+    if not _is_gated(groups):
+        return
+    for g in groups:
+        if g.gate not in GATE_MODES:
+            raise ValueError(f'unknown gate {g.gate!r}; expected one of {GATE_MODES}')
+    if not any(g.gate == GATE_EXCLUSIVE for g in groups):
+        raise ValueError('a conditional group needs at least one exclusive group')
+    if selection != SELECTION_CLOSEST:
+        # main.py's hard attention has its own cosine-distance composite backward
+        # (_attention_composite_backward_cosine); it is not ported.
+        raise NotImplementedError('gated groups support closest selection only')
+
+
+def _gate_masks(margins, groups, fallback, shape):
+    """Per-group ``(B, P, N_T)`` 0/1 masks of the visits that receive a gradient.
+
+    ``None`` for an ungated group. Each group's ``|u|`` is read at its own closest
+    comparison and taken to pair level, exactly as ``main._attention_backward_kernel``
+    compares ``all_uV[pos]``, ``all_uV[pos1]`` and ``all_uPE[pe_pos]``.
+    """
+    abs_u = []
+    for margin, group, r in zip(margins, groups, fallback):
+        u = margin.detach().gather(-1, r.unsqueeze(-1)).squeeze(-1).abs()
+        if group.pair_index is not None:
+            u = u.index_select(1, group.pair_index)
+        abs_u.append(u.expand(shape))
+
+    exclusive = [i for i, g in enumerate(groups) if g.gate == GATE_EXCLUSIVE]
+    excl_abs = torch.stack([abs_u[i] for i in exclusive])
+    winner = _first_argmin(excl_abs.movedim(0, -1))
+    smallest = excl_abs.min(dim=0).values
+
+    masks = [None] * len(groups)
+    for k, i in enumerate(exclusive):
+        masks[i] = (winner == k)
+    for i, g in enumerate(groups):
+        if g.gate == GATE_CONDITIONAL:
+            masks[i] = abs_u[i] < smallest
+    return [None if m is None else m.to(margins[0].dtype) for m in masks]
 
 
 def _gather_pairs(margins: torch.Tensor, group: LutGroup) -> torch.Tensor:
@@ -373,6 +441,8 @@ class LUTFunction(torch.autograd.Function):
                     S_j_dot = torch.matmul(S_j, grad_y.unsqueeze(-1)).squeeze(-1)
                 else:
                     S_j_dot = _rows_dot(S_flat, idx, grad_y, chunk)
+                gates = (_gate_masks(margins, groups, fallback, idx.shape)
+                         if _is_gated(groups) else [None] * n_groups)
 
                 for gi_idx, (group, margin) in enumerate(zip(groups, margins)):
                     if not needs_grad[gi_idx]:
@@ -384,7 +454,7 @@ class LUTFunction(torch.autograd.Function):
                     else:
                         grad_margins[gi_idx] = _closest_group_grad(
                             S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
-                            margin, group, fallback[gi_idx], weights)
+                            margin, group, fallback[gi_idx], weights, gates[gi_idx])
 
         grad_weights = None
         if need_weights:
@@ -400,7 +470,7 @@ class LUTFunction(torch.autograd.Function):
 
 
 def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
-                        margin, group, r, weights=None):
+                        margin, group, r, weights=None, gate=None):
     """Margin gradient for ``closest`` selection.
 
     The chosen comparison is ``argmin |u|``, which depends only on the margins, so it is
@@ -418,6 +488,8 @@ def _closest_group_grad(S_flat, trees64, n_bins, j, S_j_dot, grad_y, chunk,
     contribution = gi * _surrogate_factor(u)                             # (B, P, N_T)
     if weights is not None:  # flipping tree t's bit changes y by w[t] * delta
         contribution = contribution * weights
+    if gate is not None:
+        contribution = contribution * gate
 
     if group.pair_index is not None:
         accumulated = contribution.new_zeros(
@@ -546,6 +618,7 @@ def lut_lookup(S_flat, trees, n_bins, groups, margins,
             one. Disables the Numba kernels for the call.
     """
     _check_tree_weights(tree_weights, trees, S_flat)
+    _check_gates(groups, selection)
     return LUTFunction.apply(S_flat, trees, n_bins, tuple(groups), selection,
                              table_grad, capture, tree_weights, *margins)
 
@@ -560,23 +633,28 @@ def lut_lookup_reference(S_flat, trees, n_bins, groups, margins, capture=None,
     ``cosine-distance``, whose selection depends on the upstream gradient.
     """
     _check_tree_weights(tree_weights, trees, S_flat)
+    _check_gates(groups, SELECTION_CLOSEST)
     n_trees = trees.shape[-1]
     trees64 = _tree_rows(trees)
     weights = _tree_weights(tree_weights)
 
     with torch.no_grad():
         j, fallback = _index_and_fallback([m.detach() for m in margins], groups, n_trees)
+        gates = (_gate_masks(margins, groups, fallback, j.shape)
+                 if _is_gated(groups) else [None] * len(groups))
 
     idx = trees64 * n_bins + j
     rows = F.embedding(idx, S_flat, sparse=True)
     y = (rows if weights is None else rows * weights.unsqueeze(-1)).sum(dim=-2)
     S_j = F.embedding(idx, S_flat).detach()
 
-    for margin, group, r in zip(margins, groups, fallback):
+    for margin, group, r, gate in zip(margins, groups, fallback, gates):
         gathered = _gather_pairs(margin, group).expand(*idx.shape, group.raw_count)
         r = _gather_pairs(r, group).expand(idx.shape)
         u = gathered.gather(-1, r.unsqueeze(-1)).squeeze(-1)
         phi = 0.5 / (1.0 + torch.where(u > 0, u, -u))
+        if gate is not None:  # zero in forward either way; masks only the gradient
+            phi = phi * gate
         jbar = j ^ _flip_mask(r, group)
         delta = (F.embedding(trees64 * n_bins + jbar, S_flat).detach() - S_j)
         if weights is not None:  # zero in forward, so it carries no gradient to w

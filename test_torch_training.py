@@ -80,13 +80,14 @@ def table_grads(model):
 # Batching
 # ---------------------------------------------------------------------------
 
-def test_batch_equals_accumulated_singles():
+@parametrize('attention', ['new', 'hard'])
+def test_batch_equals_accumulated_singles(attention):
     """A batch of B must give the same gradients as B single-sequence steps averaged.
 
     This is the property that lets a real batch dimension replace main.py's
     BatchElement + SparseGradAccumulator + apply_averaged_gradients replay.
     """
-    model, cfg = make_model()
+    model, cfg = make_model(attention=attention)
     batch = 4
     rng = np.random.default_rng(2)
     inputs = rng.integers(0, cfg.vocab_size_input, (batch, cfg.context_size))
@@ -322,9 +323,10 @@ def test_best_model_path_is_a_sibling():
 # ---------------------------------------------------------------------------
 
 @parametrize('optimizer', ['sgd', 'adam'])
-def test_checkpoint_round_trip(optimizer):
+@parametrize('attention', ['new', 'hard'])
+def test_checkpoint_round_trip(optimizer, attention):
     """Saving and reloading must restore weights, optimizer, schedule and RNG."""
-    model, cfg = make_model()
+    model, cfg = make_model(attention=attention)
     args = parse_args(['--optimizer', optimizer, '--warmup-steps', '2',
                        '--max-steps', '20', '--max-learning-rate', '0.05'])
     optimizers, schedulers = build_optimizers(model, args)
@@ -347,7 +349,7 @@ def test_checkpoint_round_trip(optimizer):
         save_checkpoint(path, model, cfg, optimizers, schedulers, 3, args)
         assert os.path.exists(checkpoint_path(path))
 
-        restored, _ = make_model(seed=99)          # different init on purpose
+        restored, _ = make_model(seed=99, attention=attention)  # different init on purpose
         r_opts, r_scheds = build_optimizers(restored, args)
         step = load_checkpoint(path, restored, r_opts, r_scheds, reset_optimizer=False)
         assert step == 3

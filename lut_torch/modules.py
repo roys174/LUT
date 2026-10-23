@@ -1,4 +1,4 @@
-"""Model modules: LUT tables, the new-attention head, and the full LUT model.
+"""Model modules: LUT tables, the attention heads, and the full LUT model.
 
 Construction deliberately follows ``main.build_Model``'s RNG draw order exactly -- Python's
 ``random`` for comparison pairs, NumPy's for the embedder and PE -- so that seeding both
@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM
+from .config import ATTENTION_HARD, OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM
 from .comparisons import (
     build_random_comparison_arrays,
     causal_pair_indices,
@@ -26,6 +26,8 @@ from .comparisons import (
     random_vector,
 )
 from .functional import (
+    GATE_CONDITIONAL,
+    GATE_EXCLUSIVE,
     TABLE_GRAD_AUTO,
     LutGroup,
     lut_lookup,
@@ -354,6 +356,85 @@ class NewAttentionHead(nn.Module):
         return out.index_add_(1, self.tok_i, y_pairs)
 
 
+class HardAttentionHead(nn.Module):
+    """``main.py``'s original hard attention head (``AttentionHead.V``).
+
+    One table per head, indexed per causal pair ``(i, j < i)`` and per tree by::
+
+        row = jV[i] << (n_c + pd)  |  jV[j] << pd  |  jPE[i - j]
+
+    ``jV`` is the head's own comparison bits of the layer input, read at the query position
+    ``i`` and at the key position ``j`` -- one set of comparisons serves both sides.
+    ``jPE`` is the sign pattern of a learned ``(CS, N_T, pd)`` positional encoding at the
+    relative offset. The output at ``i`` is the plain sum over every ``j < i`` (no softmax,
+    no normalisation), so position 0 receives nothing.
+
+    The gradient is not three independent groups. ``main._attention_backward_kernel``
+    flips only the query bit *or* the key bit, whichever closest margin is smaller (ties to
+    the key), and flips the PE bit in addition only when its margin is smaller than both.
+    That is the ``exclusive`` / ``conditional`` gating in :mod:`lut_torch.functional`, with
+    the key group listed before the query group so first-minimum tie-breaking matches.
+
+    Extensions with no ``main.py`` counterpart (``test_torch_parity.py`` cannot check
+    them): ``--new-MHA`` narrows the table to ``embedding_dim / num_heads``,
+    ``--weight-sharing`` shares its physical trees as it does Final's, and
+    ``--hard-attn-n-c`` decouples its per-side bits from ``n_c``.
+    """
+
+    def __init__(self, cfg, name, frozen_pe=None):
+        super().__init__()
+        self.cfg = cfg
+        self.name = name
+        n_bits = cfg.hard_attn_bits
+
+        # Draw order mirrors main.build_Model's hard branch: PE, then the table.
+        if frozen_pe is not None:
+            pe = np.broadcast_to(np.asarray(frozen_pe, dtype=np.float32)[:, None, :],
+                                 (cfg.context_size, cfg.n_t, cfg.positional_dim)).copy()
+        else:
+            pe = random_vector(cfg.context_size * cfg.n_t * cfg.positional_dim,
+                               1.0).reshape(cfg.context_size, cfg.n_t, cfg.positional_dim)
+        self.positional_encoding = nn.Parameter(
+            torch.tensor(pe, dtype=torch.float32), requires_grad=not cfg.freeze_PE)
+
+        self.V = LUTTable(f'{name}_V', cfg.n_t, n_bits, cfg.comparisons_per_bit,
+                          cfg.hard_attn_total_n_c, cfg.head_value_dim, cfg.embedding_dim,
+                          s_n_t=cfg.final_n_t,
+                          trees=final_tree_map(cfg.final_n_t, cfg.final_share_m),
+                          tree_weights=cfg.tree_weights)
+
+        tok_i, tok_j = causal_pair_indices(cfg.context_size)
+        self.register_buffer('tok_i', torch.tensor(tok_i))
+        self.register_buffer('tok_j', torch.tensor(tok_j))
+        self.register_buffer('pe_pos', torch.tensor(tok_i - tok_j))
+
+    def forward(self, x, selection, capture=None):
+        cfg = self.cfg
+        n_bits = self.V.n_c
+        pd = cfg.positional_dim
+        margins = self.V.margins(x)                               # (B, CS, N_T, R)
+        pe = self.positional_encoding.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+
+        groups = [
+            LutGroup(n_bits=n_bits, fan_in=self.V.fan_in, bit_offset=pd,
+                     pair_index=self.tok_j, gate=GATE_EXCLUSIVE),            # key
+            LutGroup(n_bits=n_bits, fan_in=self.V.fan_in, bit_offset=n_bits + pd,
+                     pair_index=self.tok_i, gate=GATE_EXCLUSIVE),            # query
+            LutGroup(n_bits=pd, fan_in=1, bit_offset=0,
+                     pair_index=self.pe_pos, gate=GATE_CONDITIONAL),         # PE
+        ]
+        entry = {} if capture is not None else None
+        y_pairs = lut_lookup(self.V.S_flat, self.V.trees, self.V.n_bins, groups,
+                             [margins, margins, pe], selection=selection,
+                             table_grad=cfg.table_grad, capture=entry,
+                             tree_weights=self.V.tree_weights)
+        if capture is not None:
+            capture[self.V.name] = entry
+
+        out = x.new_zeros(x.shape[0], cfg.context_size, cfg.head_value_dim)
+        return out.index_add_(1, self.tok_i, y_pairs)
+
+
 class StackedHeads(nn.Module):
     """All of a layer's attention heads, executed as 4 LUT calls instead of ``4 * H``.
 
@@ -620,8 +701,10 @@ class LutLayer(nn.Module):
         if self.stacked:
             self.heads = StackedHeads(cfg, index, frozen_pe)
         else:
+            head_cls = (HardAttentionHead if cfg.attention == ATTENTION_HARD
+                        else NewAttentionHead)
             self.heads = nn.ModuleList([
-                NewAttentionHead(cfg, f'head_{index}_{h}', frozen_pe)
+                head_cls(cfg, f'head_{index}_{h}', frozen_pe)
                 for h in range(cfg.num_heads)
             ])
 
@@ -689,9 +772,12 @@ class LutModel(nn.Module):
 
         frozen_pe = None
         if cfg.freeze_PE:
+            # main.build_Model: hard attention freezes a (CS, positional_dim) pattern
+            # shared by every tree; new attention one of width attn_qk_dim.
+            pe_dim = (cfg.positional_dim if cfg.attention == ATTENTION_HARD
+                      else cfg.attn_qk_dim)
             frozen_pe = initialize_positional_encoding(
-                (cfg.context_size, cfg.attn_qk_dim), cfg.PE_init_scale,
-                cfg.positional_dim)
+                (cfg.context_size, pe_dim), cfg.PE_init_scale, cfg.positional_dim)
 
         self.layers = nn.ModuleList([
             LutLayer(cfg, l, frozen_pe) for l in range(cfg.num_layers)

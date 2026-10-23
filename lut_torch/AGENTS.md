@@ -12,7 +12,8 @@ treat the parity suite as a contract rather than a formality.
 ## What this is
 
 `lut_torch/` is a PyTorch implementation of the LUT (look-up table) model — the
-`--new-attention` / `--new-MHA` architecture — for POS tagging and plain next-token LM.
+`--new-attention` / `--new-MHA` architecture, plus `main.py`'s original hard attention
+(`--attention hard`, see "Hard attention") — for POS tagging and plain next-token LM.
 It exists so that torch owns autograd, optimizers, schedulers and checkpointing, leaving
 us to own only the part that is genuinely custom: how a LUT lookup differentiates.
 
@@ -24,7 +25,7 @@ this package deliberately dropped.
 | File | What lives in it |
 |---|---|
 | `functional.py` | **The only custom autograd.** `LUTFunction`, `lut_lookup`, `LutGroup`, and the pure-autograd oracle `lut_lookup_reference`. Read this first. |
-| `modules.py` | `LUTTable`, `NewAttentionHead`, `StackedHeads`, `LutLayer`, `LutModel`. Construction order mirrors `main.build_Model` exactly. |
+| `modules.py` | `LUTTable`, `NewAttentionHead`, `HardAttentionHead`, `StackedHeads`, `LutLayer`, `LutModel`. Construction order mirrors `main.build_Model` exactly. |
 | `comparisons.py` | a/b comparison-pair construction and PE init, RNG-order-faithful to `main.py`. |
 | `config.py` | `LutConfig`: structural flags, validation, derived fields. |
 | `data.py` | Tokenizer/POS loading (shares `main.py`'s cache filenames), `.bin` token files, window batching. |
@@ -102,6 +103,11 @@ A `LutGroup` is one contiguous run of row bits fed by one margin source.
 - Margin tensors are `(B, P_src, N_T, n_bits*fan_in)`; a tree axis of size 1 means the
   margins are shared across trees and will broadcast. `--qkpe-direct-sign` uses that, and
   it is a large memory saving.
+- `gate` (default `always`) decides which visits give a group its margin gradient. Only
+  hard attention sets it: its query and key groups are `exclusive` (only the smaller
+  closest-`|u|` one is flipped, ties to the earlier-listed group) and its PE group is
+  `conditional` (flipped only when its `|u|` is below every exclusive group's). Gated
+  calls run on the torch path only (no Numba kernel, no `cosine-distance`).
 
 ## Invariants you can break silently
 
@@ -256,6 +262,9 @@ Full measurements and history: `PERFORMANCE.md`.
   momentum but **no weight decay** (decay pulls towards 0, not 1). A weighted call never
   reaches the Numba kernels. Off by default; checkpoints without `tree_weights` keys will
   not load into a model built with it.
+- `--attention {new,hard}` / `--hard-attn-n-c N` — see "Hard attention". **Leaving out
+  `--new-attention` does not select hard attention here**, unlike `main.py`; a replayed
+  `results/POS/` (May 2026) command needs `--attention hard` added explicitly.
 - `--lut-comparison-mode` accepts only `random`; it exists so `main.py` commands port over.
 - `--device {cpu,cuda,cuda:N,auto}` — `--kernels` is silently a no-op on GPU.
 - `--stack-heads {auto,on,off}` — run a layer's heads as 4 `lut_lookup` calls instead of
@@ -295,10 +304,42 @@ Full measurements and history: `PERFORMANCE.md`.
 **Pass each flag once in run scripts.** argparse keeps the last value silently; the LM
 Part II scripts inherited `--lr-cooldown-frac 0.2` from the POS template this way.
 
-**Not carried over** (still available in `main.py`): old hard attention, `--soft-attention`,
+**Not carried over** (still available in `main.py`): `--soft-attention`,
 `--factored-output`, `--fp16`, `no-overlap`/`overlap` comparison modes,
 `--halve-lr-at-20k-40k`, `--save-multiple-checkpoints`, and the `LUTUpdateStats`
 instrumentation.
+
+## Hard attention
+
+`--attention hard` is `main.py`'s original attention (what it runs without
+`--new-attention`), as `HardAttentionHead`. One table per head, indexed per causal pair and
+tree by `jV[i] << (n_c+pd) | jV[j] << pd | jPE[i-j]`: the head's own comparison bits of the
+layer input at the query and at the key position (one set of comparisons serves both),
+plus the sign pattern of a learned `(CS, n_t, pd)` PE at the offset. The output at `i` is
+the plain, unnormalised sum over `j < i`. Its backward is the gated three-group call
+described under "Groups"; the key group is listed first so a tie flips the key, as
+`main._attention_backward_kernel`'s strict `|uQ| < |uK|` does.
+
+- **Parity.** `test_torch_parity.CONFIGS` has `hard*` entries (layernorm, fan-in 2, frozen
+  PE, one head, LM task) pinned to `main.py` exactly like the new-attention ones.
+- **Size.** The table has `2**(2*n_c + pd)` rows — 21 bits at the production `n_c 8, pd 5`,
+  ~34 GB per head at `n_t 64, emb 64`. `LutConfig` refuses more than 24 bits. Size it with:
+  - `--hard-attn-n-c N`: per-side bits for this table only (default `n_c`, as in `main.py`);
+  - `--new-MHA`: table width `embedding_dim / num_heads` plus an `MHA_O` table, as for new
+    attention;
+  - `--weight-sharing N`: shares the table's physical trees, as it does Final's.
+
+  None of the three exists in `main.py`, so parity cannot check them;
+  `test_torch_hard_attention.py` pins them against the pure-autograd oracle instead.
+- **Not supported with it:** `--stack-heads` (`auto` leaves it off; there is one table per
+  head, so there is little to stack), `--gradient-pair-selection cosine-distance` (`main.py` has a
+  composite cosine backward for it that is not ported), `--PE-only`, `--qkpe-direct-sign`,
+  `--normalize-qk`. All are refused by `LutConfig`, not silently ignored.
+- `--freeze-PE` uses `main.py`'s hard-attention form: a `(CS, pd)` pattern shared by every
+  tree.
+- Checkpoints carry `attention` in their stored config, so `inference.py` and
+  `compare_run_validation.py` rebuild these models unchanged; a checkpoint written before
+  the flag existed has no `attention` key and loads as `new`, which is what it was.
 
 ## Training recipes
 
@@ -409,6 +450,7 @@ on this corpus, so a BPE run's per-token perplexity is ~2.5x rosier than its per
 .venv/bin/python test_torch_stacking.py
 .venv/bin/python test_torch_graphs.py       # skips itself without a GPU
 .venv/bin/python test_torch_output_code.py
+.venv/bin/python test_torch_hard_attention.py
 .venv/bin/python test_torch_chat.py         # its torch-free half runs anywhere
 .venv/bin/python test_token_bin.py          # .bin input, word-start counting, per-word loss
 .venv/bin/python test_gpt_baseline.py       # GPT baseline shares windows/evaluate with lut_torch
@@ -422,12 +464,13 @@ import `parametrize`/`run_all` from `_testing.py` so they run under either
 | Suite | What it pins down |
 |---|---|
 | `test_torch_lut_primitive` | the primitive against `main.py`'s own kernels, plus `LUTFunction` vs `lut_lookup_reference` |
-| `test_torch_parity` | whole-model step equality with `main.py` across 17 configurations |
+| `test_torch_parity` | whole-model step equality with `main.py` across 23 configurations |
 | `test_torch_training` | batch equivalence, LR schedule vs `main.get_learning_rate`, checkpoint resume, evaluation |
 | `test_torch_kernels` | the fused Numba backend against the torch path, both layouts |
 | `test_torch_stacking` | stacked heads vs unstacked: exact forward, exact single-layer gradients, float32-epsilon bound deeper, call-count reduction, checkpoint conversion |
 | `test_torch_graphs` | CUDA-graph replay vs eager over *consecutive* steps, dropout redraw, and the zero_grad misuse guard |
 | `test_torch_output_code` | coded output head: the linear-readout equivalence, code construction, default head unchanged |
+| `test_torch_hard_attention` | gated groups vs the oracle and vs a hand transcription of `main.py`'s gating rule; hard-attention extensions (`--new-MHA`, `--weight-sharing`, `--hard-attn-n-c`) vs the oracle; config refusals |
 | `test_torch_chat` | run discovery, LM/POS classification, engine detection, incremental decoding, sampling filters, the causal-padding assumption, checkpoint-kind dispatch, server routes |
 | `test_token_bin` | `.bin` manifests and memmap loading, word-start counting, per-word loss |
 | `test_gpt_baseline` | the GPT baseline scores the same windows as a `lut_torch` run at the same seed |
@@ -500,6 +543,7 @@ direction (`PERFORMANCE.md`).
 - **POS inference tools** (`infer_lut_pos.py`, the `analyze_*` / `compare_*` scripts) read
   `main.py`'s `.npz` files and cannot load these `.pt` checkpoints, except
   `compare_run_validation.py`, which reads both. LM sampling is in `inference.py`.
-- **Old attention** (hard and soft) is not ported. If it is ever wanted, it is the same
-  primitive with three margin groups (Q, K, PE) instead of Final's two — `LutGroup` already
-  covers the shape.
+- **Soft attention** is not ported. It would reuse hard attention's gated Q/K/PE groups
+  for a scalar Score table, plus a plain Value table and a torch softmax.
+- **Hard attention has no update statistics** beyond the `capture` hook (its table is
+  captured as `head_{l}_{h}_V`, `main.py`'s stats name for it).

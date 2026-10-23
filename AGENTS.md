@@ -51,8 +51,9 @@ torch owns autograd, optimizers, schedulers and checkpointing; `main.py` stays u
 as the reference the parity suite measures against. **`lut_torch/AGENTS.md` is
 authoritative for that codebase** (design, silent invariants, flags, parity contract), and
 `lut_torch/PERFORMANCE.md` holds its runtime/memory measurements. Its checkpoints are `.pt`
-files that only `compare_run_validation.py` among the analysis tools can read.
-Not ported (still in `main.py`): old hard attention, `--soft-attention`, `--factored-output`, `--fp16`,
+files that only `compare_run_validation.py` among the analysis tools can read. The original
+hard attention is ported as `--attention hard` (`lut_torch/AGENTS.md`, "Hard attention").
+Not ported (still in `main.py`): `--soft-attention`, `--factored-output`, `--fp16`,
 `no-overlap`/`overlap` modes, `--halve-lr-at-20k-40k`, `--save-multiple-checkpoints`, and
 `LUTUpdateStats`.
 
@@ -305,7 +306,7 @@ So:
 The port is equivalent to `main.py`, not better. The evidence, at three levels:
 
 - **One step, exactly.** `test_torch_parity.py` asserts identical construction, logits,
-  loss, every gradient, and tables after one SGD step at batch 1, across 17 configurations
+  loss, every gradient, and tables after one SGD step at batch 1, across 23 configurations
   (`lut_torch/AGENTS.md`, "The parity contract").
 - **A full trained run, on the same windows.** The first `lut_torch` GPU run
   (`results/POS_torch_gpu/20260906-142646_torch_gpu_WS8_bs1_sgd`) looked better than the

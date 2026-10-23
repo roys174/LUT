@@ -2,8 +2,9 @@
 
 Mirrors the validation in ``main.main`` plus ``configure_new_mha`` /
 ``configure_weight_sharing`` / ``configure_lut_comparison_mode``, minus everything this
-port dropped (fp16, factored output, soft/old attention, no-overlap and overlap
-comparison layouts, the Numba/thread-pool knobs).
+port dropped (fp16, factored output, soft attention, no-overlap and overlap comparison
+layouts, the Numba/thread-pool knobs). ``main.py``'s original hard attention is available
+as ``attention='hard'``.
 
 Keeping this separate from the trainer's argparse namespace means the model can be built
 from a plain :class:`LutConfig` in tests without going through a CLI.
@@ -34,6 +35,19 @@ OUTPUT_CODE_RANDOM = 'random'
 OUTPUT_CODE_MODES = (OUTPUT_CODE_LEARNED, OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM)
 OUTPUT_CODE_FROZEN = (OUTPUT_CODE_BINARY, OUTPUT_CODE_RANDOM)
 
+# Which attention mechanism the heads use. ``new`` is main.py's --new-attention
+# (Q/K/V/Final). ``hard`` is main.py's original attention -- what it runs when
+# --new-attention is absent: one table per head indexed by (query bits, key bits, PE bits)
+# of every causal pair. See OldAttentionHead.
+ATTENTION_NEW = 'new'
+ATTENTION_HARD = 'hard'
+ATTENTION_MODES = (ATTENTION_NEW, ATTENTION_HARD)
+
+# The hard-attention table has 2 ** (2 * n_c + positional_dim) rows, so its size explodes
+# with n_c. Refuse configurations whose row index alone needs more bits than this; at 24
+# bits a single tree of a 16-wide table is already 1 GiB.
+HARD_ATTN_MAX_TOTAL_BITS = 24
+
 
 @dataclass
 class LutConfig:
@@ -55,6 +69,10 @@ class LutConfig:
     attn_qk_n_t: int = 64
 
     # --- architecture ---
+    attention: str = ATTENTION_NEW
+    # Learned bits per side (query and key) of the hard-attention table; None uses n_c,
+    # which is what main.py does. Its row index is 2 * hard_attn_n_c + positional_dim bits.
+    hard_attn_n_c: Optional[int] = None
     new_MHA: bool = False
     weight_sharing: Optional[int] = None
     # Run a layer's heads as 4 stacked LUT calls instead of 4*H separate ones. Purely a
@@ -123,6 +141,12 @@ class LutConfig:
     def validate(self):
         if self.n_c < 1:
             raise ConfigError('n_c must be at least 1')
+        if self.attention not in ATTENTION_MODES:
+            raise ConfigError(f'attention must be one of {ATTENTION_MODES}')
+        if self.attention == ATTENTION_HARD:
+            self._validate_hard_attention()
+        elif self.hard_attn_n_c is not None:
+            raise ConfigError('hard_attn_n_c requires attention=hard')
         if self.attn_qk_n_c < 1:
             raise ConfigError('attn_qk_n_c must be at least 1')
         if self.comparisons_per_bit < 1:
@@ -178,9 +202,37 @@ class LutConfig:
             # Padding the index expansion with its own high bits would give constant
             # columns instead, which only shift every logit equally and cancel.
 
+    def _validate_hard_attention(self):
+        if self.hard_attn_n_c is not None and self.hard_attn_n_c < 1:
+            raise ConfigError('hard_attn_n_c must be at least 1')
+        # These all act on the new-attention Q/K/PE path, which hard attention lacks.
+        for flag in ('PE_only', 'qkpe_direct_sign', 'normalize_qk'):
+            if getattr(self, flag):
+                raise ConfigError(f'{flag} requires attention=new')
+        if self.gradient_pair_selection != SELECTION_CLOSEST:
+            raise ConfigError('attention=hard supports closest gradient-pair selection '
+                              'only (main.py\'s cosine-distance variant is not ported)')
+        if self.stack_heads:
+            raise ConfigError('stack_heads applies to attention=new only')
+        if self.hard_attn_total_n_c > HARD_ATTN_MAX_TOTAL_BITS:
+            raise ConfigError(
+                f'the hard-attention table needs 2 * {self.hard_attn_bits} + '
+                f'{self.positional_dim} = {self.hard_attn_total_n_c} row bits, more than '
+                f'{HARD_ATTN_MAX_TOTAL_BITS}; lower hard_attn_n_c or positional_dim')
+
+    @property
+    def hard_attn_bits(self):
+        """Learned bits per side (query, key) of the hard-attention table."""
+        return self.n_c if self.hard_attn_n_c is None else self.hard_attn_n_c
+
+    @property
+    def hard_attn_total_n_c(self):
+        """Row-index width of the hard-attention table: query, key, then PE bits."""
+        return 2 * self.hard_attn_bits + self.positional_dim
+
     @property
     def head_value_dim(self):
-        """Output width of one attention head's V and Final tables."""
+        """Output width of one attention head's V and Final (or hard-attention) table."""
         return self.mha_head_dim
 
     @property

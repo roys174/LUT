@@ -35,7 +35,14 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from .config import OUTPUT_CODE_MODES, ConfigError, LutConfig
+from .config import (
+    ATTENTION_HARD,
+    ATTENTION_MODES,
+    ATTENTION_NEW,
+    OUTPUT_CODE_MODES,
+    ConfigError,
+    LutConfig,
+)
 from .data import IGNORE_INDEX, UNK_TOKEN_ID, load_datasets
 from .graphs import GraphedTrainStep
 from .kernels import KERNEL_BACKEND_MODES, set_kernel_backend, set_kernel_threads
@@ -62,7 +69,7 @@ LR_BATCH_SCALING_MODES = ('none', 'linear', 'sqrt')
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description='Train the torch LUT model (new attention / new MHA).')
+        description='Train the torch LUT model (new or original hard attention).')
 
     # data / task
     p.add_argument('training_data', type=str)
@@ -92,7 +99,18 @@ def build_parser():
 
     # architecture / ablations
     p.add_argument('--new-attention', action='store_true',
-                   help='Accepted for command-line compatibility; always on here')
+                   help="Accepted for command-line compatibility. Unlike main.py, "
+                        "leaving it out does NOT select the original attention here; "
+                        "use --attention hard for that")
+    p.add_argument('--attention', choices=list(ATTENTION_MODES), default=ATTENTION_NEW,
+                   help="'new': Q/K/V/Final (main.py --new-attention). 'hard': "
+                        "main.py's original attention, one table per head indexed by "
+                        "query, key and PE bits of every causal pair. Its table has "
+                        "2**(2*n_c + positional-dim) rows -- size it with "
+                        "--hard-attn-n-c")
+    p.add_argument('--hard-attn-n-c', dest='hard_attn_n_c', type=int, default=None,
+                   help='Learned bits per side (query, key) of the hard-attention table; '
+                        'default --n-c, as in main.py')
     p.add_argument('--new-MHA', '--new-mha', dest='new_MHA', action='store_true')
     p.add_argument('--weight-sharing', type=int, default=None)
     p.add_argument('--PE-only', dest='PE_only', action='store_true')
@@ -766,8 +784,11 @@ def main(argv=None):
     use_graphs = resolve_cuda_graphs(args, device, parser)
     # A single head has nothing to stack, so 'auto' leaves it alone rather than paying
     # for the reshapes that make the stacked layout work.
+    # Stacking exists for the new-attention Q/K/V/Final heads; a hard-attention head is a
+    # single table, so 'auto' leaves it off there.
     args.stack_heads = (args.stack_heads_mode == 'on'
-                        or (args.stack_heads_mode == 'auto' and args.num_heads > 1))
+                        or (args.stack_heads_mode == 'auto' and args.num_heads > 1
+                            and args.attention != ATTENTION_HARD))
 
     try:
         cfg = LutConfig.from_namespace(args)
