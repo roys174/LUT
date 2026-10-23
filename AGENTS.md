@@ -6,91 +6,30 @@ Read this before changing this directory, especially `main.py`. This is research
 
 This is a NumPy/Numba lookup-table (LUT) language model derived from the SNN/LUT transformer idea. `main.py` is the original implementation and supports next-token language modeling and part-of-speech (POS) prediction. `lut_torch/` is a PyTorch port of the current architecture that reproduces `main.py` exactly (see "The `lut_torch/` PyTorch Port"). `nanoGPT_POS/` is the transformer POS baseline.
 
-The active branch is ahead of `main` by a long experiment series. The progression was roughly:
-
-1. Vectorize and Numba-compile LUT forward/backward paths.
-2. Add soft attention, pre-norm LayerNorm, dropout, batching, and sparse gradient replay.
-3. Add word tokenization, POS caching/inference/accuracy, W&B, save/load, and multi-seed scripts.
-4. Instrument which LUT rows, coordinates, and row indices (`j`) are updated.
-5. Introduce the current Q/K/V/Final new-attention mechanism and its backward/replay paths.
-6. Run positional encoding, comparison-layout, QK normalization, Final sharing, MHA, and LR-schedule experiments.
-7. Add the committed `--comparisons-per-bit` XOR aggregation architecture (commit `adce4de`).
+The measurements behind the current training configurations are in `DECISIONS.md`; the process that led there (timeline, experiment ledger, overturned conclusions) is in `HISTORY.md`.
 
 Working-tree warning: `nanoGPT_POS/` is untracked user work. Do not discard, overwrite, or silently reformat it.
 
 ## Start Here
 
 - `main.py`: model structures, LUT construction/indexing, Numba kernels, forward/backward, batching/replay, CLI, training, validation, checkpointing, update statistics, and W&B.
-- `lut_torch/`: the PyTorch port. Start at `lut_torch/functional.py` (the only custom autograd) and `lut_torch/modules.py`.
+- `lut_torch/`: the PyTorch port, used for all current experiments. Read `lut_torch/AGENTS.md` first.
 - `word_tokenizer.py`: word vocabulary, tokenization, universal POS labels, spaCy alignment, and cached POS encoding.
-- `run_files/run_POS_one.sh`: newest single-run template; uses new MHA, scheduler control, frozen PE, direct-sign QKPE, and the legacy-equivalent `--comparisons-per-bit 1`. Its `--weight-sharing` line is currently commented out.
-- `run_files/torch_POS_run.sh`: the torch trainer (`python -m lut_torch.train`) at the same experiment shape. Note `run_files/` is gitignored, so these scripts are local-only.
-- `run_files/torch_POS_output_code_gpu.sh`: GPU array job for the low-dimensional coded
-  output head (`--output-code-dim`), three arms (uncoded baseline, learned code, frozen
-  binary code) at the GPU sweep's best cell. Its header explains why the baseline must be
-  rerun from that script and why validation loss, not just accuracy, decides the result.
-- `run_files/torch_LM_output_code_gpu.sh`, `torch_LM_schedule_probe_gpu.sh`,
-  `torch_LM_code_width_gpu.sh`, `torch_LM_depth_gpu.sh`, `torch_LM_lr_budget_gpu.sh`: the
-  full-vocabulary (`V = 14,398`) coded-head experiments, in the order they were run. The
-  settled configuration and every number behind it are in DECISIONS.md Part II; the short
-  version is `--output-code-dim 112 --output-code learned --output-code-bias --epochs 30
-  --lr-scheduler cosine --cosine-min-lr-ratio 0.01 --warmup-frac 0.0095`.
-  **All five share a preamble that exists because of two cluster faults -- copy it into any
-  new run script rather than writing a bare `source .venv/bin/activate`:**
-    - *Per-node venv selection.* A venv does not contain a Python: `.venv/bin/python` is a
-      symlink to `/usr/bin/python3`, so it runs **whatever version the node has**, and looks
-      for packages in `lib/python<version>/site-packages`. `.venv` has only
-      `lib/python3.11`, `.venv313` only `lib/python3.13`. The cluster is being re-imaged
-      from 3.11 to 3.13 node by node, so on a 3.11 node `.venv` works and `.venv313` fails,
-      and on a 3.13 node the reverse -- neither is wrong, the node decides. The scripts try
-      each in turn and take the first whose interpreter can `import numpy, torch`, keep the
-      winner in `PY`, and record it in `config.txt` as `venv=`. Do not use bare `python`
-      after that point; use `"${PY}"`, so the provenance and the trainer cannot disagree.
-    - *GPU preflight and `--exclude`.* The re-imaged nodes ship **no NVIDIA driver
-      userspace** -- `nvidia-smi` is absent, so `libcuda.so` is missing and
-      `torch.cuda.is_available()` is False. SLURM advertises their A10s and allocates them
-      anyway (`gres/gpu:a10=1` in `sacct -o AllocTRES`), so a job lands, takes a GPU it
-      cannot use, and dies inside argparse with a usage dump whose last line is the real
-      error. Reproducer: `srun -w arion-01 --gres=gg:g0:1 --pty nvidia-smi` ->
-      `No such file or directory`. The scripts carry
-      `#SBATCH --exclude=arion-01,binky-01,creek-01,dumfries-004,drape-01,incitatus-01` and
-      assert `torch.cuda.is_available()` right after picking the venv, failing with one
-      legible line. Prune the exclude list as nodes are repaired; the preflight is what
-      catches the ones not yet on it.
-- `gpt_baseline_train.py` + `run_files/GPT_LM_baseline_gpu.sh`: nanoGPT LM baseline for the
-  LUT LM. The trainer wraps `nanoGPT_POS/model.py`'s `GPT` but takes data, validation
-  windows, `evaluate()` and the epoch/cosine schedule from `lut_torch`, so at the same
-  `--seed`/`--testing-length` its `loss.csv` scores the same snippets as a `lut_torch` LM
-  run (`test_gpt_baseline.py`). The optimizer is the transformer's own (AdamW). The script
-  sweeps width x depth x dropout at seed 42; results go to `results/GPT_LM_baseline/`.
-- `prepare_wikitext103.py` -> `nanoGPT_POS/data/wiki103/`: WikiText-103 raw, GPT-2 BPE
-  `.bin` token files (full train, 2M/8M/32M-word article-aligned prefixes, val, test),
-  each with a `.bin.json` manifest. Both trainers take a `.bin` wherever they take a text
-  file, with `--tokenizer gpt2`. The val set is WikiText-2's, word for word (checked;
-  recorded in `val_gpt2.bin.json`). Decisions W1-W4 in DECISIONS.md Part III.
-  Runs: `run_files/GPT_LM_wt103_gpu.sh` (12-cell GPT data x size ladder) and
-  `run_files/torch_LM_wt103_gpu.sh` (LUT; arm 0 = smoke, arms 1-4 = wave 2).
-- `run_files/run_POS_multiseed_new_attn.sh`: seeds 42-45 in parallel and then `analyze_multiseed_metrics.py`.
-- `run_files/for_srun_POS_new_attn.sh`: configurable short/statistics runs launched with `srun`.
-- `run_files/run_POS_one_PE_only.sh`: PE-only ablation.
-- `run_files/run_POS_one_multi_ckpt.sh`: multiple-checkpoint experiment; see caveat below.
-- `run_files/run_POS_load_smoke.sh` and `run_files/run_POS_one_load_ckpt.sh`: checkpoint-load checks/templates; inspect paths before running.
-- `run_files/run_nanoGPT_POS.sh`: PyTorch baseline. Inspect its working-directory assumptions before copying paths.
+- `gpt_baseline_train.py`: nanoGPT LM baseline. Wraps `nanoGPT_POS/model.py`'s `GPT` but takes data, validation windows, `evaluate()` and the schedule from `lut_torch`, so at the same `--seed`/`--testing-length` its `loss.csv` scores the same snippets as a `lut_torch` LM run (`test_gpt_baseline.py`). Optimizer is AdamW.
+- `prepare_wikitext103.py` -> `nanoGPT_POS/data/wiki103/`: WikiText-103 raw text, GPT-2 BPE `.bin` token files (full train, 2M/8M/32M-word prefixes, val, test) with `.bin.json` manifests. Both trainers take a `.bin` wherever they take a text file (`--tokenizer gpt2`). DECISIONS.md Part III.
+- `run_files/`: SLURM run scripts, one per experiment. **Gitignored, local-only.** Copy the newest relevant one (`torch_LM_wt103_gpu.sh`, `GPT_LM_wt103_gpu.sh`, `torch_POS_run_gpu.sh`) rather than an old one; see "Run-script preamble".
 - `results/**/config.txt`: strongest local record of the exact command submitted for a run. Directory/run names are descriptive but occasionally stale or inconsistent; trust the command line inside the config.
 - `loss.csv`: `step, epoch, tokens, loss, perplexity, accuracy, loss_no_unk, perplexity_no_unk, accuracy_no_unk, loss_per_word, perplexity_per_word` (11 columns; runs before 2026-10-14 have only the first 9). The `_no_unk` triple scores the same predictions with `<unk>` targets excluded; nothing is masked in training, both scorings are reported. It is word-tokenizer only and NaN under BPE. The `_per_word` pair is the exact per-word loss for BPE runs (DECISIONS.md W2) and the headline there; it is NaN for the word tokenizer. `perplexity` is exactly `exp(loss)` — but W&B's `train/perplexity` is `exp(EMA loss)` while `train/loss` is the raw last-minibatch mean, so those two panels rank runs differently.
 
 ## Where checkpoints live
 
-**Checkpoints belong on `/cs/snapless`, not in `results/`.** `results/` is on the lab
-filesystem, which is quota'd lab-wide (`/cse/labs/roys`, 9,216 GB for everyone), and a
-single LUT checkpoint runs to tens of gigabytes -- one `main.py` `.npz` was 43 GB. When
-that quota fills, running jobs stop being able to write `loss.csv` and `config.txt`, so
-this is a correctness problem and not only a tidiness one.
-
-The current run scripts already do the right thing: `CHECKPOINT_ROOT` points at
-`/cs/snapless/roys/yuval.rubin/LUT_checkpoints` and each run records `checkpoint_dir=` in
-its `config.txt`. **No code change is needed** -- `main.py` and `lut_torch` both write
-wherever `--save-model` says, and the scripts say snapless.
+**Checkpoints belong on `/cs/snapless`, not in `results/`.** `results/` is on the
+lab-wide quota'd filesystem and a LUT checkpoint can be tens of gigabytes. When that quota
+fills, running jobs stop being able to write `loss.csv` and `config.txt`, so this is a
+correctness problem, not only a tidiness one. Run scripts set `CHECKPOINT_ROOT` to
+`/cs/snapless/roys/yuval.rubin/LUT_checkpoints` and record `checkpoint_dir=` in
+`config.txt`; both trainers write wherever `--save-model` says. **Create the checkpoint
+directory before the job starts** — a missing one has killed a run at its final save.
 
 Historical checkpoints (the `main.py`-era `.npz` files under `results/POS*` and the older
 `results/POS_torch_gpu/*.pt`) were relocated to
@@ -101,40 +40,21 @@ Each affected run also has `checkpoint_moved_to=` appended to its `config.txt`, 
 location survives even if a symlink is broken or the tree is copied without following
 links. Do not "clean up" those symlinks -- they are the checkpoints.
 
-Related: `sbatch_outputs/*.txt` were 5.2 GB, of which 99.9% was tqdm carriage-return
-animation frames (one 130 MB log held 900k `\r` against 1.1k `\n`). They are now pruned to
-the last segment of each line -- exactly what the terminal displayed -- for 67 MB total.
-New logs accumulate the same way; prune rather than gzip, which keeps them greppable and
-is ~28x smaller than gzipping the frames.
+`sbatch_outputs/*.txt` fill up with tqdm carriage-return frames (99.9% of their size).
+Prune each line to its last `\r` segment rather than gzipping — it stays greppable and is
+~28x smaller.
 
 ## The `lut_torch/` PyTorch Port
 
 `lut_torch/` reimplements the `--new-attention` / `--new-MHA` architecture on PyTorch so
-that torch owns autograd, optimizers, schedulers and checkpointing. `main.py` is not
-modified and remains the reference implementation that the port is measured against.
-
-**`lut_torch/AGENTS.md` is the authoritative document for that codebase.** Read it before
-changing anything under `lut_torch/`. It covers the design (why a discrete lookup fits
-torch at all), the invariants that break silently (RNG draw order, loss scaling, sparse
-table gradients), how CPUs are used and how to benchmark them, the flag set, the parity
-contract, and the performance history. Do not duplicate that material here.
-
-In brief, for orientation only:
-
-- Only two gradients are custom: the table scatter-add (which is an embedding's backward,
-  returned sparse) and the input surrogate (which is exactly `dphi/du` for
-  `phi(u) = 0.5/(1+|u|)`). Both live in `lut_torch/functional.py`.
-- The custom step is defined over *margins*, not the layer input, so QK normalization, PE
-  routing and the Q/K/PE gradient scattering are ordinary torch that autograd derives.
-- A real batch dimension replaces `BatchElement`, `SparseGradAccumulator`,
-  `apply_averaged_gradients`, the `_replay_*` kernels and all four thread-pool flags.
-- Checkpoints are torch `state_dict` `.pt` files and resume fully; they are not `.npz` and
-  the `analyze_*` / `compare_*` / `infer_lut_pos.py` tools cannot read them.
-- Not ported (still in `main.py`): old hard attention, `--soft-attention`,
-  `--factored-output`, `--fp16`, `no-overlap`/`overlap` modes, `--halve-lr-at-20k-40k`,
-  `--save-multiple-checkpoints`, sampling, and `LUTUpdateStats`.
-
-Run scripts: `run_files/torch_POS_run.sh`. Tests: see "Validation Expectations" below.
+torch owns autograd, optimizers, schedulers and checkpointing; `main.py` stays unmodified
+as the reference the parity suite measures against. **`lut_torch/AGENTS.md` is
+authoritative for that codebase** (design, silent invariants, flags, parity contract), and
+`lut_torch/PERFORMANCE.md` holds its runtime/memory measurements. Its checkpoints are `.pt`
+files that only `compare_run_validation.py` among the analysis tools can read.
+Not ported (still in `main.py`): old hard attention, `--soft-attention`, `--factored-output`, `--fp16`,
+`no-overlap`/`overlap` modes, `--halve-lr-at-20k-40k`, `--save-multiple-checkpoints`, and
+`LUTUpdateStats`.
 
 
 ## Cluster Sandbox and Command Execution — Read This Before Running Anything
@@ -155,9 +75,7 @@ Follow these rules:
 1. Run terminal commands for this repository with the execution tool's host/escalated sandbox permission from the first attempt. Set the working directory explicitly to `/cs/labs/roys/yuval.rubin/LUT/LUT` and give a narrow, honest justification.
 2. If a command was accidentally started in the default sandbox and returns the `bwrap` error above, rerun that same command once with host/escalated permission. Do not keep retrying the default sandbox, modify the command to evade it, or investigate application code.
 3. Escalated execution only bypasses the broken namespace sandbox; it does not authorize destructive, unrelated, network, or system-wide actions. Keep commands scoped to this repository and request any additional approval normally.
-4. The dedicated `apply_patch` helper currently enters the same broken sandbox and may fail before reading a file. Try the prescribed patch helper once when required. If it fails with the exact `bwrap` error, use `git apply` through an escalated terminal call with a small reviewed unified diff. Do not rewrite tracked files with `cat`, shell redirection, `sed -i`, or Python.
-5. A long command may return a process/session ID instead of finishing. Poll that existing process with the execution tool's stdin/poll operation; do not launch a duplicate test or training run. Keep each wait under 60 seconds so the user continues receiving updates.
-6. Preserve dirty and untracked user work. Check `git status --short` before editing, patch only the intended file, and never use reset/checkout/clean to recover from a patch problem.
+4. Preserve dirty and untracked user work. Check `git status --short` before editing, patch only the intended file, and never use reset/checkout/clean to recover from a patch problem.
 
 Environment notes:
 
@@ -165,6 +83,28 @@ Environment notes:
 - The project virtualenv may not contain pytest, while the cluster Python may not contain project dependencies such as `tiktoken`. Probe the intended interpreter first. Do not install or mix site-packages without explicit need and approval.
 - For syntax-only shell validation, use `bash -n script.sh`; do not submit or execute the SLURM job.
 - Network access remains separately restricted even under normal repository work. If an essential download fails for network/sandbox reasons, use the execution tool's approval flow rather than implementing a workaround.
+
+### Run-script preamble
+
+Every current GPU run script (`torch_LM_*`, `GPT_LM_*`) starts with a preamble that works
+around two cluster faults. Copy it from `run_files/torch_LM_wt103_gpu.sh` into any new
+script rather than writing a bare `source .venv/bin/activate`:
+
+- **Per-node venv selection.** `.venv/bin/python` is a symlink to the node's
+  `/usr/bin/python3`, so a venv only works on nodes whose Python matches its
+  `lib/python<version>`. `.venv` is 3.11 and `.venv313` is 3.13, and the cluster is being
+  re-imaged node by node, so the node decides which one works. The preamble takes the first
+  whose interpreter can `import numpy, torch`, stores it in `PY`, and records `venv=` in
+  `config.txt`. Use `"${PY}"`, never bare `python`, after that point.
+- **GPU preflight.** Some re-imaged nodes have no NVIDIA driver userspace, yet SLURM still
+  allocates their GPUs, and the job dies inside argparse with an unhelpful usage dump. The
+  scripts carry an `#SBATCH --exclude=` list of known-bad nodes and assert
+  `torch.cuda.is_available()` right after picking the venv. Prune the exclude list as
+  nodes are repaired; the assertion catches the rest.
+
+Pass each flag once. argparse silently keeps the last value, and appending arm flags after
+a template's fixed flags has already changed a whole experiment series unnoticed
+(DECISIONS.md Part II).
 
 ## How `main.py` Fits Together
 
@@ -259,7 +199,7 @@ The QKPE side has separate direct/fixed logic and is not multiplied by `--compar
 - `--warmup-steps`: positive linear warmup length.
 - `--max-learning-rate`: positive peak LR. Default is the legacy-compatible `1/sqrt(4001)`.
 - `--lr-scheduler inverse-sqrt`: `max_lr * (warmup_steps/step)**inverse_sqrt_alpha` after warmup.
-- `--inverse-sqrt-alpha`: nonnegative, default 0.5; one experiment used 0.32.
+- `--inverse-sqrt-alpha`: nonnegative, default 0.5.
 - `--lr-scheduler cosine`: cosine decay across remaining `max_steps`.
 - `--cosine-min-lr-ratio`: final/max LR ratio in `[0,1]`, default 0.01.
 - `--layernorm`: pre-norm before attention and FFN.
@@ -273,62 +213,18 @@ The QKPE side has separate direct/fixed logic and is not multiplied by `--compar
 - `--loss-file`: overwritten at startup; give every run a unique path.
 - `--save-model`: NumPy adds `.npz` if omitted; saves periodically and at the end.
 - `--load-model`: weights only. It does not resume step, LR schedule, RNG, or loss logging.
-- `--save-multiple-checkpoints`: saves step 0 and step-tagged validations. Its introducing commit says “not sure it works”; verify outputs before relying on resume/analysis semantics.
+- `--save-multiple-checkpoints`: saves step 0 and step-tagged validations. Unverified; check its outputs before relying on them.
 - `--lut-update-stats-file X.npz`: also emits `X_summary.csv`, `X_histogram.csv`, coordinate NPZ/summary, and `j` NPZ/summary/top CSVs.
 - `--lut-update-stats-snapshot-steps 1000,10000,...`: positive 1-based cumulative snapshots; steps beyond `max_steps` never fire.
 - `--wandb` plus project/entity/name/group/tags/mode/log interval: logs serializable args, train/validation metrics, and LR. Keep names aligned with the actual command.
 
-## Experiment Ledger
+## Experiment History
 
-This describes what commits and saved `config.txt` files show was attempted. It does not infer conclusions from run names alone; use loss files, stdout, W&B, and generated analyses for outcomes.
-
-### Baselines and POS pipeline
-
-- The branch inherited old hard attention, soft attention, LayerNorm/dropout, fp16, factored output, and batch parallelism.
-- POS work added word inputs, spaCy universal-POS targets, cache reuse, correct `<unk>` alignment, inference, accuracy, and a token-majority baseline.
-- `results/POS/` contains old-attention single- and multi-seed runs. Multi-seed scripts use seeds 42-45.
-- `run_nanoGPT_POS.sh`, `infer_gpt_pos.py`, and `pos_majority_baseline.py` provide transformer and empirical baselines.
-
-### New attention
-
-- Commits `7433e31`, `1775307`, and `6fd1cc0` progressed from initial forward work to separated Q/K/V/Final and complete backward/replay support.
-- Follow-ups integrated new tables into model-size reporting and update stats.
-- Common full POS shape: context 32, embedding 64, 6 layers, 4 heads, `n_t=64`, `n_c=6`, positional/QK dim 5, dropout 0.2, seed 42. Runs also varied 10 layers, 4/8/16 heads, and `n_t` 16/32/64/128.
-- `results/POS_new_attn/20260629-231508` is a historical sanity reference: existing notes record validation loss about 0.398, perplexity 1.49, and accuracy 0.869 near step 99,000. It is not a guaranteed benchmark.
-
-### Update coverage and row behavior
-
-- `20260802-...stats...` runs varied `n_t` 16/32/64, random/overlap/no-overlap comparisons, direct-sign QKPE, PE-only, frozen PE, and frozen PE+PE-only.
-- Instrumentation grew from row counts/histograms to `j` distributions, cumulative snapshots, per-coordinate counts, and KL divergence from uniform.
-- Multiple-checkpoint work supports comparing initial/intermediate/final `S` rows.
-
-### PE and QK variants
-
-- Direct-sign QKPE, deterministic overlap/no-overlap layouts, PE-only, frozen PE, and sign-pattern PE initialization were tested.
-- QK normalization was run at least in `results/POS_new_attn/20260806-102506`. Do not trust later run names that say “norm”; confirm `--normalize-qk` in `config.txt`.
-
-### Final sharing, MHA, schedules, and XOR aggregation
-
-- Final sharing was tried with `n_t=64, weight-sharing=8` and `n_t=128, weight-sharing=16`; later MHA runs use sharing 8 or 16.
-- New MHA runs cover 4, 8, and 16 heads, usually with frozen PE, direct-sign QKPE, random comparisons, and Final sharing.
-- Scheduler experiments varied warmup 1000/2000, cosine versus inverse sqrt, peak LR (notably 0.01), and inverse-sqrt exponent 0.32 versus 0.5.
-- Later runs varied `n_c`/`attn_qk_n_c` through 6, 7, 8, and 9. Some W&B names say `WS_16` while the command says `--weight-sharing 8`; trust `config.txt`.
-- XOR aggregation was implemented in `adce4de`. The focused comparison suite verifies exact legacy behavior at `--comparisons-per-bit 1`, while fan-in 2 smoke runs cover old hard, soft, and new attention.
-
-### Epoch budgets, LR scaling, and the cooldown (torch port, Sep 2026)
-
-- The torch port's training schedule was retuned from scratch: budget in epochs rather
-  than steps, peak LR scaled linearly with batch, warmup `6400/batch`, and a terminal
-  cooldown. `lut_torch/AGENTS.md` ("Training recipe") has the settings; **`DECISIONS.md`
-  at the repo root has the measurements, the wrong turns, and what is still open.**
-- Outcome: `new-MHA=on` beats `new-MHA=off` by 0.010-0.017 with 3-7x fewer parameters,
-  and reaches 0.9454 in ~57 min where the old schedule reached 0.9445 in 3.30 h.
-  Differences *within* `new-MHA=on` are smaller than seed noise and are not a ranking.
-- Result trees: `POS_torch_gpu_sweep/` (first sweep, fixed 200k steps),
-  `POS_torch_lr_probe*/` and `POS_torch_exp{A,A2,B,C,D,E}/` (the tuning probes),
-  `POS_torch_gpu_sweep_v2_E10/` (the rerun). Each run's `config.txt` names its swept axis
-  under `swept_*` keys; trust those over directory names, and check for
-  `DUE TO PREEMPTION` in the sbatch output before reading a short run as a crash.
+`HISTORY.md` has the timeline, the experiment ledger (which result trees belong to which
+era), and the conclusions that were later overturned. Read it before re-running an old
+idea. When reading any result: trust the command and `swept_*` keys in `config.txt` over
+directory or W&B names, and check the sbatch output for `DUE TO PREEMPTION` before reading
+a short run as a crash.
 
 ## Analysis and Inference Tools
 
@@ -390,11 +286,7 @@ random starts. At the historical setting of 100 windows that is only ~2,900 scor
 tokens, whose 95% sampling interval on accuracy is **+/-1.1 points**. Two window sets
 drawn independently differ enough in difficulty that the *same* checkpoint scored 0.9201
 on one and 0.9374 on the other — a 1.7-point spread with no model difference at all.
-This is what made the first `lut_torch` GPU run
-(`results/POS_torch_gpu/20260906-142646_torch_gpu_WS8_bs1_sgd`) look better than the
-`main.py` run it was ported from (`results/POS_new_attn/20260814-101642`); scored on the
-same 1,000 windows the two land at identical accuracy (0.928331 each, 29,134 tokens),
-agreeing on 95.7% of individual predictions with 579 tokens right each way.
+This is exactly what made the port look better than `main.py` at first (next section).
 
 So:
 
@@ -407,6 +299,26 @@ So:
   the same seed they score the same snippets and build the same model. See invariant 1 in
   `lut_torch/AGENTS.md`. Training snippet order and dropout masks still diverge, so the
   runs themselves are not step-for-step identical.
+
+### `main.py` vs `lut_torch`: what has been established
+
+The port is equivalent to `main.py`, not better. The evidence, at three levels:
+
+- **One step, exactly.** `test_torch_parity.py` asserts identical construction, logits,
+  loss, every gradient, and tables after one SGD step at batch 1, across 17 configurations
+  (`lut_torch/AGENTS.md`, "The parity contract").
+- **A full trained run, on the same windows.** The first `lut_torch` GPU run
+  (`results/POS_torch_gpu/20260906-142646_torch_gpu_WS8_bs1_sgd`) looked better than the
+  `main.py` run it was ported from (`results/POS_new_attn/20260814-101642`) on their own
+  `loss.csv` files. Scored on the same 1,000 windows with `compare_run_validation.py`, the
+  two land at identical accuracy (0.928331 each, 29,134 tokens) and agree on 95.7% of
+  individual predictions, with 579 tokens right each way.
+- **Speed.** At the production POS shape the port is 0.66x `main.py` per sequence at batch
+  1 and 2.4x faster at batch 32 on CPU; on GPU, `--stack-heads` plus `--cuda-graphs` give a
+  further 8.3x (`lut_torch/PERFORMANCE.md`).
+
+Every later accuracy gain (the Sep 2026 schedule retune in DECISIONS.md Part I) comes from
+training recipe, not from the port.
 
 ## Validation Expectations
 
@@ -421,7 +333,8 @@ python test_compare_lut_checkpoint_rows.py
 python -m pytest -q test_xor_comparisons.py
 ```
 
-For the torch port:
+For the torch port the core three are below; the full list, and what each suite pins
+down, is in `lut_torch/AGENTS.md` ("Testing").
 
 ```bash
 .venv/bin/python test_torch_lut_primitive.py

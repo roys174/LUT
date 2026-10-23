@@ -2,15 +2,17 @@
 
 Why the training configuration is what it is. `AGENTS.md` and `lut_torch/AGENTS.md` carry
 the verdict; this file carries the measurements behind it, so that a later change can see
-which numbers it would be overturning rather than rediscovering them.
+which numbers it would be overturning rather than rediscovering them. How these were
+reached — the sweeps in order, the wrong turns, the conclusions later retracted — is in
+`HISTORY.md`.
 
-Part I is the POS task; **Part II covers the LM coded output head** and its conclusions
-do not transfer in either direction -- where they conflict (anneal shape, budget), the
-regimes differ and both are correct for their own task.
+Part I is the POS task, Part II the LM coded output head on WikiText-2, Part III the move
+to WikiText-103. Part I and Part II conclusions do not transfer in either direction --
+where they conflict (anneal shape, budget), the regimes differ and both are correct for
+their own task.
 
 Part I measured on the POS task (wiki2, 2,156,877 training positions, context 32) at
-`heads 4 / new-MHA on / weight-sharing 8`, batch 32, unless stated otherwise. About
-40 GPU-h of probes (`expA`-`expE`, two LR probe stages) plus two full sweeps.
+`heads 4 / new-MHA on / weight-sharing 8`, batch 32, unless stated otherwise.
 
 ---
 
@@ -68,12 +70,10 @@ keeps descending.
 
 `--max-steps` is not comparable across batch sizes. 200k steps is 3 passes over this
 corpus at batch 1 and 96 at batch 32; and because the objective is a batch *mean*, batch
-32 also took 32x the total parameter travel at the same LR.
-
-The first GPU sweep (`results/POS_torch_gpu_sweep/`) was budgeted that way, and its
-headline result -- batch 32 beating batch 1 by 0.016 -- was measuring those two things,
-not batch size. Under an epoch budget the effect disappears completely: across batch 1 to
-64 the spread within each architecture is 0.0009-0.0021, inside the noise.
+32 also took 32x the total parameter travel at the same LR. A step-budgeted sweep once
+"found" a 0.016 batch-size effect that was entirely this (`HISTORY.md`). Under an epoch
+budget, across batch 1 to 64 the spread within each architecture is 0.0009-0.0021, inside
+the noise.
 
 `--epochs` derives `max_steps = ceil(epochs * positions / (batch * CS))` in
 `derive_schedule`, which also re-paces warmup, validation cadence and logging density
@@ -124,12 +124,11 @@ LR response at batch 32, E=10:
 | accuracy | 0.9244 | 0.9390 | 0.9431 | 0.9450 | **0.9454** | 0.9394 |
 | val loss | 0.3047 | 0.2236 | 0.1874 | 0.1681 | **0.1583** | 0.1700 |
 
-**A wrong turn worth recording:** an early probe concluded that linear scaling was wrong
-for this model, after extrapolating linearly from batch 1's historical lr 0.01 to 0.32 at
-batch 32 and watching it oscillate (0.9344 at 0.16, ~0.47 at 0.32). The rule was right;
-the *anchor* was wrong. Batch 1 wants ~0.00125 under this schedule, not 0.01. Four
-separate grids in this project bracketed an optimum from above only before this was
-caught -- when probing an LR, bracket from both sides.
+**A wrong turn worth knowing:** linear scaling was once declared wrong for this model,
+because extrapolating from batch 1's historical lr 0.01 gave 0.32 at batch 32, which
+oscillated. The rule was right and the *anchor* was wrong: batch 1 wants ~0.00125 under
+this schedule. Four LR grids bracketed the optimum from above only before this was
+caught -- **when probing an LR, bracket from both sides.** Details in `HISTORY.md`.
 
 ---
 
@@ -144,10 +143,8 @@ across batch 1 to 128 (0.031 / 0.089 / 0.178 / 0.252 / 0.356) -- and depth moves
 optimum, which is exactly why the 3-epoch and 10-epoch optima differ. Any batch-size
 comparison at fixed warmup steps is partly a depth comparison.
 
-Ramp length itself barely matters. `--lr-decay-start` was added so the ramp could be
-varied with the decay curve held fixed (in `(W/s)**alpha` the warmup length also sets the
-height of the whole decay, which made every earlier warmup comparison uninterpretable --
-a short ramp "won" twice purely by decaying faster). With `t0` pinned:
+Ramp length itself barely matters. With the decay start `t0` pinned by `--lr-decay-start`
+(otherwise the warmup length also sets the height of the whole decay):
 
 | W | 32 | 200 | 1000 |
 |---|---|---|---|
@@ -180,11 +177,6 @@ annealing earlier, from a worse point, gain more, and **all finish in the same p
 The anneal collects whatever gap remains and deposits the run on the same floor
 regardless of when it begins or how long it takes.
 
-An earlier experiment had varied the cooldown at 3 epochs and found 0.2 best; that did
-not transfer, because at 3 epochs a long cooldown eats real learning (the curve is still
-climbing at +0.0059/epoch where it would start). Check what regime a schedule knob is
-being tested in.
-
 ---
 
 ## Decision 6 -- batch size is a speed knob only
@@ -196,11 +188,11 @@ At a token-matched schedule (warmup `6400/batch`, so depth and warmup tokens ide
 |---|---|---|---|---|---|
 | best accuracy | 0.9281 | 0.9371 | 0.9409 | **0.9413** | 0.9341 |
 | optimal lr | <0.005 | 0.01 | 0.04 | 0.08 | 0.08 |
-| throughput | ~3,000 tok/s | 6,400 | 6,050 | 7,000 | 5,900 |
 
-Throughput saturates at batch 8 and is flat to 128; only batch 1 is penalised, at roughly
-half. Batch 32 and 64 are tied within noise and 128 falls off. In the v2 sweep, with LR
-scaled, accuracy across batch 1 to 64 is flat within each architecture.
+Batch 32 and 64 are tied within noise and 128 falls off. In the v2 sweep, with LR scaled,
+accuracy across batch 1 to 64 is flat within each architecture. Throughput saturates at
+batch 8 and only batch 1 is penalised, at roughly half (`lut_torch/PERFORMANCE.md`,
+"Training throughput by batch size").
 
 ---
 
@@ -222,44 +214,45 @@ scaled, accuracy across batch 1 to 64 is flat within each architecture.
   lr 0.08 where the rule gives 0.04, so at least +0.006 of the measured gap is tuning.
   The ranking is very unlikely to flip, but the margin is not yet a measurement.
 
+## Still open (POS)
+
+- **`new-MHA=off` LR is unbracketed.** `expD` ran 0.01/0.02/0.04/0.08 at batch 32 and was
+  monotone increasing. Extend upward (0.08/0.16/0.32) before quoting the on-vs-off gap.
+- **The 10-epoch LR rule (`0.0025 * batch`) is confirmed at batch 32 only.** Check batch
+  8 (0.01 vs 0.02) and batch 64 (0.08 vs 0.16), ~4 GPU-h.
+- **`E=8 + lr 0.08` has never been run together** with the chosen shape, though each half
+  is validated. One confirming run before building on it.
+- **Three cells cannot run**: `h8/mha=off/ws=full` is 1.68B parameters = 6.24 GiB of
+  weights plus 6.24 GiB of dense gradient before activations, and the cluster mixes
+  10.57 GiB to ~24 GiB cards behind one `--gres`. Pin the GPU by memory, or use
+  `--table-grad sparse --cuda-graphs off`.
+- **Everything is single-seed.** Differences under ~0.003 need 3+ seeds to mean anything.
+
 ---
 
 # Part II -- the LM coded output head (full vocabulary)
 
-Everything above is POS (18 classes). This part is the **LM** task: wiki2 word-level,
-`V = 14,398`, same 6-layer body (`n_t 64 / n_c 8 / ctx 32 / emb 64 / h4 / ws8 / new-MHA`,
-47,972,352 body table entries), batch 32, seed 42. The question is whether the output head
-can be replaced by `D` coordinates plus a `(V, D)` code matrix -- `logits = y @ C.T + b` --
-instead of one table column per class.
-
-Measured across six sweeps, ~280 GPU-h: `LM_torch_output_code_E10` (does it work at all),
-`LM_torch_schedule_probe` (budget and LR shape), `LM_torch_code_width` (how wide must `D` be,
-and does a frozen code ever catch up), `LM_torch_lr_budget` (peak LR x budget, two rounds),
-`LM_torch_depth` (where the freed parameters should go, plus a deeper ladder to L60).
+This part is the **LM** task: wiki2 word-level, `V = 14,398`, same 6-layer body
+(`n_t 64 / n_c 8 / ctx 32 / emb 64 / h4 / ws8 / new-MHA`, 47,972,352 body table entries),
+batch 32, seed 42. The question is whether the output head can be replaced by `D`
+coordinates plus a `(V, D)` code matrix -- `logits = y @ C.T + b` -- instead of one table
+column per class. Six sweeps, ~280 GPU-h; the order they ran in is in `HISTORY.md`.
 
 ## The settled LM configuration
 
 ```
 --output-code learned --output-code-bias
 --output-code-dim 112               # settled at L6 (Decision L3); the depth runs used 448,
-                                    # and the deep cell has not been repeated at 112 (Open L7)
+                                    # and the deep cell has not been repeated at 112
 --num-layers 32                     # or 48 -- see Decision L5. n_c stays 8
 --epochs 30                         # NOT more at depth: L24 at E=60 is worse than at E=30
 --lr-scheduler cosine --cosine-min-lr-ratio 0.01
---lr-cooldown-frac 0.2              # applied in every Part II run (see note below)
+--lr-cooldown-frac 0.2              # every Part II run had this on top of cosine (HISTORY.md)
 --warmup-frac 0.0095
 --max-learning-rate 0.00125          # x batch 32 = 0.04 effective, coded head, E>=30
 --lr-batch-scaling linear --lr-reference-batch-size 1
 --validation-interval-epochs 0.1
 ```
-
-**Note (found 2026-10-14):** the Part II scripts kept the POS template's fixed flags
-(`--lr-scheduler inverse-sqrt --lr-cooldown-frac 0.2 --warmup-steps 200 --epochs 10`) and
-appended the arm's cosine flags after them. argparse keeps the last value, so cosine,
-warmup-frac and the epoch count took effect. `--lr-cooldown-frac` was never overridden, so
-**every Part II run is cosine to 1% multiplied by a linear ramp over the last 20%**. The
-trainers print `lr_cooldown_frac = 0.2`. The block above now lists it; earlier copies
-omitted it. New scripts must pass each flag once (`run_files/torch_LM_wt103_gpu.sh` does).
 
 Best measured: **`L60_nc8_lr04` (D448) at 107.46 perplexity** (min 106.88; acc 0.2631,
 no-unk ppl 133.1), 493.5M parameters, 26.2 h. The recommended point is **`L32` at 113.53**
@@ -269,10 +262,8 @@ no-unk ppl 133.1), 493.5M parameters, 26.2 h. The recommended point is **`L32` a
 Best dense baseline: **`dense_E60_lr04` at 120.65** (283.9M, 8.8 h).
 
 **The headline is "deeper coded models beat the dense head at equal parameters", not "the
-coded head is smaller at equal wall clock".** The earlier wall-clock claim (126.52 coded at
-4.8 h vs 128.39 dense at 4.1 h) did not survive giving the dense head 60 epochs: at 120.65 it
-beats every 6-layer coded run, including `D112_E120_lr04` (125.38 in 10.8 h). A 6-layer coded
-head is smaller but worse. What holds up, all single-seed:
+coded head is smaller at equal wall clock".** At 6 layers the dense head beats every coded
+run; the coded head wins only when its freed parameters go into depth. All single-seed:
 
 ```
 equal parameters   L32 coded  269.7M  14.1 h  113.53   vs  dense E60  283.9M  8.8 h  120.65   (-5.9%)
@@ -281,7 +272,6 @@ equal wall clock   L18 coded  157.7M   8.0 h  120.42   vs  dense E60  283.9M  8.
 
 The coded model costs 1.6x the wall clock at equal parameters (depth is serial), and wins
 nothing at equal wall clock except size. See Decisions L4 and L5.
-
 
 ## Decision L1 -- the coded head is a real replacement, and `learned` is the only version that works
 
@@ -300,8 +290,7 @@ parameters**. `D = ceil(log2 V) = 14` is not enough: 18% worse than 28.
 
 **Freezing the code is what costs, not the code's Hamming distance.** Frozen random at
 `D = 28` (399.7) is indistinguishable from frozen ECOC at `D = 14` (403.3), although the
-random code's minimum distance is far larger. This kills the "widen `D` to buy distance"
-theory that `lut_torch/AGENTS.md` previously recommended -- see Decision L3.
+random code's minimum distance is far larger. Widening `D` does not rescue a frozen code.
 
 ## Decision L2 -- 30 epochs with a cosine anneal; `inverse-sqrt` is the wrong shape here
 
@@ -311,17 +300,14 @@ Unlike POS, the LM task is **not** saturated at 10 epochs -- it is budget-starve
 | arm | schedule | epochs run | ppl | ppl @ ep 23.5 |
 |---|---|---|---|---|
 | (E10 reference) | inverse-sqrt, cooldown 0.2 | 10 | 187.7 | -- |
-| `A1_E30_depthfree` | inverse-sqrt, warmup left at 200 steps | **23.5, preempted** | (167.3) | 167.3 |
+| `A1_E30_depthfree` | inverse-sqrt, warmup left at 200 steps | 23.5\* | (167.3) | 167.3 |
 | `A2_E30_depthpin` | inverse-sqrt, `--warmup-frac 0.0095` | 30 | 152.6 | 157.4 |
 | `C3_E30_cooldown01` | inverse-sqrt, cooldown 0.1 | 30 | 151.9 | 157.1 |
-| `C1_E30_alpha025` | inverse-sqrt `alpha 0.25`, depth-pinned | **23.5, preempted** | (150.1) | 150.1 |
+| `C1_E30_alpha025` | inverse-sqrt `alpha 0.25`, depth-pinned | 23.5\* | (150.1) | 150.1 |
 | **`C2_E30_cosine`** | **cosine to 1%, depth-pinned** | **30** | **144.0** | **145.7** |
 | `A3_E60_depthpin` | inverse-sqrt, depth-pinned | 60 | 138.0 | 150.8 |
 
-**`A1` and `C1` were preempted at epoch 23.5** and never annealed; their finals are
-mid-run values, so the last column compares every arm at that common epoch instead.
-
-Three things, in order of size:
+\* stopped early and never annealed; compare all arms in the last column.
 
 - **Cosine beats every `inverse-sqrt` variant at the same budget**, by 5.6% at 30 epochs
   (144.0 vs 152.6) and by 3.0% at the common epoch 23.5 (145.7 vs 150.1 for the best
@@ -332,16 +318,12 @@ Three things, in order of size:
   `alpha 0.25` (`C1`) is the runner-up and beats `alpha 0.5` by 4.7% at epoch 23.5 --
   consistent with cosine's advantage being "hold a higher LR for longer, then anneal hard".
 - **`A3`'s 60-epoch win is budget, not shape.** At epoch 30 `A3` is at 146.6, *behind*
-  `C2`'s 144.0 at the same point; it only passes it by spending twice the compute. Cosine at
-  `E = 60` has never been run and is the obvious next cell -- see Open L3.
+  `C2`'s 144.0 at the same point; it only passes it by spending twice the compute.
 - **Warmup must be pinned as a fraction, not a step count.** `--warmup-frac 0.0095`
   reproduces the 200-step depth of the 10-epoch schedule at 30 epochs; leaving warmup at 200
   absolute steps costs 6.3% at matched epoch (167.3 vs 157.4). Same mechanism as POS
   Decision 4 -- in `(W/s)**alpha` the warmup length sets the height of the whole decay -- but
   here it is worth 10 perplexity rather than nothing.
-- **Budget is still the biggest single knob** and has not been exhausted: doubling to 60
-  epochs buys another 9.6% even on the inferior `inverse-sqrt` shape. 30 is where this work
-  stopped, not where the curve flattens.
 
 `--max-learning-rate 0.005` (0.16 effective) diverges to NaN. The probe at `E=10` gave
 0.01 -> 255.2, 0.02 -> 213.7, 0.04 -> 187.7, 0.08 -> 171.9, 0.16 -> NaN.
@@ -365,36 +347,26 @@ Three things, in order of size:
 perplexity. The gap column shows why: learned's train/val gap grows monotonically from
 -0.02 to +0.47, so everything past `D = 112` goes into memorising. `D = 56` is the cheap
 option at 1.2% worse; below that the loss is real (`D = 28` is +8%, `D = 14` is +18%).
+`D = 112` over `D = 224` is the smaller of two tied arms, not a measured winner.
 
 **`binary` never saturates because it never fits.** Its gap stays at roughly zero across
 the entire range -- it is still underfitting at `D = 1000`. It is not a regulariser; the
-frozen code is a capacity and optimisation bottleneck. Concretely: **learned `D = 14`
-(157.3) beats binary `D = 1000` (181.8)**, a >70x width disadvantage with no crossover
-anywhere in the range.
+frozen code is a capacity and optimisation bottleneck. **Learned `D = 14` (157.3) beats
+binary `D = 1000` (181.8)**, a >70x width disadvantage with no crossover anywhere.
 
-Two things that make `binary` look better than it is:
+`binary` also saves no storage at equal `D` (the frozen `C` is a buffer, absent from the
+parameter count but still `V*D` floats), and its occasional raw-accuracy edge is the bias
+capturing `<unk>` -- on `acc_no_unk` it loses.
 
-- **It saves no storage at equal `D`.** The frozen `C` is a buffer so it does not appear in
-  the printed parameter count, but it still occupies `V*D` floats. Including it, every
-  binary arm's footprint equals the learned arm's exactly (e.g. 30,796,398 at `D = 1000`).
-  The only real saving is gradient and optimiser state for `C`, at a cost of ~50 perplexity.
-- **`B_D1000` has the highest raw accuracy of any arm** (0.2456, above `L_D1000`'s 0.2447)
-  while being 38% worse in perplexity. On `acc_no_unk` the order flips back (0.2268 vs
-  0.2310). The raw-accuracy edge is the bias term capturing `<unk>`, not the frozen code
-  being competitive. This is the rank-`D` bottleneck behaving exactly as
-  `lut_torch/AGENTS.md` warns: argmax survives, calibration does not.
+Do not spend further GPU time on `binary`, and **do not fix `ecoc_masks` first and
+re-test**. Its minimum Hamming distance is stuck at 2 for every `D` from 28 to 1000 (a
+greedy-construction defect), but Decision L1 shows distance is not the binding constraint.
 
-Do not spend further GPU time on `binary`, and in particular **do not fix `ecoc_masks`
-first and re-test**. Its minimum Hamming distance is stuck at 2 for every `D` from 28 to
-1000 (a greedy-construction defect, not a property of the vocabulary), but the frozen
-random `D = 28` control in Decision L1 shows distance is not the binding constraint.
-
-## Decision L4 -- peak LR 0.04 at E>=30 for both heads; at L6 the dense head wins
+## Decision L4 -- peak LR 0.04 at E>=30; at L6 the dense head wins
 
 `LM_torch_lr_budget`, all cosine to 1%, `--warmup-frac 0.0095`, seed 42. `D = 112` learned
 + bias. The `E=30 / 0.04` cell is `L_D112` from the width sweep (identical command line
-apart from `--epochs`). Round 2 (`20260918-*`) added `D112_E120_lr04` and the two dense
-`E=60` arms. Final-step perplexity:
+apart from `--epochs`). Final-step perplexity:
 
 | `D = 112` | peak 0.04 | peak 0.08 |
 |---|---|---|
@@ -405,43 +377,28 @@ apart from `--epochs`). Round 2 (`20260918-*`) added `D112_E120_lr04` and the tw
 | dense (`V` logits) | peak 0.04 | peak 0.08 |
 |---|---|---|
 | E = 30 | 132.29 | **128.39** |
-| E = 60 | **120.65** (min 119.93 @ ep 59) | *crashed at ep 37.5* |
+| E = 60 | **120.65** (min 119.93 @ ep 59) | *no result* |
 
-**Round 2 overturns this decision's original headline.** Round 1 concluded that the coded
-head reaches 126.52 in 4.8 h against the dense head's 128.39 in 4.1 h, and so was "68x
-smaller at matched wall clock". Given 60 epochs, the dense head reaches **120.65 in 8.8 h**,
-which beats every `L6` coded run, including `D112_E120_lr04` (125.38 in 10.8 h). At `L6`
-the coded head is smaller but worse at any matched budget. Its advantage comes from spending
-the freed parameters on depth (Decision L5), not from the head alone.
+**At `L6` the coded head is smaller but worse at any matched budget.** The dense head at
+E=60 (120.65 in 8.8 h) beats every `L6` coded run, including `D112_E120_lr04` (125.38 in
+10.8 h). The coded head's advantage comes from spending the freed parameters on depth
+(Decision L5), not from the head alone.
 
 **The coded head's budget is exhausted near E=60.** E=60 -> E=120 at 0.04 is 126.52 ->
-125.38, 0.9% for 2x compute, against the ~3.4% the previous revision extrapolated (it
-predicted ~122). The train/val gap reached +0.64. More epochs at `L6` / `D = 112` are not
-worth running.
+125.38, 0.9% for 2x compute, with the train/val gap at +0.64. More epochs at `L6` /
+`D = 112` are not worth running.
 
-**The dense head's LR preference also reverses with budget, tentatively.** At E=30 it
-prefers 0.08; at E=60, 0.04 leads 0.08 at the last common point (123.90 against 125.23 at
-epoch 37.5, same cosine schedule, so the same LR fraction). `dense_E60_lr08` died at its
-final checkpoint save because its `/cs/snapless/.../LM_torch_lr_budget/<run>` directory did
-not exist. That is an infrastructure fault, not divergence. Its 37.5-epoch value is not a
-result.
-
-**The `E=10` LR probe did not transfer, and it reversed.** At 10 epochs, 0.08 beat 0.04 by
-8.4%; at 30 epochs it *loses* by 6.7% and at 60 by 8.4%. This is the same budget-depth
-mechanism as POS Decision 3 -- a longer run anneals deeper on its own, so it wants a lower
-peak -- but pointing the other way, and it invalidates the prediction in this file's
-previous revision that the width sweep was understated by being run at 0.04. It was not;
-0.04 was right. Nothing here diverged, including 120 epochs at 0.08.
-
-**At E=30 the two heads want opposite LRs.** Coded prefers 0.04 and dense prefers 0.08
-(128.39 against 132.29). Had the dense control been run at one LR only -- the POS
-`new-MHA=off` mistake -- the comparison would have been wrong whichever LR was chosen. At
-E=60 the dense preference appears to move to 0.04 too (above), the same reversal the coded
-head showed between E=10 and E=30. Re-bracket LR whenever the budget changes.
+**Re-bracket LR whenever the budget changes.** The `E=10` probe preferred 0.08 by 8.4%; at
+30 epochs 0.08 *loses* by 6.7% and at 60 by 8.4% (same budget-depth mechanism as POS
+Decision 3 -- a longer run anneals deeper on its own, so it wants a lower peak). At E=30
+the two heads want opposite LRs: coded prefers 0.04, dense prefers 0.08 (128.39 against
+132.29), so a dense control at one LR only would have been wrong whichever LR was chosen.
+At E=60 the dense preference appears to move to 0.04 too (123.90 against 125.23 at epoch
+37.5, the last common point). Nothing here diverged, including 120 epochs at 0.08.
 
 **At 0.08 the coded model converges to ~132 regardless of budget** (137.20 at E=60, 132.59
 at E=120, flat over its last 10 epochs: 132.55 -> 132.59). At 0.04 it goes lower but
-saturates by E=120 too (above).
+saturates by E=120 too.
 
 **Overfitting is the constraint.** Train/val gap at `D = 112` / 0.04 (val loss minus train
 EMA loss): +0.217 at E=30, +0.383 at E=60, +0.637 at E=120 (+0.583 at E=120 / 0.08). The
@@ -462,17 +419,16 @@ Validation perplexity:
 |---|---|---|---|---|
 | L6 | 130.1 | 135.2 | 142.9 | 152.9 |
 | L12 | 123.2 | 130.7 | 136.0 | 141.8 |
-| L18 | *(died at 7.9 ep)* | 123.7 | 130.4 | 134.6 |
+| L18 | 119.2 | 123.7 | 130.4 | 134.6 |
 | L24 | **113.9** | 119.0 | 127.6 | 129.5 |
 | dense L6 | 131.7 | -- | 127.9 | -- |
 
 **Depth is monotone in all four ladders.** The deepest cell wins every column. Four
 independent ladders agreeing matters more than the size of any one gap.
 
-**The deeper ladder (`20260918-103308_*`, `run_files/torch_LM_deeper_gpu.sh`)** extended the
-winning column (`n_c=8 / 0.04`, same flags apart from `--num-layers`) and refilled `L18`. Min
-val perplexity, as in the table above (finals in brackets), with the train/val gap computed
-from the final val loss:
+**The deeper ladder** (`20260918-103308_*`, `run_files/torch_LM_deeper_gpu.sh`) extended the
+winning column (`n_c=8 / 0.04`, same flags apart from `--num-layers`). Min val perplexity
+(finals in brackets), with the train/val gap computed from the final val loss:
 
 | layers | ppl | total params | wall clock | gap | step gain |
 |---|---|---|---|---|---|
@@ -486,7 +442,7 @@ from the final val loss:
 
 **Depth still pays at 60 but has started to flatten**, from ~5% per 6 layers early to
 ~1.7% for the last 12, while cost is linear in layers. The `L24 -> L32` step (-0.6%) is out
-of line with its neighbours. It is probably seed noise, which is unmeasured (Open L4), not a
+of line with its neighbours. It is probably seed noise, which is unmeasured, not a
 plateau, since L48 resumes the trend. The train/val gap rises only slowly with depth
 (+0.41 -> +0.46), so the extra layers are mostly going to generalisation, not
 memorisation. Lower layers show no starvation through L60.
@@ -519,10 +475,7 @@ L6  n_c=10  ->  135.2      capacity
 the ~222M the coded head frees buys ~27 layers, and they are worth more than the same
 bytes as table rows.
 
-**The coded head wins outright once depth is added, but by less than first measured.**
-Against the E=30 dense head (127.9) the coded `L24` was 11% better at 28% fewer parameters.
-The fair baseline is now `dense_E60_lr04` at 120.65 (Decision L4), the best dense run
-measured. Against it:
+**Against the best dense run** (`dense_E60_lr04`, 120.65, Decision L4):
 
 ```
 L24 coded   205.7M  10.7 h  114.45   -5.1%  at 28% fewer params
@@ -547,10 +500,8 @@ here (4-16%) are two orders of magnitude clear of noise, while the `L24 n_c=8` v
 `L24 n_c=10` accuracy tie (0.2548 vs 0.2554) is not.
 
 **Caveats.** Run at `D = 448`, not the `D = 112` of Decision L3 -- chosen before L3 settled,
-and it should be repeated at 112 before `D` and depth are quoted together. The original
-`L18 / n_c=8 / 0.04` was killed at epoch 7.9 on the `killable` partition. The deeper ladder
-refilled it (`20260918-103308_L18_nc8_lr04_seed42`), so the stub run is superseded.
-Single seed throughout.
+and it should be repeated at 112 before `D` and depth are quoted together. Single seed
+throughout.
 
 ## Decision L6 -- the nanoGPT baseline: best no-unk ppl 96.9, and a 1.2M-parameter GPT ties L60
 
@@ -590,31 +541,20 @@ costs d512/L6 +13.3, and d512/L12 overfits from 97.0 at epoch 11.8 to 130.1). Th
 regulariser grows with size while the best score stays flat. A larger transformer is not
 the missing piece; more data (or longer context) is.
 
-**The best no-unk perplexity is 96.9 (`d256_L12_h8_do0.3`).** It reads high, but most of
-the number comes from how and on what we score, not from the model:
+**Why 96.9 reads high.** Every position of a 32-word window is scored, and early positions
+have little context (ppl 202 at position 0, ~67-80 from position 8; positions >= 16 alone
+give 72.5 / no-unk 86.2). No-unk also removes the easy `<unk>` targets (8.8% of val, ppl
+13.2), and published WT2 figures use a 33k vocabulary and carried state, so they are not
+comparable; treat the with-unk 81.4 as a sanity range, not a benchmark.
 
-- **Short context, every position scored.** Per-position loss of that checkpoint on the
-  same 1,000 windows: ppl 202 at position 0 (one word of context), 155 at position 1, 114
-  at position 2, and ~67-80 from position 8 on. Positions >= 16 alone give **ppl 72.5 /
-  no-unk 86.2**, so the 32-word window with every position averaged costs ~11% on its
-  own. The single-position values are noisy (1,000 tokens each); the >= 16 pool is not.
-- **No-unk is a harder metric than standard WT2 perplexity.** `<unk>` is 8.8% of val
-  targets and is easy to predict (ppl 13.2 on those targets), so removing it raises the
-  number. Published WikiText-2 figures include `<unk>` targets, use a 33k vocabulary, and
-  carry state across segments (AWD-LSTM is ~68 val with all of that). The closest
-  comparable number here is the with-unk 81.4, or 72.5 with context. These are not
-  apples to apples (smaller vocab, short window), so treat that as a sanity range, not a
-  benchmark.
-
-**"The data is not good enough": partly yes, as quantity, not as quality.** 2.16M training
-tokens is what limits the larger models, and the sweep shows it. Every large or
-lightly-regularised cell overfits: d512/L12/do0.1 bottoms at 97.0 at epoch 11.8 and ends
-at 130.1, and d512/L6/do0.1 peaks at epoch 20.6. The best cells are the high-dropout ones,
-and they are still improving at epoch 30. That is a data-size ceiling, consistent with
-`L24_E60` memorising in Decision L5. Nothing here points to a *quality* problem with the
-data: the tokens are verified identical to the LUT stream, and the per-position curve has
-the shape expected of clean text. A larger corpus (WikiText-103, same pipeline) is the
-test that would separate "small data" from "our models", for both model families.
+**The data limits quantity, not quality.** 2.16M training tokens is what limits the larger
+models: every large or lightly-regularised cell overfits (d512/L12/do0.1 bottoms at 97.0 at
+epoch 11.8 and ends at 130.1; d512/L6/do0.1 peaks at epoch 20.6), while the best cells are
+the high-dropout ones and are still improving at epoch 30. That is a data-size ceiling,
+consistent with `L24_E60` memorising in Decision L5. Nothing points to a *quality* problem:
+the tokens are verified identical to the LUT stream, and the per-position curve has the
+shape expected of clean text. WikiText-103 (Part III) is the test that separates "small
+data" from "our models", for both model families.
 
 **What matters for the LUT story is the gap, not the absolute number.** On identical windows:
 
@@ -631,60 +571,19 @@ measured against a LUT dense head, not against a transformer. Quote it that way.
 
 ## Still open (LM)
 
-- **L8 -- seed the GPT baseline (Decision L6).** All 12 cells are done. Seeds 43/44 for the best cell and for d64/L6 (array indices +12, +24).
-  The best cells were still improving at epoch 30, so the baseline is probably under-, not
-  over-, estimated. Also try dropout 0.4-0.5 at d256-d512. WikiText-103 through the same
-  pipeline is the test for "data-limited".
-
-- **L1 -- RESOLVED (Decision L4).** 0.04 is correct for the coded head at E >= 30; the
-  `E=10` probe's preference for 0.08 reversed with budget. The dense head wants 0.08 at
-  E=30 and, tentatively, 0.04 at E=60.
-- **L2 -- RESOLVED (Decision L4).** Dense baselines exist at E=30 (128.39) and E=60
-  (120.65). The "68x smaller at matched wall clock" claim is retracted. At `L6` the dense
-  head wins; the coded head wins only with the freed parameters spent on depth.
-- **L3 -- RESOLVED (Decision L4).** `D112_E120_lr04` = 125.38, not the ~122 predicted: the
-  `L6` coded budget saturates near E=60. `dense_E60_lr04` = 120.65. **Still missing:
-  `dense_E60_lr08`**, which died at its final save because its snapless checkpoint
-  directory was missing (`sbatch_outputs/LM_TUNE2-*`). Rerun it after recreating the
-  directory, or accept 0.04 on the epoch-37.5 lead.
-- **L6 -- depth: flattening but not saturated (Decision L5).** L60 = 107.46 is the best
-  cell, but the last 12 layers bought only 1.7% for +24% wall clock. No lower-layer
-  starvation is visible through L60 (gap rises only +0.41 -> +0.46). Further depth is
-  low-value. **The open questions at depth are now budget and regularisation:** `L24_E60`
-  lost to `L24_E30` through memorisation (gap +0.77), so try E=15-20 and/or higher dropout
-  at L32/L48 rather than more epochs or more layers.
-- **L7 -- the depth grid ran at `D = 448`, Decision L3 settled on `D = 112`.** Repeat `L32`
+- **Seeds.** Everything is seed 42. The *repeat* floor is ~0.11% (Decision L5), but seed
+  variance is unmeasured and the POS floors do not transfer. The `L24 -> L32` step, the
+  L18-vs-dense-E60 tie and `D = 112` vs `D = 224` all need seeds before they mean anything.
+  Cheapest: two extra seeds for L24, L32, L48 and dense E60; for the GPT baseline, seeds
+  43/44 for the best cell and d64/L6 (array indices +12, +24).
+- **Repeat the depth result at `D = 112`.** The depth grid ran at `D = 448`; repeat `L32`
   (and ideally `L48`) at 112 before quoting `D` and depth together. A narrower head may
   also overfit less, which is now the binding constraint.
-- **L4 -- everything is seed 42, single seed.** The *repeat* floor is now ~0.11%
-  (Decision L5, two byte-identical dense runs 0.14 ppl apart), but SEED variance remains
-  unmeasured and the POS floors in Part I do not transfer to a different task and metric. The
-  `D = 112` vs `D = 224` difference (133.4 vs 133.1) is certainly inside it, which is why
-  `D = 112` is chosen over `D = 224` -- it is the smaller of two arms that are tied, not a
-  measured winner. The `L24 -> L32` step (-0.6%, against ~4% for its neighbours) and the
-  L18-vs-dense-E60 tie also need seeds before they mean anything. Two extra seeds for L24,
-  L32, L48 and dense E60 is the cheapest way to know.
-- **L5 -- `learnedD64_bias` (`LM_torch_output_code_E10`) and `R2_randomD64`
-  (`LM_torch_schedule_probe`) never produced a `loss.csv`.** The `random_code_matrix`
-  `n_bits >= 63` int64 overflow that killed them is fixed; the runs were not repeated.
-
-
----
-
-## Still open
-
-- **`new-MHA=off` LR is unbracketed.** `expD` ran 0.01/0.02/0.04/0.08 at batch 32 and was
-  monotone increasing. Extend upward (0.08/0.16/0.32) before quoting the on-vs-off gap.
-- **The 10-epoch LR rule (`0.0025 * batch`) is confirmed at batch 32 only.** Check batch
-  8 (0.01 vs 0.02) and batch 64 (0.08 vs 0.16), ~4 GPU-h.
-- **`E=8 + lr 0.08` has never been run together** with the chosen shape, though each half
-  is validated. One confirming run before building on it.
-- **Three cells cannot run**: `h8/mha=off/ws=full` is 1.68B parameters = 6.24 GiB of
-  weights plus 6.24 GiB of dense gradient before activations, and the cluster mixes
-  10.57 GiB to ~24 GiB cards behind one `--gres`. Pin the GPU by memory, or use
-  `--table-grad sparse --cuda-graphs off`. Four cells of the *first* sweep failed the
-  same way and were recorded only as "incomplete".
-- **Everything is single-seed.** Differences under ~0.003 need 3+ seeds to mean anything.
+- **Budget and regularisation at depth, not more depth.** L60 is best but the last 12
+  layers bought 1.7% for +24% wall clock. Try E=15-20 and/or higher dropout at L32/L48.
+- **GPT baseline tuning.** The best cells were still improving at epoch 30, so the
+  baseline is probably under-, not over-, estimated. Try dropout 0.4-0.5 at d256-d512.
+- **`dense_E60_lr08` has no result.** Rerun it, or accept 0.04 on the epoch-37.5 lead.
 
 ---
 
@@ -696,18 +595,11 @@ reasoning survives whatever the numbers turn out to be.
 
 ## Decision W1 -- the tokenizer was not the problem, but the LM line leaves it anyway
 
-Measured on the WT2 pipeline (`d256_L12_h8_do0.3`, the 1,000 shared windows):
-
-- The source file is WikiText-2 *v1*, which is already tokenized (33,277 types, rare
-  words already `<unk>`, 2.5% of tokens). `word_tokenizer.py` tokenizes it again with
-  `<unk>|<eol>|\w+|[^\w\s]` and `min_freq 10`. That more than doubles `<unk>` (6.8% of
-  train, 8.8% of val targets), splits `@-@` / `@,@` / `@.@` into three tokens, and splits
-  `'s` into two.
-- Those artifacts are *easy* targets: `<unk>` ppl 13.2, `@` 2.8, `=` 1.4, `<eol>` 3.3,
-  together 13.4% of targets. On real words + punctuation (86.6%) the same model is at
-  **ppl 117.9**, against 81.4 overall. So the tokenizer flatters the headline. It does
-  not explain it, and it cannot explain the GPT/LUT gap, because both see the identical
-  stream.
+The WT2 source is already tokenized (v1), and `word_tokenizer.py` re-tokenizes it with
+`min_freq 10`, more than doubling `<unk>` and splitting `@-@` / `'s`. Those artifacts are
+easy targets (13.4% of targets; on the remaining real words the best GPT is at ppl 117.9
+against 81.4 overall), so the tokenizer flatters the headline, but it cannot explain the
+GPT/LUT gap because both see the identical stream.
 
 Decided:
 
@@ -765,11 +657,14 @@ token files to `nanoGPT_POS/data/wiki103/`. Each `.bin` has a `<file>.json` mani
 (token and word counts, source and token SHA-256, tiktoken version).
 
 Both trainers accept a `.bin` path wherever they accept a text file. `load_datasets`
-memory-maps it after validating the manifest, and the text path is unchanged. Chosen over
-encoding at startup (A: ~1.5 min and ~6 GB per job, and the token stream would depend on
-whichever tiktoken a node has) and over an automatic cache (C: 12 array jobs starting
-together race to write it). The run scripts copy both manifests into `config.txt`, so
-every run records the exact token stream it trained on.
+memory-maps it after validating the manifest, and the text path is unchanged. Rejected:
+
+- **A, encode at startup:** ~1.5 min and ~6 GB per job, and the token stream would depend
+  on whichever tiktoken a node has.
+- **C, automatic cache:** 12 array jobs starting together race to write it.
+
+The run scripts copy both manifests into `config.txt`, so every run records the exact token
+stream it trained on.
 
 WikiText-2 and -103 share the validation articles. The prep script checks this against
 the WT2 val file and records the result in `val_gpt2.bin.json`. Same val `.bin` + same
@@ -790,27 +685,104 @@ The question wave 1 answers: if bigger transformers start winning as data grows,
 data-limited (Decision L6). Wave 2 asks the same of LUT depth, which at WT2 scale
 memorised (`L24_E60`).
 
+## Result W5 -- wave-1 GPT: the WT103 numbers are high because of rare words, not BPE
+
+Status on 2026-10-14 16:45, seed 42. The headline is per-word ppl (final, with the min in
+brackets where it differs). Runtime is training time from the tqdm bar. **It is only
+comparable on the same GPU type**: the cluster mixes RTX 2080 Ti, A10 and A5000, and
+`full_d512` on an A5000 (1.37 h) ran faster than `full_d256` on a 2080 Ti (3.20 h).
+
+GPT (`GPT_LM_wt103`): AdamW, ctx 32, batch 32, cosine to 1%, warmup 0.95%, L12.
+
+| run | data | epochs | dropout | peak LR | params | GPU | runtime | ppl/word | status |
+|---|---|---|---|---|---|---|---|---|---|
+| 2M d256 h8 | 2M | 30 | 0.3 | 1e-3 | 22.3M | 2080 Ti | 1.05 h | 496.9 (496.5) | done |
+| 2M d512 h8 | 2M | 30 | 0.3 | 6e-4 | 63.5M | 2080 Ti | 1.67 h | 494.1 (493.7) | done |
+| 2M d768 h12 | 2M | 30 | 0.3 | 6e-4 | 123.6M | 2080 Ti | 0.85 h | 774.0 at ep 8.1 | crashed (ckpt dir) |
+| 8M d256 h8 | 8M | 15 | 0.2 | 1e-3 | 22.3M | 2080 Ti | 1.88 h | 370.2 (369.6) | done |
+| 8M d512 h8 | 8M | 15 | 0.2 | 6e-4 | 63.5M | 2080 Ti | 3.26 h | 307.0 (306.5) | done |
+| 8M d768 h12 | 8M | 15 | 0.2 | 6e-4 | 123.6M | 2080 Ti | 0.43 h | 838.8 at ep 1.05 | crashed (ckpt dir) |
+| 32M d256 h8 | 32M | 5 | 0.1 | 1e-3 | 22.3M | 2080 Ti | 2.43 h | 302.2 (302.1) | done |
+| 32M d512 h8 | 32M | 5 | 0.1 | 6e-4 | 63.5M | 2080 Ti | 4.16 h | 238.2 (237.9) | done |
+| 32M d768 h12 | 32M | 5 | 0.1 | 6e-4 | 123.6M | 2080 Ti | 4.9 h, 64% | 456.7 at ep 3.2 | running |
+| full d256 h8 | 103M | 2 | 0.1 | 1e-3 | 22.3M | 2080 Ti | 3.20 h | 288.1 | done |
+| full d512 h8 | 103M | 2 | 0.1 | 6e-4 | 63.5M | A5000 | 1.37 h | 225.6 | done |
+| full d768 h12 | 103M | 2 | 0.1 | 6e-4 | 123.6M | -- | -- | -- | not started |
+
+LUT (`LM_torch_wt103`): the settled body (emb 64, h4, n_t 64, n_c 8, ws 8, new-MHA),
+learned code D112 + bias, SGD peak 0.04, cosine with cooldown 0.2, dropout 0.2. Params =
+table entries + output code.
+
+| run | data | epochs | params | GPU | runtime | ppl/word | status |
+|---|---|---|---|---|---|---|---|
+| L6 smoke | 103M | 0.1 | 55.5M | A5000 | 0.46 h | 1059.9 at ep 0.09 | done |
+| L6 2M E30 | 2M | 30 | 55.5M | A5000 | -- | -- | crashed at first save (ckpt dir) |
+| L6 | 103M | 1 | 55.5M | A5000 | 4.45 h | 545.2 (543.4) | done |
+| L18 | 103M | 1 | 151.4M | A10 | 4.9 h, 33% (~15 h total) | 655.4 at ep 0.33 | running |
+| L32 | 103M | 1 | 263.4M | A5000 | 4.8 h, 22% (~22 h total) | 689.9 at ep 0.21 | running |
+
+The three "crashed (ckpt dir)" runs died with "Parent directory ... does not exist" on
+`/cs/snapless`, although the script had created it. Both trainers now re-create the
+directory before every save.
+
+**d768 at peak LR 6e-4 is unstable.** At equal epochs it is worse than d256 in all three
+runs (2M at ep 8.1: 774 against 704; 8M at ep 1.05: 839 against 662; 32M at ep 3.2: 457
+against 394). On 32M its loss *rose* from 830 to 1,025 between epochs 0.3 and 0.6, while
+no d256 or d512 run rose more than 3.5% above its running best. nanoGPT's 6e-4 for this
+width assumes ~0.5M-token batches; ours are 1,024 tokens. Rerun d768 at a lower peak LR,
+not as is.
+
+- **Data-limited, confirmed.** At 2M words the two widths tie; from 8M up, d512 wins by
+  17-22%. Every cell from 8M up has its minimum at the last validation, and the full-data
+  cells gained 4% in their last 10%, so 2 epochs on full data is too short.
+- **Why 494 at 2M when WT2 gave 81 on the same text.** The val sets are word-for-word
+  identical, so each whitespace word can be classified by whether the WT2 pipeline
+  (`vocab_file_10_freq`) could predict it. 90.7% of words can. The BPE model's per-word
+  loss is the sum of its tokens' NLL. Scored on the 1,000 run windows, words that fall
+  wholly inside a window:
+
+  | checkpoint | all words | WT2-vocab words (90.8%) | other words (9.2%) |
+  |---|---|---|---|
+  | 2M_d512 | 493.7 | **128.7** | 1.4e8 |
+  | 32M_d512 | 237.9 | **75.3** | 1.0e7 |
+  | full_d512 | 225.6 | **72.7** | 8.4e6 |
+
+  On the words WT2 could predict, the 2M BPE model is at 128.7, against WT2's 117.9 for
+  real words + punctuation (Decision W1). That is the same ballpark: a 32-token BPE window
+  holds ~27 words, and the model also has to learn spelling. The whole gap to 494 is the
+  9.2% of words WT2 mapped to `<unk>`, which BPE has to spell out (~16-19 nats each). So
+  the high headline is the honest cost of an open vocabulary, not a pipeline fault. With
+  full data, the same words reach **72.7**, well below anything WT2-sized achieved.
+  The WT2 `no_unk` columns are *not* this comparison: they drop the `<unk>` targets but
+  still compare against a closed 14k vocabulary.
+- Script: the same-words analysis is a one-off (no tool in the repo). Its rule: whitespace
+  word w is "WT2-vocab" iff every `word_tokenizer` regex piece of w is in
+  `vocab_file_10_freq.txt`; words cut by a window edge are dropped; whitespace-only tokens
+  belong to no word.
+
+Follow-up: `run_files/GPT_LM_wt103_depth_gpu.sh`. Full data, 4 epochs, d256/d512 x L12/L24.
+
 ---
 
 ## Run index
 
 | directory | what it is |
 |---|---|
-| `results/POS_torch_gpu_sweep/` | first sweep, 24 cells, fixed 200k steps, lr 0.01, no cooldown. 4 cells never ran (OOM) |
+| `results/POS_torch_gpu_sweep/` | first sweep, 24 cells, fixed 200k steps, lr 0.01, no cooldown |
 | `results/POS_torch_lr_probe/`, `lr_probe2/` | first LR probes; stage 1 used base-lr x scaling, stage 2 switched to absolute LR |
 | `results/POS_torch_expA/`, `expA2/` | peak LR x budget at batch 32, and closing that grid |
 | `results/POS_torch_expB/` | schedule shape: ramp, decay start, cooldown fraction |
 | `results/POS_torch_expC/` | batch size at a token-matched schedule |
-| `results/POS_torch_expD/` | does the LR rule transfer to `new-MHA=off` (4 cells OOM) |
+| `results/POS_torch_expD/` | does the LR rule transfer to `new-MHA=off` |
 | `results/POS_torch_expE/` | cooldown shape vs budget, 2 seeds, paired |
 | `results/POS_torch_gpu_sweep_v2_E10/` | the rerun under this recipe, 32 cells |
-| `results/LM_torch_output_code_E10/` | LM, does the coded head work: dense baseline, learned D14/D28/D64, binary D14. `learnedD64_bias` has no `loss.csv` |
-| `results/LM_torch_schedule_probe/` | LM, budget and LR shape at D28: `A*` budget/warmup, `B*` peak LR, `C*` anneal shape, `R*` frozen-random controls. `R2_randomD64` never ran; `A1` and `C1` preempted at epoch 23.5 |
-| `results/LM_torch_code_width/` | LM, `D` in {14,56,112,224,448,1000} x {learned, binary} at the C2 schedule, 30 epochs. Learned `D28` is absent -- it is `C2_E30_cosine` in the schedule probe |
-| `results/LM_torch_depth/` | LM, layer count x `n_c` x peak LR at learned D448, 30 epochs, 18 cells, plus the deeper ladder (`20260918-103308_*`: L18 refill, L32, L48, L60, `L24_E60`). Decision L5. The `20260917-205223_L18_nc8_lr04` stub (killed at epoch 7.9) is superseded. Directories without `loss.csv` are aborted submissions |
-| `results/LM_torch_lr_budget/` | LM, peak LR x budget at D112 plus dense controls at E=30 and E=60 (round 2: `20260918-*`). Decision L4. `dense_E60_lr08` crashed at epoch 37.5 on a missing checkpoint dir |
+| `results/LM_torch_output_code_E10/` | LM, does the coded head work: dense baseline, learned D14/D28/D64, binary D14 |
+| `results/LM_torch_schedule_probe/` | LM, budget and LR shape at D28: `A*` budget/warmup, `B*` peak LR, `C*` anneal shape, `R*` frozen-random controls |
+| `results/LM_torch_code_width/` | LM, `D` in {14,56,112,224,448,1000} x {learned, binary} at the C2 schedule, 30 epochs. Learned `D28` is `C2_E30_cosine` in the schedule probe |
+| `results/LM_torch_depth/` | LM, layer count x `n_c` x peak LR at learned D448, 30 epochs, 18 cells, plus the deeper ladder (`20260918-103308_*`: L18 refill, L32, L48, L60, `L24_E60`). Decision L5 |
+| `results/LM_torch_lr_budget/` | LM, peak LR x budget at D112 plus dense controls at E=30 and E=60 (round 2: `20260918-*`). Decision L4 |
 | `results/GPT_LM_baseline/` | LM, nanoGPT baseline (`gpt_baseline_train.py`): width {64..512} x depth {6,12} x dropout {0.1,0.3}, seed 42, same windows as the LUT LM runs. Decision L6. Arm label is in the directory name and `config.txt` (`arm=`) |
 
-Each run's `config.txt` records its swept axis under `swept_*` keys and the full command;
-trust those over directory names. Preempted runs say `DUE TO PREEMPTION` in the sbatch
-output -- check before assuming a crash.
+Crashed, preempted and never-run cells are listed in `HISTORY.md` ("Infrastructure
+incidents"). Each run's `config.txt` records its swept axis under `swept_*` keys and the
+full command; trust those over directory names.
