@@ -546,6 +546,9 @@ def best_model_path(path):
 
 
 def save_checkpoint(path, model, cfg, optimizers, schedulers, step, args):
+    # A missing checkpoint directory has killed runs at their save (dense_E60_lr08, and
+    # two GPT WT103 jobs on /cs/snapless). Re-create it right before every write.
+    os.makedirs(os.path.dirname(checkpoint_path(path)) or '.', exist_ok=True)
     torch.save({
         'step': step,
         'config': cfg.to_dict(),

@@ -215,6 +215,10 @@ def best_model_path(stem):
 
 
 def save_checkpoint(stem, gpt, model_args, optimizer, step, val, args):
+    # The run script creates this directory at job start, yet two WT103 jobs (dumfries-007,
+    # -009) still died here with "Parent directory ... does not exist" on /cs/snapless.
+    # Re-creating it right before the write costs nothing and removes the failure.
+    os.makedirs(os.path.dirname(checkpoint_path(stem)) or '.', exist_ok=True)
     torch.save({
         'kind': 'nanogpt_lm',
         'step': step,
